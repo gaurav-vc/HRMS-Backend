@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "C:\Users\MC VIP\OneDrive\Desktop\HRMS\backend\payroll\views.py", line 344, in get
+    paid_leave_days = sum((min(l.end_date, calc_end) - max(l.start_date, calc_start)).days + 1 for l in emp.leaverequest_set.filter(status='Approved', start_date__lte=calc_end, end_date__gte=calc_start) if 'lop' not in (l.leave_type.name or '').lower())
+AttributeError: 'Employee' object has no attribute 'leaverequest_set'

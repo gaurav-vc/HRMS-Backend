@@ -1,0 +1,8 @@
+Role,Employee,Monthly Salary,Total Work Days (A),No Of Leaves Applied (B),No Of Leaves Not Applied (C),Net workDays A-(B+C),Payable Work Days A-C,Over time Hours,No of Time Delay Deduction
+SENIOR MANAGER,Mukund Zujam,120000,31,0,2,29,29,3 hours,0.5
+EXECUTIVE,Vishal Tripathi,60000,31,0,1,30,30,0,1.0
+SENIOR ARCHITECT,Hetal Karani,220000,31,0,3,28,28,3 hours,0
+ENGINEER,Dinesh Kumar,50000,31,0,31,0,0,0,0
+ENGINEER,Rajnikant Deokar,80000,31,0,31,0,0,0,0
+DRIVER,Naresh Kalluri,25000,31,0,0,31,31,0,0
+ASSISTANT VICE PRESIDENT-PROCUREMENT,Jasmin Modi,150000,31,0,0,31,31,0,0
