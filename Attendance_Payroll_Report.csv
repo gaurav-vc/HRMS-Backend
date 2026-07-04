@@ -1,0 +1,3 @@
+Company,Region,Location,Group,Role,Employee,Total Work Days (A),Present Days,Absent Days,No Of Leaves (Applied),No Of Leaves (Not Applied),Net workDays,Payable Work Days,Overtime Hours,LOC / Time Delay Deduction,Annual Leave,In Hand Salary
+PeoplePulse Corp,Headquarters,Bengaluru HQ,Developers,,Gaurav Kokane,31,0,0,0,0,31,31,0.0,0,0,0.0
+Tata Consultancy Services Demo Pvt Ltd,Pune Development Center,,Finance,,Kash Sharma,31,0,0,0,0,31,31,0.0,0,0,0.0

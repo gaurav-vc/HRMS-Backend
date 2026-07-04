@@ -141,7 +141,9 @@ class DashboardStatsAPIView(APIView):
                 "leaveBalance": 12, # mock
                 "lastNetPay": last_run_net,
                 "recentAttendance": [{"id": a.id, "date": str(a.attendance_date), "checkIn": a.first_check_in.strftime("%H:%M") if a.first_check_in else "N/A", "checkOut": a.last_check_out.strftime("%H:%M") if a.last_check_out else "N/A"} for a in DailyAttendance.objects.order_by('-attendance_date')[:5]],
-                "myLeaveRequests": [{"id": l.id, "type": l.leave_type.name, "from": str(l.start_date), "status": l.status} for l in LeaveRequest.objects.order_by('-created_at')[:5]]
+                "myLeaveRequests": [{"id": l.id, "type": l.leave_type.name, "from": str(l.start_date), "status": l.status} for l in LeaveRequest.objects.order_by('-created_at')[:5]],
+                "siteQrEnabled": emp.site.qr_enabled if emp and hasattr(emp, 'site') and emp.site else True,
+                "siteFaceEnabled": emp.site.face_enabled if emp and hasattr(emp, 'site') and emp.site else True,
             }
         }
         

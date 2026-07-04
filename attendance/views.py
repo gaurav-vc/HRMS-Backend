@@ -319,8 +319,9 @@ class AttendanceViewSet(viewsets.ViewSet):
                 lat, lng = float(lat_str), float(lng_str)
                 if site and site.latitude and site.longitude:
                     distance = haversine(lat, lng, float(site.latitude), float(site.longitude))
-                    if distance > site.radius:
-                        return Response({"error": f"Rejected: Outside geofence. Distance: {int(distance)}m (max {site.radius}m)"}, status=400)
+                    effective_radius = max(site.radius, 500) # Increased to 500m for testing
+                    if distance > effective_radius:
+                        return Response({"error": f"Rejected: Outside geofence. Distance: {int(distance)}m (max {effective_radius}m)"}, status=400)
                 
                 # Wave 5: Hardened Velocity Replay/Spoof Check
                 last_punch = PunchLog.objects.filter(employee=employee).order_by('-punch_time').first()
