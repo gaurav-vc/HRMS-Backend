@@ -1,6 +1,9 @@
 from django.db import models
+from admin_org.models import Organization
+
 
 class Entity(models.Model):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='entities', null=True, blank=True)
     name = models.CharField(max_length=100)
     code = models.CharField(max_length=50, blank=True, null=True)
     country = models.CharField(max_length=50, default='India')
@@ -24,7 +27,22 @@ class Branch(models.Model):
 
 class Site(models.Model):
     name = models.CharField(max_length=100)
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='sites', null=True, blank=True)
     branch = models.ForeignKey(Branch, on_delete=models.CASCADE, related_name='sites', null=True, blank=True)
+    site_code = models.CharField(max_length=50, blank=True, null=True)
+    product_type = models.CharField(max_length=50, blank=True, null=True)
+    country = models.CharField(max_length=50, blank=True, null=True)
+    status = models.CharField(max_length=20, default='Active')
+    activate_date = models.DateField(null=True, blank=True)
+    
+    # Contact Info
+    contact_name = models.CharField(max_length=100, blank=True, null=True)
+    contact_phone = models.CharField(max_length=20, blank=True, null=True)
+    contact_email = models.EmailField(blank=True, null=True)
+    
+    # Modules
+    modules = models.JSONField(default=list, blank=True, null=True)
+
     address = models.TextField(blank=True, null=True)
     latitude = models.FloatField(blank=True, null=True)
     longitude = models.FloatField(blank=True, null=True)

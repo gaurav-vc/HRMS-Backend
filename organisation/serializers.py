@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from .models import Entity, Branch, Site, Department, Designation, Role, AttendancePolicy
 
+
 class EntitySerializer(serializers.ModelSerializer):
     class Meta:
         model = Entity
@@ -12,9 +13,15 @@ class BranchSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 class SiteSerializer(serializers.ModelSerializer):
+    organization_name = serializers.CharField(source='organization.name', read_only=True)
+    users_count = serializers.SerializerMethodField()
+
     class Meta:
         model = Site
         fields = '__all__'
+
+    def get_users_count(self, obj):
+        return obj.employees.count() if hasattr(obj, 'employees') else 0
 
 class DepartmentSerializer(serializers.ModelSerializer):
     class Meta:

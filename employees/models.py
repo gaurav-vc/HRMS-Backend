@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import User
 from organisation.models import Entity, Branch, Site, Department, Designation, Role
+from admin_org.models import Organization
 
 ROLE_CHOICES = [
     ('super_admin', 'Super Admin'),
@@ -22,6 +23,7 @@ class Employee(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, null=True, blank=True, related_name='employee_profile')
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='employee')
     dynamic_role = models.ForeignKey(Role, on_delete=models.SET_NULL, null=True, blank=True, related_name='employees')
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, null=True, blank=True, related_name='employees')
     mfa_enabled = models.BooleanField(default=False)
 
     # Personal Details

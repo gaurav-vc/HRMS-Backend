@@ -294,6 +294,7 @@ class SalarySlipAPIView(APIView):
             for slip in db_slips:
                 emp = slip.employee
                 components = {}
+                paid_leave_days = 0
                 
                 if is_draft:
                     # DYNAMIC PREVIEW: Calculate 100% real-time using current CTC and formulas
@@ -425,9 +426,11 @@ class SalarySlipAPIView(APIView):
                     'doj': emp.doj,
                     'managerName': f"{emp.manager.first_name} {emp.manager.last_name}" if emp.manager else "—",
                     'department': emp.department.name if emp.department else 'N/A',
+                    'totalDays': calc_days if 'calc_days' in locals() else 30,
                     'daysPaid': days_paid,
                     'daysPresent': days_present,
                     'daysOff': days_off,
+                    'paidLeaves': float(paid_leave_days),
                     'daysAbsent': days_absent,
                     'overtimeHours': float(total_ot_hours) if 'total_ot_hours' in locals() else 0.0,
                     'error': getattr(slip, 'engine_error', None),
@@ -614,7 +617,8 @@ class PayrollPreviewAPIView(APIView):
             from decimal import Decimal
 
             if entity_param and entity_param != '__all__':
-                entities = Entity.objects.filter(id=entity_param)
+                entity_ids = entity_param.split(',')
+                entities = Entity.objects.filter(id__in=entity_ids)
             else:
                 entities = Entity.objects.all()
 
@@ -707,7 +711,11 @@ class PayrollPreviewAPIView(APIView):
                             'ifscCode': safe_ifsc or '',
                             'currentSalary': 0 if hide_money else sfloat(getattr(emp, 'ctc', 0)),
                             'totalDays': sfloat(context.get('total_days', 0)),
-                            'presentDays': sfloat(context.get('present_days', 0)),
+                            'presentDays': sfloat(context.get('actual_present_days', context.get('present_days', 0))),
+                            'leaves': sfloat(context.get('absent_days', 0)),
+                            'lopDays': sfloat(context.get('lop_days', 0)),
+                            'ot': sfloat(context.get('ot_hours', context.get('overtime_hours', 0))),
+                            'daysPaid': sfloat(context.get('paid_days', 0)),
                             'totalAmount': 0 if hide_money else sfloat(gross),
                             'deduction': 0 if hide_money else sfloat(ded),
                             'pf': 0 if hide_money else sfloat(pf_amount),

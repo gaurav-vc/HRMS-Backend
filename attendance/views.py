@@ -622,6 +622,12 @@ class RosterViewSet(viewsets.ViewSet):
                 date=date,
                 defaults={'shift': shift}
             )
+            from employees.models import Notification
+            Notification.objects.create(
+                recipient_id=employee_id,
+                title="Shift Assignment Updated",
+                message=f"You have been assigned to the {shift.name} shift ({shift.start_time.strftime('%I:%M %p')} to {shift.end_time.strftime('%I:%M %p')}) for {date}."
+            )
             return Response(ShiftAssignmentSerializer(assignment).data)
         except ShiftDefinition.DoesNotExist:
             return Response({"error": "Shift not found"}, status=404)
@@ -669,6 +675,19 @@ class RosterViewSet(viewsets.ViewSet):
                 unique_fields=['employee', 'date'],
                 update_fields=['shift', 'updated_at']
             )
+            
+            from employees.models import Notification
+            notifications = []
+            for emp in employees:
+                notifications.append(
+                    Notification(
+                        recipient=emp,
+                        title="Shift Assignment Updated",
+                        message=f"You have been assigned to the {shift.name} shift for the period {start_date} to {end_date}."
+                    )
+                )
+            if notifications:
+                Notification.objects.bulk_create(notifications)
             
         return Response({"message": f"Successfully assigned shift to {employees.count()} employees for {len(dates)} days ({len(assignments_to_create)} total assignments)."})
 

@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     'reports',
     'ot_engine',
     'org_engine',
+    'admin_org',
 ]
 
 MIDDLEWARE = [
@@ -135,6 +136,8 @@ STATIC_URL = 'static/'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+
+
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
@@ -175,7 +178,7 @@ EMAIL_HOST = 'smtp.gmail.com'
 EMAIL_PORT = 587
 EMAIL_USE_TLS = True
 EMAIL_HOST_USER = 'gauravkokane420op@gmail.com'
-EMAIL_HOST_PASSWORD = 'eodg bvmj jdgt oyou'
+EMAIL_HOST_PASSWORD = 'najnkgngkjbcteli'
 DEFAULT_FROM_EMAIL = 'HRMS Admin <gauravkokane420op@gmail.com>'
 
 SECURE_CROSS_ORIGIN_OPENER_POLICY = None

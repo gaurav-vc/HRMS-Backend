@@ -16,7 +16,7 @@ import json
 class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = Employee.objects.all()
     serializer_class = EmployeeSerializer
-    # permission_classes = [IsAuthenticated] # Temporarily disabled so you don't get blocked!
+    permission_classes = [IsAuthenticated]
 
     @action(detail=False, methods=['POST'], parser_classes=[MultiPartParser])
     def bulk_import(self, request):

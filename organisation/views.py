@@ -6,6 +6,7 @@ from .serializers import (
     AttendancePolicySerializer
 )
 
+
 class EntityViewSet(viewsets.ModelViewSet):
     queryset = Entity.objects.all()
     serializer_class = EntitySerializer
@@ -15,13 +16,93 @@ class AttendancePolicyViewSet(viewsets.ModelViewSet):
     serializer_class = AttendancePolicySerializer
     filterset_fields = ['site', 'organization', 'employee']
 
+
 class BranchViewSet(viewsets.ModelViewSet):
     queryset = Branch.objects.all()
     serializer_class = BranchSerializer
 
+import string
+import random
+from django.contrib.auth.models import User
+from django.core.mail import send_mail
+from django.conf import settings
+
+def generate_random_password(length=12):
+    characters = string.ascii_letters + string.digits + "!@#$%^&*"
+    return ''.join(random.choice(characters) for i in range(length))
+
+def provision_contact_person(site):
+    if not site.contact_email:
+        return
+        
+    email = site.contact_email
+    user = User.objects.filter(email=email).first() or User.objects.filter(username=email).first()
+    
+    if user:
+        if not user.is_superuser:
+            password = generate_random_password()
+            user.set_password(password)
+            user.save()
+        else:
+            password = "[Your existing password]"
+        subject = f"You have been assigned to Site: {site.name}"
+        message = f"Hello {site.contact_name or 'User'},\n\nYou have been assigned as the Site Admin for {site.name}.\n\nWebsite URL: http://localhost:5173\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
+        import threading
+        def send_async():
+            try:
+                send_mail(subject, message, getattr(settings, 'EMAIL_HOST_USER', 'noreply@vibecopilot.ai'), [email], fail_silently=False)
+            except Exception as e:
+                print(f"SITE EMAIL FAILED. Google SMTP Error: {str(e)}")
+        threading.Thread(target=send_async).start()
+    else:
+        password = generate_random_password()
+        user = User.objects.create_user(
+            username=email,
+            email=email,
+            password=password,
+            first_name=site.contact_name or ''
+        )
+        try:
+            from employees.models import Employee
+            from organisation.models import Role
+            role_obj, _ = Role.objects.get_or_create(name='Site Admin', defaults={'code': 'SITE_ADMIN'})
+            Employee.objects.create(
+                user=user,
+                first_name=site.contact_name or email.split('@')[0],
+                email=email,
+                code=f"EMP-{user.id:04d}",
+                role='admin',
+                dynamic_role=role_obj,
+                status='Active'
+            )
+        except Exception as e:
+            print(f"Failed to create employee profile: {e}")
+            
+        subject = f"Welcome to VibeCopilot - Site Admin Credentials"
+        message = f"Hello {site.contact_name or 'User'},\n\nAn account has been created for you as the Site Admin for {site.name}.\n\nWebsite URL: http://localhost:5173\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
+        
+        import threading
+        def send_async_new():
+            try:
+                send_mail(subject, message, getattr(settings, 'EMAIL_HOST_USER', 'noreply@vibecopilot.ai'), [email], fail_silently=False)
+            except Exception as e:
+                print(f"SITE EMAIL FAILED. Google SMTP Error: {str(e)}")
+        threading.Thread(target=send_async_new).start()
+
+
 class SiteViewSet(viewsets.ModelViewSet):
     queryset = Site.objects.all()
     serializer_class = SiteSerializer
+
+    def perform_create(self, serializer):
+        site = serializer.save()
+        provision_contact_person(site)
+        
+    def perform_update(self, serializer):
+        old_email = serializer.instance.contact_email
+        site = serializer.save()
+        if site.contact_email and site.contact_email != old_email:
+            provision_contact_person(site)
 
 class DepartmentViewSet(viewsets.ModelViewSet):
     queryset = Department.objects.all()

@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 from .views import EntityViewSet, BranchViewSet, SiteViewSet, DepartmentViewSet, DesignationViewSet, RoleViewSet, AttendancePolicyViewSet
 
 router = DefaultRouter()
+
 router.register(r'entities', EntityViewSet)
 router.register(r'branches', BranchViewSet)
 router.register(r'sites', SiteViewSet)
