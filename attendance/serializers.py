@@ -28,6 +28,8 @@ class DailyAttendanceSerializer(serializers.ModelSerializer):
 
 class RegularizationRequestSerializer(serializers.ModelSerializer):
     employee_name = serializers.SerializerMethodField(read_only=True)
+    employee_designation = serializers.SerializerMethodField(read_only=True)
+    employee_entity = serializers.SerializerMethodField(read_only=True)
     from employees.models import Employee
     employee = serializers.PrimaryKeyRelatedField(queryset=Employee.objects.all(), required=False)
     
@@ -37,6 +39,12 @@ class RegularizationRequestSerializer(serializers.ModelSerializer):
         
     def get_employee_name(self, obj):
         return f"{obj.employee.first_name} {obj.employee.last_name}"
+
+    def get_employee_designation(self, obj):
+        return obj.employee.designation.title if getattr(obj.employee, 'designation', None) else "—"
+
+    def get_employee_entity(self, obj):
+        return obj.employee.entity.name if getattr(obj.employee, 'entity', None) else "—"
 
 class ShiftDefinitionSerializer(serializers.ModelSerializer):
     class Meta:

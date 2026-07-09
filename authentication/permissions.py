@@ -21,7 +21,7 @@ class BaseRolePermission(permissions.BasePermission):
             # For Site Admins accessing HR features like Payroll, grant access if module is enabled
             sites = Site.objects.filter(contact_email=request.user.email)
             for site in sites:
-                if site.modules and any(m in site.modules for m in ['Payroll', 'Payroll Overview', 'Run Payroll', 'Salary Structure']):
+                if site.modules and any(m in site.modules for m in ['Payroll', 'Payroll Overview', 'Run Payroll', 'Salary Structure', 'Import CTC']):
                     return True
             if 'site_admin' not in self.allowed_roles:
                 pass  # fall through to employee check
@@ -144,6 +144,8 @@ def isolate_queryset(qs, user):
             return qs.filter(organization_id__in=org_ids)
         if hasattr(qs.model, 'entity'):
             return qs.filter(entity__organization_id__in=org_ids)
+        if hasattr(qs.model, 'department'):
+            return qs.filter(department__entity__organization_id__in=org_ids)
 
         return qs.none()
 
@@ -167,6 +169,8 @@ def isolate_queryset(qs, user):
             qs = qs.filter(organization=employee.organization)
         elif hasattr(qs.model, 'entity'):
             qs = qs.filter(entity__organization=employee.organization)
+        elif hasattr(qs.model, 'department'):
+            qs = qs.filter(department__entity__organization=employee.organization)
         elif hasattr(qs.model, 'employee'):
             qs = qs.filter(employee__organization=employee.organization)
 
@@ -191,6 +195,8 @@ def isolate_queryset(qs, user):
             if custom_allowed:
                 if hasattr(qs.model, 'entity'):
                     return qs.filter(entity_id__in=custom_allowed)
+                if hasattr(qs.model, 'department'):
+                    return qs.filter(department__entity_id__in=custom_allowed)
                 if hasattr(qs.model, 'employee'):
                     return qs.filter(employee__entity_id__in=custom_allowed)
                 if qs.model.__name__ == 'Employee':
@@ -198,6 +204,8 @@ def isolate_queryset(qs, user):
 
             if hasattr(qs.model, 'entity'):
                 return qs.filter(entity=employee.entity) if employee.entity else qs
+            if hasattr(qs.model, 'department'):
+                return qs.filter(department__entity=employee.entity) if employee.entity else qs
             if hasattr(qs.model, 'employee'):
                 return qs.filter(employee__entity=employee.entity) if employee.entity else qs
             if qs.model.__name__ == 'Employee':
@@ -222,6 +230,8 @@ def isolate_queryset(qs, user):
     if role in ('hr', 'manager'):
         if hasattr(qs.model, 'entity'):
             return qs.filter(entity=employee.entity)
+        if hasattr(qs.model, 'department'):
+            return qs.filter(department__entity=employee.entity)
         if hasattr(qs.model, 'employee'):
             return qs.filter(employee__entity=employee.entity)
         if qs.model.__name__ == 'Employee':

@@ -141,3 +141,19 @@ class Form16DocumentSerializer(serializers.ModelSerializer):
                 return f"{obj.uploaded_by.employee_profile.first_name} {obj.uploaded_by.employee_profile.last_name}"
             return obj.uploaded_by.username
         return ""
+
+from .models import CTCImportHistory
+
+class CTCImportHistorySerializer(serializers.ModelSerializer):
+    imported_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CTCImportHistory
+        fields = '__all__'
+        
+    def get_imported_by_name(self, obj):
+        if obj.imported_by:
+            if hasattr(obj.imported_by, 'employee_profile') and obj.imported_by.employee_profile:
+                return f"{obj.imported_by.employee_profile.first_name} {obj.imported_by.employee_profile.last_name}"
+            return obj.imported_by.username
+        return ""

@@ -4,7 +4,8 @@ from django.utils import timezone
 from employees.models import Employee
 from .models import (
     PayrollRun, Payslip, PayslipLineItem, SimulatedPayslip, SimulatedLineItem,
-    PayrollException, ComponentRule, PayrollSettings, PayslipAllocationSnapshot
+    PayrollException, ComponentRule, PayrollSettings, PayslipAllocationSnapshot,
+    Reimbursement
 )
 from .engine import build_dag_and_sort, evaluate_component, calculate_tds
 
@@ -51,8 +52,9 @@ class PayrollService:
         free_paid_days = weekends + holidays
         
         # 3. Pre-aggregate attendance (Punches)
+        emp_filter = Q(employee__entity=run.entity) | Q(employee__branch__entity=run.entity) | Q(employee__site__branch__entity=run.entity)
         attendance_qs = DailyAttendance.objects.filter(
-            employee__entity=run.entity,
+            emp_filter,
             attendance_date__range=[start_date, end_date]
         ).values('employee_id').annotate(
             present_count=Count('id', filter=Q(attendance_status__in=['Present', 'Late'])),
@@ -65,7 +67,7 @@ class PayrollService:
         
         # 4. Pre-aggregate Paid Leaves
         leaves_qs = LeaveRequest.objects.filter(
-            employee__entity=run.entity,
+            emp_filter,
             status='Approved',
             start_date__lte=end_date,
             end_date__gte=start_date,
@@ -87,7 +89,7 @@ class PayrollService:
         # 5. Pre-aggregate YTD Gross and TDS for TDS calculation
         financial_year_start = f"{year}-04" if month >= 4 else f"{year-1}-04"
         ytd_qs = Payslip.objects.filter(
-            employee__entity=run.entity,
+            emp_filter,
             period__gte=financial_year_start,
             period__lt=run.period
         ).values('employee_id').annotate(
@@ -96,6 +98,13 @@ class PayrollService:
         )
         ytd_map = {item['employee_id']: item for item in ytd_qs}
 
+        # 6. Pre-aggregate Approved Reimbursements
+        reimb_qs = Reimbursement.objects.filter(
+            emp_filter,
+            status='Approved'
+        ).values('employee_id').annotate(total_reimb=Sum('amount'))
+        reimb_map = {item['employee_id']: item['total_reimb'] for item in reimb_qs}
+
         return {
             'total_days': total_days,
             'free_paid_days': free_paid_days,
@@ -103,6 +112,7 @@ class PayrollService:
             'leave_map': leave_map,
             'lop_map': lop_map,
             'ytd_map': ytd_map,
+            'reimb_map': reimb_map,
             'month': month
         }
 
@@ -138,6 +148,10 @@ class PayrollService:
             
         present_days = max(0.0, min(calculated_paid_days, float(total_days)))
         
+        reimbursement_amount = precomputed_data.get('reimb_map', {}).get(employee.id, Decimal('0.00'))
+        if not reimbursement_amount:
+            reimbursement_amount = Decimal('0.00')
+        
         return {
             'ctc': Decimal(employee.ctc or 0),
             'monthly_ctc': Decimal(employee.ctc or 0) / Decimal(12),
@@ -153,6 +167,7 @@ class PayrollService:
             'state': 'KA', 
             'current_month': precomputed_data.get('month', 1),
             'gender': getattr(employee, 'gender', 'Male'),
+            'reimbursement': Decimal(str(reimbursement_amount)),
         }
 
     @staticmethod
@@ -272,6 +287,29 @@ class PayrollService:
                 )
                 line_items.append({'rule': virtual_bonus_rule, 'amount': round(bonus_amount, 2)})
             
+        # ==========================================
+        # AUTOMATED REIMBURSEMENT INJECTION
+        # ==========================================
+        reimbursement_amt = context.get('reimbursement', Decimal('0.00'))
+        if reimbursement_amt > 0:
+            found_reimb = False
+            for item in line_items:
+                if 'REIMBURSEMENT' in getattr(item['rule'], 'name', '').upper():
+                    diff = reimbursement_amt - item['amount']
+                    if diff != 0:
+                        total_gross += diff
+                        item['amount'] = reimbursement_amt
+                    found_reimb = True
+                    break
+                    
+            if not found_reimb:
+                total_gross += reimbursement_amt
+                virtual_reimb_rule, _ = ComponentRule.objects.get_or_create(
+                    name="Reimbursement", 
+                    defaults={'type': 'Earning', 'is_taxable': False, 'formula': 'reimbursement', 'is_statutory': False}
+                )
+                line_items.append({'rule': virtual_reimb_rule, 'amount': reimbursement_amt})
+
         net = total_gross - total_deductions
         if net < 0:
             raise ValueError(f"Negative net pay generated: {net}")
@@ -288,11 +326,12 @@ class PayrollService:
             from django.db import connection
             try:
                 run = PayrollRun.objects.get(id=run_id)
+                from django.db.models import Q
                 if is_simulation:
                     SimulatedPayslip.objects.filter(run=run).delete()
-                    employees = Employee.objects.filter(entity=run.entity, status='Active')
+                    employees = Employee.objects.filter(Q(entity=run.entity) | Q(branch__entity=run.entity) | Q(site__branch__entity=run.entity), status='Active')
                 else:
-                    employees = Employee.objects.filter(entity=run.entity, status='Active').exclude(
+                    employees = Employee.objects.filter(Q(entity=run.entity) | Q(branch__entity=run.entity) | Q(site__branch__entity=run.entity), status='Active').exclude(
                         payslip__run=run
                     )
                     

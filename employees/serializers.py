@@ -1,5 +1,11 @@
 from rest_framework import serializers
-from .models import Employee
+from .models import Employee, EmployeeDocument
+
+class EmployeeDocumentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EmployeeDocument
+        fields = '__all__'
+
 
 class EmployeeSerializer(serializers.ModelSerializer):
     department_name = serializers.CharField(source='department.name', read_only=True)
@@ -9,6 +15,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
     entity_name = serializers.CharField(source='entity.name', read_only=True)
     salary_structure_name = serializers.SerializerMethodField()
     manager_name = serializers.SerializerMethodField()
+    code = serializers.CharField(required=False, allow_blank=True)
     
     class Meta:
         model = Employee

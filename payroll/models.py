@@ -30,6 +30,19 @@ class PayrollEvent(models.Model):
     reference = models.CharField(max_length=100)
     payload = models.JSONField(default=dict)
 
+class CTCImportHistory(models.Model):
+    import_date = models.DateTimeField(auto_now_add=True)
+    imported_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True)
+    records_processed = models.IntegerField(default=0)
+    successful = models.IntegerField(default=0)
+    failed = models.IntegerField(default=0)
+    file_type = models.CharField(max_length=20, default='CSV')
+    duration_seconds = models.IntegerField(default=0)
+    status = models.CharField(max_length=20, choices=[('Completed', 'Completed'), ('Partial', 'Partial'), ('Failed', 'Failed')], default='Completed')
+
+    def __str__(self):
+        return f"Import {self.id} on {self.import_date}"
+
 # ==========================================
 # COST CENTERS & ALLOCATION
 # ==========================================

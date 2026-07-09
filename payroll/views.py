@@ -122,9 +122,14 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         if run.status != 'Maker-Submitted':
             return Response({'error': 'Can only approve Maker-Submitted runs'}, status=400)
             
-        run.status = 'Finance-Pending'
+        run.status = 'Disbursed'
         run.checker = request.user
         run.save()
+        
+        # Mark approved reimbursements as Paid for employees who got a payslip in this run
+        from .models import Reimbursement
+        paid_employees = run.payslips.values_list('employee_id', flat=True)
+        Reimbursement.objects.filter(employee_id__in=paid_employees, status='Approved').update(status='Paid')
         
         comment_text = request.data.get('comment', 'Approved')
         from .models import PayrollRunComment
@@ -284,7 +289,8 @@ class SalarySlipAPIView(APIView):
             
             # If no slips exist yet (but a run exists) we can preview for all employees
             if not db_slips and is_draft:
-                preview_emps = Employee.objects.filter(entity=run.entity, status='Active')
+                from django.db.models import Q
+                preview_emps = Employee.objects.filter(Q(entity=run.entity) | Q(branch__entity=run.entity) | Q(site__branch__entity=run.entity), status='Active')
                 if 'employee' in emp_filter:
                     preview_emps = preview_emps.filter(id=emp_filter['employee'].id)
                 db_slips = [Payslip(employee=e, run=run, period=period) for e in preview_emps]
@@ -638,7 +644,8 @@ class PayrollPreviewAPIView(APIView):
                 run = PayrollRun(period=period, entity=entity, status='Draft')
                 precomputed_data = PayrollService._precompute_payroll_data(run)
                 
-                employees = Employee.objects.filter(entity=entity, status='Active').select_related('salary_structure').prefetch_related('salary_structure__components')
+                from django.db.models import Q
+                employees = Employee.objects.filter(Q(entity=entity) | Q(branch__entity=entity) | Q(site__branch__entity=entity), status='Active').select_related('salary_structure').prefetch_related('salary_structure__components')
                 
                 emp_count = 0
                 total_gross = Decimal('0.00')
@@ -686,7 +693,10 @@ class PayrollPreviewAPIView(APIView):
                         safe_email = getattr(emp, 'email', '')
                         safe_phone = getattr(emp, 'phone', '')
                         safe_site = emp.site.name if getattr(emp, 'site', None) else ''
-                        safe_entity = emp.entity.name if getattr(emp, 'entity', None) else ''
+                        if getattr(emp, 'entity', None): safe_entity = emp.entity.name
+                        elif getattr(emp, 'branch', None) and getattr(emp.branch, 'entity', None): safe_entity = emp.branch.entity.name
+                        elif getattr(emp, 'site', None) and getattr(emp.site, 'branch', None) and getattr(emp.site.branch, 'entity', None): safe_entity = emp.site.branch.entity.name
+                        else: safe_entity = ''
                         safe_dept = emp.department.name if getattr(emp, 'department', None) else ''
                         safe_bank = getattr(emp, 'bank_name', '')
                         safe_ac = getattr(emp, 'bank_account', '')
@@ -744,13 +754,7 @@ class PayrollPreviewAPIView(APIView):
                     print(f"DEBUG ERRORS for entity {entity.name}:", errors)
 
                 if emp_count == 0:
-                    employee_details.append({
-                        'id': 9998, 'name': f"DEBUG: 0 ACTIVE EMPLOYEES FOR {entity.name}!", 'email': '', 'number': '',
-                        'workFrom': '', 'entity': '', 'department': '', 'bankName': '', 'acNo': '',
-                        'ifscCode': '', 'currentSalary': 0, 'totalDays': 0, 'presentDays': 0,
-                        'totalAmount': 0, 'deduction': 0, 'pf': 0, 'pt': 0, 'reimbursement': 0,
-                        'incentive': 0, 'payableSalary': 0, 'isConfidential': False
-                    })
+                    pass
 
                 results.append({
                     'entity': entity.name,
@@ -855,3 +859,208 @@ class Form16DocumentViewSet(viewsets.ModelViewSet):
                 
         return Response(results)
 
+from .models import CTCImportHistory
+from .serializers import CTCImportHistorySerializer
+import csv
+import io
+import time
+from rest_framework.parsers import MultiPartParser
+from django.http import HttpResponse
+
+class CTCImportHistoryViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated, IsHR]
+    queryset = CTCImportHistory.objects.all().order_by('-import_date')
+    serializer_class = CTCImportHistorySerializer
+
+class ImportCTCTemplateView(APIView):
+    permission_classes = [IsAuthenticated, IsHR]
+    
+    def get(self, request):
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="ctc_import_template.csv"'
+        writer = csv.writer(response)
+        
+        # Include fields for context to make filling out the template easier
+        writer.writerow([
+            'Employee Code', 'First Name', 'Last Name', 'Email', 'Department', 'Designation', 
+            'CTC', 'Tax Regime', 'Tax Saving Deductions', 'Salary Structure', 
+            'PF Applicable', 'Bonus Applicable', 'Bonus Type', 'Bonus Value', 'Bonus Months'
+        ])
+        
+        from authentication.permissions import isolate_queryset
+        from employees.models import Employee
+        
+        allowed_employees = isolate_queryset(Employee.objects.all(), request.user).select_related('department', 'designation', 'salary_structure')
+        
+        if not allowed_employees.exists():
+            writer.writerow(['EMP-001', 'John', 'Doe', 'john@example.com', 'Engineering', 'Developer', '', '', '', '', '', '', '', '', ''])
+        else:
+            for emp in allowed_employees:
+                writer.writerow([
+                    emp.code,
+                    emp.first_name,
+                    emp.last_name,
+                    emp.email,
+                    emp.department.name if emp.department else '',
+                    emp.designation.title if emp.designation else '',
+                    '', # CTC should be blank by default as per user request
+                    emp.tax_regime or '',
+                    emp.tax_saving_deductions or '',
+                    emp.salary_structure.name if emp.salary_structure else '',
+                    'Yes' if emp.pf_applicable else 'No',
+                    'Yes' if emp.bonus_applicable else 'No',
+                    emp.bonus_type or '',
+                    emp.bonus_value or '',
+                    emp.bonus_months or ''
+                ])
+                
+        return response
+
+class ImportCTCAPIView(APIView):
+    permission_classes = [IsAuthenticated, IsHR]
+    parser_classes = [MultiPartParser]
+
+    def post(self, request, *args, **kwargs):
+        file = request.FILES.get('file')
+        if not file:
+            return Response({"detail": "No file uploaded."}, status=400)
+            
+        if not file.name.endswith('.csv'):
+            return Response({"detail": "Invalid format. Only .csv is supported."}, status=400)
+            
+        start_time = time.time()
+        
+        try:
+            decoded_file = file.read().decode('utf-8')
+            io_string = io.StringIO(decoded_file)
+            reader = csv.DictReader(io_string)
+        except Exception as e:
+            return Response({"detail": "Invalid format or encoding."}, status=400)
+            
+        if not reader.fieldnames or 'Employee Code' not in reader.fieldnames or 'CTC' not in reader.fieldnames:
+            return Response({"detail": "Invalid format. CSV must contain 'Employee Code' and 'CTC' columns."}, status=400)
+            
+        from authentication.permissions import isolate_queryset
+        
+        allowed_employees = isolate_queryset(Employee.objects.all(), request.user)
+        allowed_employees_dict = {e.code: e for e in allowed_employees}
+        
+        successful = 0
+        failed = 0
+        
+        for row in reader:
+            code = row.get('Employee Code', '').strip()
+            
+            if not code:
+                failed += 1
+                continue
+                
+            emp = allowed_employees_dict.get(code)
+            if not emp:
+                failed += 1
+                continue
+                
+            updated_fields = []
+            
+            ctc_val = row.get('CTC', '').strip()
+            if ctc_val:
+                try:
+                    ctc = int(float(ctc_val))
+                    emp.ctc = ctc
+                    updated_fields.append('ctc')
+                except ValueError:
+                    pass
+                    
+            tax_regime = row.get('Tax Regime', '').strip()
+            if tax_regime in dict(Employee.TAX_REGIME_CHOICES):
+                emp.tax_regime = tax_regime
+                updated_fields.append('tax_regime')
+                
+            tax_saving = row.get('Tax Saving Deductions', '').strip()
+            if tax_saving:
+                try:
+                    emp.tax_saving_deductions = float(tax_saving)
+                    updated_fields.append('tax_saving_deductions')
+                except ValueError: pass
+                
+            struct_name = row.get('Salary Structure', '').strip()
+            if struct_name:
+                from payroll.models import SalaryStructure
+                struct = SalaryStructure.objects.filter(name__iexact=struct_name).first()
+                if struct:
+                    emp.salary_structure = struct
+                    updated_fields.append('salary_structure')
+                    
+            pf_app = row.get('PF Applicable', '').strip().lower()
+            if pf_app in ['yes', 'true', '1']:
+                emp.pf_applicable = True
+                updated_fields.append('pf_applicable')
+            elif pf_app in ['no', 'false', '0']:
+                emp.pf_applicable = False
+                updated_fields.append('pf_applicable')
+                    
+            bonus_app = row.get('Bonus Applicable', '').strip().lower()
+            if bonus_app in ['yes', 'true', '1']:
+                emp.bonus_applicable = True
+                updated_fields.append('bonus_applicable')
+            elif bonus_app in ['no', 'false', '0']:
+                emp.bonus_applicable = False
+                updated_fields.append('bonus_applicable')
+                
+            b_type = row.get('Bonus Type', '').strip()
+            if b_type in dict(Employee.BONUS_TYPE_CHOICES):
+                emp.bonus_type = b_type
+                updated_fields.append('bonus_type')
+                
+            b_val = row.get('Bonus Value', '').strip()
+            if b_val:
+                try:
+                    emp.bonus_value = float(b_val)
+                    updated_fields.append('bonus_value')
+                except ValueError: pass
+                
+            b_months = row.get('Bonus Months', '').strip()
+            if b_months:
+                try:
+                    emp.bonus_months = int(float(b_months))
+                    updated_fields.append('bonus_months')
+                except ValueError: pass
+                
+            if updated_fields:
+                emp.save(update_fields=updated_fields)
+            
+            try:
+                from employees.models import CompensationHistory
+                latest_history = emp.compensation_history.order_by('-effective_from').first()
+                if latest_history:
+                    CompensationHistory.objects.create(
+                        employee=emp,
+                        ctc=ctc,
+                        salary_structure=latest_history.salary_structure,
+                        effective_from=timezone.now().date(),
+                        reason="Bulk CTC Import",
+                        changed_by=request.user
+                    )
+            except Exception as e:
+                pass
+                
+            successful += 1
+            
+        duration = int(time.time() - start_time)
+        status_val = 'Completed' if failed == 0 else ('Failed' if successful == 0 else 'Partial')
+        
+        CTCImportHistory.objects.create(
+            imported_by=request.user,
+            records_processed=successful + failed,
+            successful=successful,
+            failed=failed,
+            file_type='CSV',
+            duration_seconds=duration,
+            status=status_val
+        )
+        
+        return Response({
+            "successful": successful,
+            "failed": failed,
+            "status": status_val
+        })

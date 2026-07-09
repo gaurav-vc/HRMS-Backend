@@ -5,19 +5,20 @@ from .serializers import (
     DepartmentSerializer, DesignationSerializer, RoleSerializer,
     AttendancePolicySerializer
 )
+from authentication.permissions import DataIsolationMixin
 
 
-class EntityViewSet(viewsets.ModelViewSet):
+class EntityViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = Entity.objects.all()
     serializer_class = EntitySerializer
 
-class AttendancePolicyViewSet(viewsets.ModelViewSet):
+class AttendancePolicyViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = AttendancePolicy.objects.all()
     serializer_class = AttendancePolicySerializer
     filterset_fields = ['site', 'organization', 'employee']
 
 
-class BranchViewSet(viewsets.ModelViewSet):
+class BranchViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = Branch.objects.all()
     serializer_class = BranchSerializer
 
@@ -90,7 +91,7 @@ def provision_contact_person(site):
         threading.Thread(target=send_async_new).start()
 
 
-class SiteViewSet(viewsets.ModelViewSet):
+class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = Site.objects.all()
     serializer_class = SiteSerializer
 
@@ -104,11 +105,11 @@ class SiteViewSet(viewsets.ModelViewSet):
         if site.contact_email and site.contact_email != old_email:
             provision_contact_person(site)
 
-class DepartmentViewSet(viewsets.ModelViewSet):
+class DepartmentViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = Department.objects.all()
     serializer_class = DepartmentSerializer
 
-class DesignationViewSet(viewsets.ModelViewSet):
+class DesignationViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = Designation.objects.all()
     serializer_class = DesignationSerializer
 

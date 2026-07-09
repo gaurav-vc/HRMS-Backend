@@ -62,14 +62,65 @@ class LeaveTypeViewSet(viewsets.ReadOnlyModelViewSet):
             return super().get_queryset()
 
 class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = LeaveBalance.objects.all()
     serializer_class = LeaveBalanceSerializer
+
+    def get_queryset(self):
+        qs = LeaveBalance.objects.all()
+        from .models import LeavePolicyConfiguration
+        from datetime import date
+        from decimal import Decimal
+        
+        try:
+            config = LeavePolicyConfiguration.get_settings()
+            for balance in qs:
+                needs_save = False
+                entitlement = balance.leave_type.annual_entitlement
+                if balance.leave_type.code == 'AL' and balance.employee and balance.employee.doj:
+                    years = (date.today() - balance.employee.doj).days / 365.25
+                    if years >= config.tenured_years_threshold:
+                        entitlement = config.tenured_annual_leaves
+                    else:
+                        entitlement = config.standard_annual_leaves
+                        
+                if balance.allocated_days == Decimal('20.00') and entitlement != Decimal('20.00'):
+                    balance.allocated_days = entitlement
+                    balance.remaining_days = entitlement - balance.used_days
+                    needs_save = True
+                elif balance.leave_type.code == 'LOP' and balance.allocated_days != Decimal('0.00'):
+                    balance.allocated_days = Decimal('0.00')
+                    balance.remaining_days = Decimal('0.00') - balance.used_days
+                    needs_save = True
+                    
+                if needs_save:
+                    balance.save()
+        except Exception:
+            pass
+            
+        return qs
 
 from authentication.permissions import DataIsolationMixin
 
 class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
-    queryset = LeaveRequest.objects.all().order_by('-created_at')
     serializer_class = LeaveRequestSerializer
+
+    def get_queryset(self):
+        qs = LeaveRequest.objects.all().order_by('-created_at')
+        
+        mode = self.request.query_params.get('mode')
+        user = self.request.user
+        employee = getattr(user, 'employee_profile', None)
+
+        from authentication.permissions import isolate_queryset
+        qs = isolate_queryset(qs, user)
+
+        if mode == 'inbox' and employee:
+            # Show all leaves they have access to, EXCEPT their own
+            return qs.exclude(employee=employee)
+        elif mode == 'my_leaves' and employee:
+            # Show only their own leaves
+            return qs.filter(employee=employee)
+            
+        return qs
 
     def perform_create(self, serializer):
         try:
@@ -103,13 +154,24 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             balance = LeaveBalance.objects.filter(employee=employee, leave_type=leave_type, year=year).first()
             if not balance:
                 # Auto-create balance for testing/convenience
+                entitlement = leave_type.annual_entitlement
+                if leave_type.code == 'AL' and employee and employee.doj:
+                    from datetime import date
+                    from decimal import Decimal
+                    config = LeavePolicyConfiguration.get_settings()
+                    years_of_service = (date.today() - employee.doj).days / 365.25
+                    if years_of_service >= config.tenured_years_threshold:
+                        entitlement = config.tenured_annual_leaves
+                    else:
+                        entitlement = config.standard_annual_leaves
+
                 balance = LeaveBalance.objects.create(
                     employee=employee,
                     leave_type=leave_type,
                     year=year,
-                    allocated_days=20,
+                    allocated_days=entitlement,
                     used_days=0,
-                    remaining_days=20
+                    remaining_days=entitlement
                 )
     
             if balance.remaining_days < total_days:
@@ -195,9 +257,10 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def dashboard(self, request):
-        pending = LeaveRequest.objects.filter(status='Pending').count()
-        approved = LeaveRequest.objects.filter(status='Approved').count()
-        rejected = LeaveRequest.objects.filter(status='Rejected').count()
+        qs = self.get_queryset()
+        pending = qs.filter(status='Pending').count()
+        approved = qs.filter(status='Approved').count()
+        rejected = qs.filter(status='Rejected').count()
         return Response({
             "pending": pending,
             "approved": approved,
