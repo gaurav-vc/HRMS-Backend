@@ -725,6 +725,8 @@ class PayrollPreviewAPIView(APIView):
                             'leaves': sfloat(context.get('absent_days', 0)),
                             'lopDays': sfloat(context.get('lop_days', 0)),
                             'ot': sfloat(context.get('ot_hours', context.get('overtime_hours', 0))),
+                            'halfDays': sfloat(context.get('half_day_count', 0)),
+                            'latePenalties': sfloat(context.get('late_penalty_days', 0)),
                             'daysPaid': sfloat(context.get('paid_days', 0)),
                             'totalAmount': 0 if hide_money else sfloat(gross),
                             'deduction': 0 if hide_money else sfloat(ded),

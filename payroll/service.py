@@ -161,6 +161,8 @@ class PayrollService:
             'overtime_hours': Decimal(str(overtime_hours)),
             'absent_days': Decimal(str(absent_count)),
             'lop_days': Decimal(str(lop_days)),
+            'half_day_count': Decimal(str(half_day_count)),
+            'late_penalty_days': Decimal(str(late_penalty_days)),
             'paid_days': Decimal(str(present_days)),
             'pf_wage_limit': settings.pf_wage_limit,
             'esic_wage_limit': settings.esic_wage_limit,
@@ -306,7 +308,7 @@ class PayrollService:
                 total_gross += reimbursement_amt
                 virtual_reimb_rule, _ = ComponentRule.objects.get_or_create(
                     name="Reimbursement", 
-                    defaults={'type': 'Earning', 'is_taxable': False, 'formula': 'reimbursement', 'is_statutory': False}
+                    defaults={'type': 'Earning', 'formula': 'reimbursement', 'is_statutory': False, 'effective_from': timezone.now().date()}
                 )
                 line_items.append({'rule': virtual_reimb_rule, 'amount': reimbursement_amt})
 
