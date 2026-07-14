@@ -531,11 +531,14 @@ class OfferLetterViewSet(viewsets.ModelViewSet):
         final_metrics = {k: metrics_dict.get(k, 0) for k in all_statuses.keys()}
         
         from datetime import date
+        from django.db.models.functions import Coalesce
         today = date.today()
-        upcoming_qs = self.queryset.filter(
+        upcoming_qs = self.queryset.annotate(
+            effective_joining_date=Coalesce('joining_date', 'employee__doj')
+        ).filter(
             status__in=['Pending Approval', 'Awaiting Acceptance', 'Accepted'],
-            joining_date__gte=today
-        ).order_by('joining_date')[:5]
+            effective_joining_date__gte=today
+        ).order_by('effective_joining_date')[:5]
         
         upcoming = OfferLetterSerializer(upcoming_qs, many=True).data
         

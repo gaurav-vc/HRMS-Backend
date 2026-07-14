@@ -9,6 +9,17 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     def validate(self, attrs):
         data = super().validate(attrs)
         
+        # Automated LWD Deactivation Logic
+        if hasattr(self.user, 'employee_profile') and hasattr(self.user.employee_profile, 'exit_process'):
+            exit_process = self.user.employee_profile.exit_process
+            if exit_process.status == 'Approved' and exit_process.last_working_day <= timezone.now().date():
+                self.user.is_active = False
+                self.user.save()
+                exit_process.status = 'Deactivated'
+                exit_process.save()
+                from rest_framework.exceptions import AuthenticationFailed
+                raise AuthenticationFailed("Account deactivated: Last working day has passed.")
+        
         # Log successful login
         request = self.context.get('request')
         ip_address = request.META.get('REMOTE_ADDR') if request else None

@@ -220,12 +220,13 @@ def isolate_queryset(qs, user):
 
     # ── LEGACY ROLE LOGIC ────────────────────────────────────────────────────
     if role == 'site_admin':
+        from django.db.models import Q
         if hasattr(qs.model, 'site'):
             return qs.filter(site=employee.site)
         if hasattr(qs.model, 'employee'):
-            return qs.filter(employee__site=employee.site)
+            return qs.filter(Q(employee__site=employee.site) | Q(employee__enrolled_sites=employee.site)).distinct()
         if qs.model.__name__ == 'Employee':
-            return qs.filter(site=employee.site)
+            return qs.filter(Q(site=employee.site) | Q(enrolled_sites=employee.site)).distinct()
 
     if role in ('hr', 'manager'):
         if hasattr(qs.model, 'entity'):

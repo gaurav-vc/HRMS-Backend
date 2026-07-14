@@ -52,6 +52,7 @@ INSTALLED_APPS = [
     'ot_engine',
     'org_engine',
     'admin_org',
+    'drf_spectacular',
 ]
 
 MIDDLEWARE = [
@@ -149,6 +150,18 @@ REST_FRAMEWORK = {
     'DEFAULT_PARSER_CLASSES': (
         'djangorestframework_camel_case.parser.CamelCaseJSONParser',
     ),
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'HRMS API',
+    'DESCRIPTION': 'API for HRMS Platform (Web & Mobile Apps)',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    'CAMELIZE_NAMES': True,
+    'POSTPROCESSING_HOOKS': [
+        'drf_spectacular.hooks.postprocess_schema_enums'
+    ],
 }
 
 JSON_CAMEL_CASE = {

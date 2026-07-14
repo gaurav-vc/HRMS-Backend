@@ -28,6 +28,59 @@ from .qr_service import CryptographicQRService
 from .models import EnrollmentAudit, ConsentLog, ManualOverrideRequest
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 
+import threading
+from django.core.mail import EmailMultiAlternatives
+from django.utils.html import strip_tags
+
+def send_shift_email_async(emp_email, emp_name, shift_name, shift_start, shift_end, dates_str):
+    if not emp_email:
+        return
+        
+    def _send():
+        subject = f'Your Shift Assignment: {shift_name}'
+        
+        html_content = f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+                <div style="background-color: #0b1b3d; padding: 20px; border-radius: 8px 8px 0 0; text-align: center;">
+                    <h2 style="color: white; margin: 0;">Shift Assignment Update</h2>
+                </div>
+                <div style="padding: 30px; border: 1px solid #ddd; border-top: none; border-radius: 0 0 8px 8px;">
+                    <p style="font-size: 16px;">Hello <strong>{emp_name}</strong>,</p>
+                    <p style="font-size: 15px; line-height: 1.5;">You have been assigned to a new shift. Please find the details of your assignment below:</p>
+                    
+                    <div style="background-color: #f8fafc; padding: 20px; border-radius: 6px; margin: 25px 0;">
+                        <p style="margin: 0 0 10px 0;"><strong>Shift Name:</strong> {shift_name}</p>
+                        <p style="margin: 0 0 10px 0;"><strong>Timings:</strong> {shift_start} to {shift_end}</p>
+                        <p style="margin: 0;"><strong>Applicable Dates:</strong> {dates_str}</p>
+                    </div>
+                    
+                    <p style="font-size: 14px; color: #666;">If you have any questions or conflicts, please reach out to your manager immediately.</p>
+                    <br/>
+                    <p style="font-size: 14px; color: #666; margin: 0;">Best Regards,</p>
+                    <p style="font-size: 14px; color: #666; font-weight: bold; margin: 5px 0 0 0;">HRMS Administration</p>
+                </div>
+            </body>
+        </html>
+        """
+        
+        text_content = strip_tags(html_content)
+        
+        try:
+            msg = EmailMultiAlternatives(
+                subject=subject,
+                body=text_content,
+                from_email='HRMS Admin <gauravkokane420op@gmail.com>',
+                to=[emp_email]
+            )
+            msg.attach_alternative(html_content, "text/html")
+            msg.send(fail_silently=True)
+            print(f"Shift email successfully dispatched to {emp_email}")
+        except Exception as e:
+            print(f"Failed to send shift email to {emp_email}: {str(e)}")
+            
+    threading.Thread(target=_send).start()
+
 class AttendanceViewSet(viewsets.ViewSet):
     parser_classes = (MultiPartParser, FormParser, JSONParser)
     
@@ -628,19 +681,37 @@ class RosterViewSet(viewsets.ViewSet):
                 title="Shift Assignment Updated",
                 message=f"You have been assigned to the {shift.name} shift ({shift.start_time.strftime('%I:%M %p')} to {shift.end_time.strftime('%I:%M %p')}) for {date}."
             )
+            
+            # Trigger async email
+            emp = Employee.objects.get(id=employee_id)
+            if emp.email:
+                send_shift_email_async(
+                    emp_email=emp.email,
+                    emp_name=f"{emp.first_name} {emp.last_name}",
+                    shift_name=shift.name,
+                    shift_start=shift.start_time.strftime('%I:%M %p'),
+                    shift_end=shift.end_time.strftime('%I:%M %p'),
+                    dates_str=str(date)
+                )
+                
             return Response(ShiftAssignmentSerializer(assignment).data)
         except ShiftDefinition.DoesNotExist:
             return Response({"error": "Shift not found"}, status=404)
 
     @action(detail=False, methods=['post'])
     def bulk_assign(self, request):
-        department_id = request.data.get('department_id')
+        department_ids = request.data.get('department_ids', [])
+        
+        # Fallback for legacy requests passing single department_id
+        if not department_ids and 'department_id' in request.data:
+            department_ids = [request.data.get('department_id')]
+            
         shift_id = request.data.get('shift_id')
         start_date = request.data.get('start_date')
         end_date = request.data.get('end_date')
 
-        if not all([department_id, shift_id, start_date, end_date]):
-            return Response({"error": "department_id, shift_id, start_date, and end_date are required"}, status=400)
+        if not department_ids or not shift_id or not start_date or not end_date:
+            return Response({"error": "department_ids, shift_id, start_date, and end_date are required"}, status=400)
 
         try:
             shift = ShiftDefinition.objects.get(id=shift_id)
@@ -656,7 +727,7 @@ class RosterViewSet(viewsets.ViewSet):
         if start_dt > end_dt:
             return Response({"error": "start_date cannot be after end_date"}, status=400)
 
-        employees = Employee.objects.filter(department_id=department_id, status='Active')
+        employees = Employee.objects.filter(department_id__in=department_ids, status='Active')
         
         delta = end_dt - start_dt
         dates = [start_dt + timedelta(days=i) for i in range(delta.days + 1)]
@@ -688,6 +759,18 @@ class RosterViewSet(viewsets.ViewSet):
                 )
             if notifications:
                 Notification.objects.bulk_create(notifications)
+                
+            # Trigger async emails for bulk assignment
+            for emp in employees:
+                if emp.email:
+                    send_shift_email_async(
+                        emp_email=emp.email,
+                        emp_name=f"{emp.first_name} {emp.last_name}",
+                        shift_name=shift.name,
+                        shift_start=shift.start_time.strftime('%I:%M %p'),
+                        shift_end=shift.end_time.strftime('%I:%M %p'),
+                        dates_str=f"{start_date} to {end_date}"
+                    )
             
         return Response({"message": f"Successfully assigned shift to {employees.count()} employees for {len(dates)} days ({len(assignments_to_create)} total assignments)."})
 

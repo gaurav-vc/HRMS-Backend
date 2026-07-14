@@ -72,6 +72,7 @@ class Employee(models.Model):
     entity = models.ForeignKey(Entity, on_delete=models.SET_NULL, null=True, blank=True, related_name='employees')
     branch = models.ForeignKey(Branch, on_delete=models.SET_NULL, null=True, blank=True, related_name='employees')
     site = models.ForeignKey(Site, on_delete=models.SET_NULL, null=True, blank=True, related_name='employees')
+    enrolled_sites = models.ManyToManyField(Site, related_name='enrolled_employees', blank=True)
     department = models.ForeignKey(Department, on_delete=models.SET_NULL, null=True, blank=True, related_name='employees')
     designation = models.ForeignKey(Designation, on_delete=models.SET_NULL, null=True, blank=True, related_name='employees')
     
@@ -137,10 +138,10 @@ class EmployeeExit(models.Model):
     ]
     employee = models.OneToOneField(Employee, on_delete=models.CASCADE, related_name='exit_process')
     exit_type = models.CharField(max_length=50, choices=EXIT_TYPES)
-    reason = models.TextField()
+    reason = models.TextField(blank=True, null=True)
     
     notice_period_days = models.IntegerField(default=30)
-    resignation_date = models.DateField()
+    resignation_date = models.DateField(auto_now_add=True)
     last_working_day = models.DateField()
     
     manager_approved = models.BooleanField(default=False)
@@ -149,7 +150,7 @@ class EmployeeExit(models.Model):
     finance_cleared = models.BooleanField(default=False)
     
     fnf_status = models.CharField(max_length=50, default='Pending') # Full & Final
-    status = models.CharField(max_length=50, default='Initiated') # Initiated, In Progress, Completed
+    status = models.CharField(max_length=50, default='Pending') # Pending, Approved, Rejected, Deactivated
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

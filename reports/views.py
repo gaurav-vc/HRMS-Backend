@@ -21,38 +21,42 @@ class DashboardView(DataIsolationMixin, APIView):
         user = request.user
         emp = getattr(user, 'employee_profile', None)
         
-        # Base filter based on user role (simulating DataIsolation)
-        emp_filter = {}
+        from django.db.models import Q
+        emp_q = Q()
+        related_q = Q()
         if not user.is_superuser and emp:
             if emp.role == 'org_admin':
-                emp_filter['entity'] = emp.entity
+                emp_q = Q(entity=emp.entity)
+                related_q = Q(employee__entity=emp.entity)
             elif emp.role == 'site_admin':
-                emp_filter['site'] = emp.site
+                emp_q = Q(site=emp.site) | Q(enrolled_sites=emp.site)
+                related_q = Q(employee__site=emp.site) | Q(employee__enrolled_sites=emp.site)
             elif emp.role in ['hr', 'manager']:
-                emp_filter['entity'] = emp.entity
+                emp_q = Q(entity=emp.entity)
+                related_q = Q(employee__entity=emp.entity)
         
         # Employee metrics
-        total_employees = Employee.objects.filter(status='Active', **emp_filter).count()
+        total_employees = Employee.objects.filter(emp_q, status='Active').distinct().count()
         new_joiners = Employee.objects.filter(
+            emp_q,
             status='Active', 
-            doj__gte=timezone.now().date().replace(day=1),
-            **emp_filter
-        ).count()
+            doj__gte=timezone.now().date().replace(day=1)
+        ).distinct().count()
         
         # Attendance metrics for today
         today = timezone.now().date()
         present_today = DailyAttendance.objects.filter(
+            related_q,
             attendance_date=today,
             attendance_status__in=['Present', 'Late'],
-            employee__status='Active',
-            **{f"employee__{k}": v for k, v in emp_filter.items()}
-        ).count()
+            employee__status='Active'
+        ).distinct().count()
         
         # Payroll metrics for current month
         period = today.strftime('%Y-%m')
         total_payroll_qs = Payslip.objects.filter(
-            period=period,
-            **{f"employee__{k}": v for k, v in emp_filter.items()}
+            related_q,
+            period=period
         ).aggregate(
             total_net=Sum('net'),
             total_gross=Sum('gross'),

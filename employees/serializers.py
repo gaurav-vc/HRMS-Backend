@@ -65,6 +65,7 @@ class OfferLetterSerializer(serializers.ModelSerializer):
     designation_name = serializers.CharField(source='employee.designation.title', read_only=True)
     department_name = serializers.CharField(source='employee.department.name', read_only=True)
     entity_name = serializers.CharField(source='employee.site.branch.entity.name', read_only=True, default='')
+    joining_date = serializers.SerializerMethodField()
 
     class Meta:
         model = OfferLetter
@@ -75,3 +76,9 @@ class OfferLetterSerializer(serializers.ModelSerializer):
     
     def get_candidate_email(self, obj):
         return obj.employee.email
+
+    def get_joining_date(self, obj):
+        # Fallback to employee.doj if OfferLetter.joining_date is not set
+        if obj.joining_date:
+            return obj.joining_date
+        return obj.employee.doj if hasattr(obj, 'employee') and obj.employee else None

@@ -17,6 +17,7 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path, include
 from django.http import HttpResponse
+from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
 def favicon_view(request):
     return HttpResponse(status=204)
@@ -34,6 +35,10 @@ urlpatterns = [
     path('api/reports/', include('reports.urls')),
     path('api/ot/', include('ot_engine.urls')),
     path('api/org-engine/', include('org_engine.urls')),
+    
+    # OpenAPI Schema & Swagger Docs
+    path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
+    path('api/docs/', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),
 ]
 
 from django.conf import settings

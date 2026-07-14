@@ -1,4 +1,5 @@
 from rest_framework import viewsets
+from rest_framework.decorators import action
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from .models import PayrollRun, Loan, Reimbursement, ComponentRule, ComplianceReport, SalaryStructure, PayrollException
@@ -66,6 +67,35 @@ class ComponentRuleViewSet(viewsets.ModelViewSet):
 class ComplianceReportViewSet(viewsets.ModelViewSet):
     queryset = ComplianceReport.objects.all().order_by('due')
     serializer_class = ComplianceReportSerializer
+
+    @action(detail=False, methods=['get'])
+    def generate_return(self, request):
+        category = request.query_params.get('category')
+        if not category:
+            return Response({'error': 'Category is required'}, status=400)
+            
+        pending_reports = self.get_queryset().filter(category=category, status='Pending')
+        
+        import csv
+        from django.http import HttpResponse
+        
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = f'attachment; filename="Compliance_Return_{category.replace(" ", "_")}.csv"'
+        
+        writer = csv.writer(response)
+        writer.writerow(['Category', 'Key', 'Description', 'Period', 'Amount', 'Due Date'])
+        
+        for report in pending_reports:
+            writer.writerow([
+                report.category,
+                report.key,
+                report.desc,
+                report.period,
+                report.amount,
+                report.due.strftime('%Y-%m-%d') if report.due else ''
+            ])
+            
+        return response
 
 from rest_framework.decorators import action
 from .service import PayrollService
@@ -215,6 +245,8 @@ class SalarySlipAPIView(APIView):
             
             user = request.user
             emp_filter = {}
+            from django.db.models import Q
+            emp_q = Q()
             can_view_confidential = False
             
             if hasattr(user, 'employee_profile') and user.employee_profile:
@@ -253,7 +285,7 @@ class SalarySlipAPIView(APIView):
                     elif emp.role in ['org_admin', 'hr', 'manager']:
                         emp_filter['employee__entity'] = emp.entity
                     elif emp.role == 'site_admin':
-                        emp_filter['employee__site'] = emp.site
+                        emp_q = Q(employee__site=emp.site) | Q(employee__enrolled_sites=emp.site)
                     else:
                         emp_filter['employee'] = emp
         except Exception as e:
@@ -271,7 +303,7 @@ class SalarySlipAPIView(APIView):
             month_start = date(p_year, p_month, 1)
             month_end = date(p_year, p_month, total_days_in_month)
             calc_end = month_end
-            db_slips = Payslip.objects.filter(period=period, **emp_filter).select_related('employee', 'employee__manager', 'employee__department').prefetch_related('lines', 'lines__rule')
+            db_slips = Payslip.objects.filter(emp_q, period=period, **emp_filter).select_related('employee', 'employee__manager', 'employee__department').prefetch_related('lines', 'lines__rule')
             
             # Determine if we should dynamically calculate
             from payroll.models import PayrollRun
