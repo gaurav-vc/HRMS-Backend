@@ -782,8 +782,7 @@ class HolidayViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def stats(self, request):
         today = timezone.now().date()
-        current_year = today.year
-        holidays = Holiday.objects.filter(date__year=current_year, status='Active')
+        holidays = Holiday.objects.all()
         
         return Response({
             "total_holidays": holidays.count(),

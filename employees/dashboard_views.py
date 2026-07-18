@@ -9,6 +9,8 @@ from leaves.models import LeaveRequest
 from attendance.models import DailyAttendance, PunchLog, RegularizationRequest
 from payroll.models import PayrollRun, Loan, Reimbursement
 from decimal import Decimal
+from django.db.models import Count
+from datetime import date
 
 class DashboardStatsAPIView(APIView):
     def get(self, request):
@@ -19,7 +21,9 @@ class DashboardStatsAPIView(APIView):
         emp = getattr(user, 'employee_profile', None)
         if emp and emp.role == 'super_admin':
             is_super_admin = True
-        if emp and emp.dynamic_role and emp.dynamic_role.permissions and emp.dynamic_role.permissions.get('can_view_confidential_payroll'):
+        if is_super_admin:
+            can_view_confidential = True
+        elif emp and emp.dynamic_role and emp.dynamic_role.permissions and emp.dynamic_role.permissions.get('can_view_confidential_payroll'):
             can_view_confidential = True
         
         from authentication.permissions import isolate_queryset
@@ -118,7 +122,7 @@ class DashboardStatsAPIView(APIView):
             # Stats for super admin
             super_admin_stats = {
                 "totalRevenue": 24000, # mock for now
-                "activeSites": Site.objects.filter(qr_enabled=True).count() or 5,
+                "activeSites": Site.objects.filter(status='Active').count(),
                 "totalUsers": Employee.objects.count(),
                 "totalCompany": Organization.objects.count(),
                 "moduleWiseRevenue": [
@@ -127,26 +131,49 @@ class DashboardStatsAPIView(APIView):
                     {"module": "calendar", "revenue": 0},
                     {"module": "projects", "revenue": 0},
                     {"module": "tasks", "revenue": 0}
-                ],
-                "companyWiseSite": [
-                    {"name": "Jan", "acmeCorp": 40, "test": 24, "tcs": 24},
-                    {"name": "Feb", "acmeCorp": 30, "test": 13, "tcs": 22},
-                    {"name": "Mar", "acmeCorp": 20, "test": 58, "tcs": 22},
-                    {"name": "Apr", "acmeCorp": 27, "test": 39, "tcs": 20},
-                    {"name": "May", "acmeCorp": 18, "test": 48, "tcs": 21},
-                    {"name": "Jun", "acmeCorp": 23, "test": 38, "tcs": 25},
-                    {"name": "Jul", "acmeCorp": 34, "test": 43, "tcs": 21}
-                ],
-                "moduleWiseSite": [
-                    {"name": "Jan", "site": 40},
-                    {"name": "Feb", "site": 30},
-                    {"name": "Mar", "site": 20},
-                    {"name": "Apr", "site": 27},
-                    {"name": "May", "site": 18},
-                    {"name": "Jun", "site": 23},
-                    {"name": "Jul", "site": 34}
                 ]
             }
+            
+            try:
+                # Real dynamic data for charts
+                top_orgs = list(Organization.objects.annotate(site_count=Count('sites')).order_by('-site_count')[:3])
+                top_org_names = [org.name for org in top_orgs]
+                
+                today = timezone.now().date()
+                months = []
+                for i in range(6, -1, -1):
+                    m = today.month - i
+                    y = today.year
+                    while m <= 0:
+                        m += 12
+                        y -= 1
+                    months.append(date(y, m, 1))
+                
+                company_wise_data = []
+                for m in months:
+                    month_name = m.strftime('%b')
+                    data_point = {"name": month_name}
+                    for org in top_orgs:
+                        # safe filtering by date if created_at exists
+                        count = Site.objects.filter(organization=org, created_at__date__lte=date(m.year, m.month, 28)).count()
+                        data_point[org.name] = count
+                    company_wise_data.append(data_point)
+                
+                module_wise_data = []
+                for m in months:
+                    month_name = m.strftime('%b')
+                    count = Site.objects.filter(created_at__date__lte=date(m.year, m.month, 28)).count()
+                    module_wise_data.append({"name": month_name, "site": count})
+                    
+                super_admin_stats["companyWiseSite"] = company_wise_data
+                super_admin_stats["moduleWiseSite"] = module_wise_data
+                super_admin_stats["topOrgs"] = top_org_names
+            except Exception as e:
+                import traceback
+                print("DASHBOARD STATS ERROR:", traceback.format_exc())
+                super_admin_stats["companyWiseSite"] = [{"name": "Error", "Error": 0}]
+                super_admin_stats["moduleWiseSite"] = [{"name": "Error", "site": 0}]
+                super_admin_stats["topOrgs"] = ["Error: " + str(e)[:30]]
 
         payload = {
             "super_admin": super_admin_stats,

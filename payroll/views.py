@@ -249,11 +249,14 @@ class SalarySlipAPIView(APIView):
             emp_q = Q()
             can_view_confidential = False
             
-            if hasattr(user, 'employee_profile') and user.employee_profile:
+            if user.is_superuser:
+                can_view_confidential = True
+            elif hasattr(user, 'employee_profile') and user.employee_profile:
                 emp = user.employee_profile
-                if emp.dynamic_role and emp.dynamic_role.permissions and emp.dynamic_role.permissions.get('can_view_confidential_payroll'):
+                if emp.role == 'super_admin':
                     can_view_confidential = True
-
+                elif emp.dynamic_role and emp.dynamic_role.permissions and emp.dynamic_role.permissions.get('can_view_confidential_payroll'):
+                    can_view_confidential = True
             if not user.is_superuser:
                 emp = getattr(user, 'employee_profile', None)
                 if not emp:
@@ -641,11 +644,16 @@ class PayrollPreviewAPIView(APIView):
             user = request.user
             can_view_confidential = False
             if user and user.is_authenticated:
-                emp = getattr(user, 'employee_profile', None)
-                if emp and emp.dynamic_role:
-                    perms = emp.dynamic_role.permissions or {}
-                    if perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1']:
+                if user.is_superuser:
+                    can_view_confidential = True
+                else:
+                    emp = getattr(user, 'employee_profile', None)
+                    if emp and emp.role == 'super_admin':
                         can_view_confidential = True
+                    elif emp and emp.dynamic_role:
+                        perms = emp.dynamic_role.permissions or {}
+                        if perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1']:
+                            can_view_confidential = True
             
             from organisation.models import Entity
             from payroll.models import PayrollRun
@@ -663,12 +671,16 @@ class PayrollPreviewAPIView(APIView):
             user = request.user
             can_view_confidential = False
             if user and user.is_authenticated:
-                emp = getattr(user, 'employee_profile', None)
-                if emp and emp.dynamic_role:
-                    perms = emp.dynamic_role.permissions or {}
-                    if perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1']:
+                if user.is_superuser:
+                    can_view_confidential = True
+                else:
+                    emp = getattr(user, 'employee_profile', None)
+                    if emp and emp.role == 'super_admin':
                         can_view_confidential = True
-
+                    elif emp and emp.dynamic_role:
+                        perms = emp.dynamic_role.permissions or {}
+                        if perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1']:
+                            can_view_confidential = True
             results = []
 
             for entity in entities:
@@ -911,7 +923,7 @@ class ImportCTCTemplateView(APIView):
     
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
-        response['Content-Disposition'] = 'attachment; filename="ctc_import_template.csv"'
+        response['Content-Disposition'] = 'attachment; filename="CTC import template.csv"'
         writer = csv.writer(response)
         
         # Include fields for context to make filling out the template easier
@@ -921,32 +933,9 @@ class ImportCTCTemplateView(APIView):
             'PF Applicable', 'Bonus Applicable', 'Bonus Type', 'Bonus Value', 'Bonus Months'
         ])
         
-        from authentication.permissions import isolate_queryset
-        from employees.models import Employee
-        
-        allowed_employees = isolate_queryset(Employee.objects.all(), request.user).select_related('department', 'designation', 'salary_structure')
-        
-        if not allowed_employees.exists():
-            writer.writerow(['EMP-001', 'John', 'Doe', 'john@example.com', 'Engineering', 'Developer', '', '', '', '', '', '', '', '', ''])
-        else:
-            for emp in allowed_employees:
-                writer.writerow([
-                    emp.code,
-                    emp.first_name,
-                    emp.last_name,
-                    emp.email,
-                    emp.department.name if emp.department else '',
-                    emp.designation.title if emp.designation else '',
-                    '', # CTC should be blank by default as per user request
-                    emp.tax_regime or '',
-                    emp.tax_saving_deductions or '',
-                    emp.salary_structure.name if emp.salary_structure else '',
-                    'Yes' if emp.pf_applicable else 'No',
-                    'Yes' if emp.bonus_applicable else 'No',
-                    emp.bonus_type or '',
-                    emp.bonus_value or '',
-                    emp.bonus_months or ''
-                ])
+        # Output reference dummy rows instead of real employee data
+        writer.writerow(['EMP-001', 'John', 'Doe', 'john@example.com', 'Engineering', 'Developer', '1200000', 'New', '0', 'Client Structure', 'Yes', 'Yes', 'Fixed Amount', '50000', '1'])
+        writer.writerow(['EMP-002', 'Jane', 'Smith', 'jane@example.com', 'HR', 'Manager', '1500000', 'Old', '150000', 'Client Structure', 'No', 'No', '', '', ''])
                 
         return response
 
@@ -1069,7 +1058,7 @@ class ImportCTCAPIView(APIView):
                 if latest_history:
                     CompensationHistory.objects.create(
                         employee=emp,
-                        ctc=ctc,
+                        ctc=emp.ctc,
                         salary_structure=latest_history.salary_structure,
                         effective_from=timezone.now().date(),
                         reason="Bulk CTC Import",

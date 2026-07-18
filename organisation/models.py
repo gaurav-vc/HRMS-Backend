@@ -1,4 +1,5 @@
 from django.db import models
+from django.utils import timezone
 from admin_org.models import Organization
 
 
@@ -10,6 +11,10 @@ class Entity(models.Model):
     currency = models.CharField(max_length=10, default='INR')
     gstin = models.CharField(max_length=50, blank=True, null=True)
     status = models.CharField(max_length=20, default='Active')
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ['-created_at']
 
     def __str__(self):
         return self.name
@@ -21,6 +26,10 @@ class Branch(models.Model):
     city = models.CharField(max_length=100, blank=True, null=True)
     state = models.CharField(max_length=100, blank=True, null=True)
     head = models.CharField(max_length=100, blank=True, null=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ['-created_at']
 
     def __str__(self):
         return f"{self.name} ({self.entity.name})"
@@ -49,6 +58,10 @@ class Site(models.Model):
     radius = models.IntegerField(default=150)
     qr_enabled = models.BooleanField(default=True)
     face_enabled = models.BooleanField(default=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ['-created_at']
 
     def __str__(self):
         return self.name
@@ -58,6 +71,10 @@ class Department(models.Model):
     entity = models.ForeignKey(Entity, on_delete=models.CASCADE, related_name='departments', null=True, blank=True)
     code = models.CharField(max_length=50, blank=True, null=True)
     head = models.CharField(max_length=100, blank=True, null=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ['-created_at']
 
     def __str__(self):
         return self.name
@@ -66,6 +83,10 @@ class Designation(models.Model):
     title = models.CharField(max_length=100)
     department = models.ForeignKey(Department, on_delete=models.CASCADE, related_name='designations', null=True, blank=True)
     grade = models.CharField(max_length=50, blank=True, null=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ['-created_at']
 
     def __str__(self):
         return self.title

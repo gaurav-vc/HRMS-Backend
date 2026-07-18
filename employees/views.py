@@ -14,7 +14,7 @@ from rest_framework.permissions import IsAuthenticated
 import json
 
 class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
-    queryset = Employee.objects.all()
+    queryset = Employee.objects.exclude(user__is_superuser=True)
     serializer_class = EmployeeSerializer
     permission_classes = [IsAuthenticated]
 

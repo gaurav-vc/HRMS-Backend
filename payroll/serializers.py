@@ -52,7 +52,11 @@ class PayrollRunSerializer(serializers.ModelSerializer):
         if not request or not request.user.is_authenticated:
             return False
         user = request.user
+        if user.is_superuser:
+            return True
         emp = getattr(user, 'employee_profile', None)
+        if emp and emp.role == 'super_admin':
+            return True
         if emp and emp.dynamic_role and emp.dynamic_role.permissions and emp.dynamic_role.permissions.get('can_view_confidential_payroll'):
             return True
         return False

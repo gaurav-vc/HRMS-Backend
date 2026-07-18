@@ -15,5 +15,6 @@ router.register(r'offer-templates', OfferTemplateViewSet, basename='offer-templa
 urlpatterns = [
     path('dashboard/stats/', DashboardStatsAPIView.as_view(), name='dashboard-stats'),
     path('search/', GlobalSearchAPIView.as_view(), name='global-search'),
+    path('workspace/notifications/', NotificationViewSet.as_view({'get': 'list'}), name='workspace-notifications'),
     path('', include(router.urls)),
 ]

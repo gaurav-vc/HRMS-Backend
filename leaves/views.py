@@ -8,6 +8,59 @@ from .serializers import LeaveTypeSerializer, LeaveBalanceSerializer, LeaveReque
 from decimal import Decimal
 from datetime import timedelta
 from django.db.models import Q
+import threading
+from django.core.mail import EmailMultiAlternatives
+from django.utils.html import strip_tags
+
+def send_leave_email_async(emp_email, emp_name, status, start_date, end_date, total_days, reason, manager_comments):
+    if not emp_email:
+        return
+        
+    def _send():
+        subject = f'Your Leave Request has been {status}'
+        
+        html_content = f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+                <div style="background-color: #0b1b3d; padding: 20px; border-radius: 8px 8px 0 0; text-align: center;">
+                    <h2 style="color: white; margin: 0;">Leave Request Update</h2>
+                </div>
+                <div style="padding: 30px; border: 1px solid #ddd; border-top: none; border-radius: 0 0 8px 8px;">
+                    <p style="font-size: 16px;">Hello <strong>{emp_name}</strong>,</p>
+                    <p style="font-size: 15px; line-height: 1.5;">Your leave request has been <strong>{status}</strong>. Please find the details below:</p>
+                    
+                    <div style="background-color: #f8fafc; padding: 20px; border-radius: 6px; margin: 25px 0;">
+                        <p style="margin: 0 0 10px 0;"><strong>Status:</strong> {status}</p>
+                        <p style="margin: 0 0 10px 0;"><strong>Dates:</strong> {start_date} to {end_date}</p>
+                        <p style="margin: 0 0 10px 0;"><strong>Total Days:</strong> {total_days}</p>
+                        <p style="margin: 0 0 10px 0;"><strong>Reason:</strong> {reason}</p>
+                        <p style="margin: 0;"><strong>Manager Comments:</strong> {manager_comments}</p>
+                    </div>
+                    
+                    <br/>
+                    <p style="font-size: 14px; color: #666; margin: 0;">Best Regards,</p>
+                    <p style="font-size: 14px; color: #666; font-weight: bold; margin: 5px 0 0 0;">HRMS Administration</p>
+                </div>
+            </body>
+        </html>
+        """
+        
+        text_content = strip_tags(html_content)
+        
+        try:
+            msg = EmailMultiAlternatives(
+                subject=subject,
+                body=text_content,
+                from_email='HRMS Admin <hr@example.com>',
+                to=[emp_email]
+            )
+            msg.attach_alternative(html_content, "text/html")
+            msg.send(fail_silently=True)
+            print(f"Leave status email successfully dispatched to {emp_email}")
+        except Exception as e:
+            print(f"Failed to send leave status email to {emp_email}: {str(e)}")
+            
+    threading.Thread(target=_send).start()
 
 def calculate_working_days(start_date, end_date, site_id=None):
     # Fetch holidays between dates
@@ -241,6 +294,18 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         leave_req.approved_by = "Manager" # In real app, request.user
         leave_req.save()
 
+        if leave_req.employee and leave_req.employee.email:
+            send_leave_email_async(
+                emp_email=leave_req.employee.email,
+                emp_name=f"{leave_req.employee.first_name} {leave_req.employee.last_name}".strip(),
+                status="Approved",
+                start_date=leave_req.start_date.strftime("%Y-%m-%d"),
+                end_date=leave_req.end_date.strftime("%Y-%m-%d"),
+                total_days=leave_req.total_days,
+                reason=leave_req.reason,
+                manager_comments=leave_req.manager_comments
+            )
+
         return Response(self.get_serializer(leave_req).data)
 
     @action(detail=True, methods=['patch'])
@@ -252,6 +317,18 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         leave_req.status = 'Rejected'
         leave_req.manager_comments = request.data.get('manager_comments', '')
         leave_req.save()
+
+        if leave_req.employee and leave_req.employee.email:
+            send_leave_email_async(
+                emp_email=leave_req.employee.email,
+                emp_name=f"{leave_req.employee.first_name} {leave_req.employee.last_name}".strip(),
+                status="Rejected",
+                start_date=leave_req.start_date.strftime("%Y-%m-%d"),
+                end_date=leave_req.end_date.strftime("%Y-%m-%d"),
+                total_days=leave_req.total_days,
+                reason=leave_req.reason,
+                manager_comments=leave_req.manager_comments
+            )
 
         return Response(self.get_serializer(leave_req).data)
 

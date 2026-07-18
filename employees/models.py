@@ -18,6 +18,8 @@ EMPLOYEE_TYPE_CHOICES = [
 ]
 
 class Employee(models.Model):
+    created_at = models.DateTimeField(auto_now_add=True, null=True)
+    updated_at = models.DateTimeField(auto_now=True, null=True)
     employee_type = models.CharField(max_length=50, choices=EMPLOYEE_TYPE_CHOICES, default='Normal Employee')
     # Authentication & Access
     user = models.OneToOneField(User, on_delete=models.CASCADE, null=True, blank=True, related_name='employee_profile')
