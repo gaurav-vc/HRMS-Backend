@@ -314,7 +314,15 @@ class PayrollService:
 
         net = total_gross - total_deductions
         if net < 0:
-            raise ValueError(f"Negative net pay generated: {net}")
+            diff = total_deductions - total_gross
+            virtual_adjustment, _ = ComponentRule.objects.get_or_create(
+                name="Negative Pay Adjustment",
+                type="Earning",
+                defaults={'formula': "0", 'effective_from': "2020-01-01"}
+            )
+            line_items.append({'rule': virtual_adjustment, 'amount': diff})
+            total_gross += diff
+            net = Decimal('0.00')
             
         return total_gross, total_deductions, net, line_items
 
@@ -433,7 +441,7 @@ class PayrollService:
                             
                 has_exceptions = PayrollException.objects.filter(run=run, resolved=False).exists()
                 if has_exceptions:
-                    run.status = 'Processing'
+                    run.status = 'Maker-Submitted' # Still submit so approvers can reject/fix
                 else:
                     run.status = 'Maker-Submitted'
                     # Notify Approvers
@@ -461,8 +469,8 @@ class PayrollService:
     @staticmethod
     def execute_run(run_id, overrides=None, include_variable_bonus=False):
         run = PayrollRun.objects.get(id=run_id)
-        if run.status != 'Draft':
-            raise ValueError("Can only execute Draft runs")
+        if run.status in ['Frozen', 'Disbursed']:
+            raise ValueError("Cannot execute a run that is Frozen or Disbursed")
         run.status = 'Processing'
         run.save()
         is_simulation = (run.run_type == 'Simulation')

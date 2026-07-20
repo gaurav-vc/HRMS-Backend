@@ -556,11 +556,13 @@ from authentication.permissions import DataIsolationMixin
 from rest_framework.permissions import IsAuthenticated
 
 class DailyAttendanceViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Attendance'
     queryset = DailyAttendance.objects.all()
     serializer_class = DailyAttendanceSerializer
     permission_classes = [IsAuthenticated]
 
 class RegularizationViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Regularization'
     queryset = RegularizationRequest.objects.all().order_by('-created_at', '-id')
     serializer_class = RegularizationRequestSerializer
     
@@ -623,6 +625,7 @@ from .serializers import ShiftDefinitionSerializer, ShiftAssignmentSerializer
 from collections import defaultdict
 
 class ShiftDefinitionViewSet(viewsets.ModelViewSet):
+    rbac_module = 'Shift Definitions'
     queryset = ShiftDefinition.objects.all().order_by('start_time')
     serializer_class = ShiftDefinitionSerializer
     permission_classes = [AllowAny]

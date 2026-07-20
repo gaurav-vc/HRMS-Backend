@@ -11,11 +11,13 @@ from authentication.permissions import DataIsolationMixin, IsHR
 from rest_framework.permissions import IsAuthenticated
 
 class SalaryStructureViewSet(viewsets.ModelViewSet):
+    rbac_module = 'Salary Structure'
     permission_classes = [IsAuthenticated, IsHR]
     queryset = SalaryStructure.objects.all()
     serializer_class = SalaryStructureSerializer
 
 class ComponentRuleViewSet(viewsets.ModelViewSet):
+    rbac_module = 'Salary Structure'
     permission_classes = [IsAuthenticated, IsHR]
     queryset = ComponentRule.objects.all()
     serializer_class = ComponentRuleSerializer
@@ -65,6 +67,7 @@ class ComponentRuleViewSet(viewsets.ModelViewSet):
         return Response(serializer.data, status=201)
 
 class ComplianceReportViewSet(viewsets.ModelViewSet):
+    rbac_module = 'Compliance'
     queryset = ComplianceReport.objects.all().order_by('due')
     serializer_class = ComplianceReportSerializer
 
@@ -102,6 +105,7 @@ from .service import PayrollService
 from authentication.permissions import DataIsolationMixin
 
 class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Run Payroll'
     queryset = PayrollRun.objects.all().order_by('-period')
     serializer_class = PayrollRunSerializer
 
@@ -130,6 +134,20 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                     return PayrollRun.objects.all().order_by('-period')
                 
         return qs
+
+    def create(self, request, *args, **kwargs):
+        period = request.data.get('period')
+        entity_id = request.data.get('entity')
+        run_type = request.data.get('run_type', 'Live')
+        
+        # Prevent multiple runs for the same period and entity
+        if period and entity_id:
+            existing_run = PayrollRun.objects.filter(period=period, entity_id=entity_id, run_type=run_type).first()
+            if existing_run:
+                serializer = self.get_serializer(existing_run)
+                return Response(serializer.data, status=200)
+                
+        return super().create(request, *args, **kwargs)
 
     @action(detail=True, methods=['post'])
     def execute(self, request, pk=None):
@@ -221,10 +239,12 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         return Response({'status': 'success', 'run_status': run.status})
 
 class LoanViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Loans & Advances'
     queryset = Loan.objects.all()
     serializer_class = LoanSerializer
 
 class ReimbursementViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Reimbursements'
     queryset = Reimbursement.objects.all()
     serializer_class = ReimbursementSerializer
 
@@ -278,7 +298,7 @@ class SalarySlipAPIView(APIView):
                         elif custom_allowed:
                             emp_filter['employee__entity_id__in'] = custom_allowed
                         else:
-                            emp_filter['employee__entity'] = emp.entity
+                            emp_q = Q(employee__entity=emp.entity) | Q(employee__branch__entity=emp.entity) | Q(employee__site__branch__entity=emp.entity)
                     else:
                         emp_filter['employee'] = emp
                 else:
@@ -286,7 +306,7 @@ class SalarySlipAPIView(APIView):
                     if emp.role in ['super_admin']:
                         pass
                     elif emp.role in ['org_admin', 'hr', 'manager']:
-                        emp_filter['employee__entity'] = emp.entity
+                        emp_q = Q(employee__entity=emp.entity) | Q(employee__branch__entity=emp.entity) | Q(employee__site__branch__entity=emp.entity)
                     elif emp.role == 'site_admin':
                         emp_q = Q(employee__site=emp.site) | Q(employee__enrolled_sites=emp.site)
                     else:

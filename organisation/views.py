@@ -9,6 +9,7 @@ from authentication.permissions import DataIsolationMixin
 
 
 class EntityViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Entities'
     queryset = Entity.objects.all()
     serializer_class = EntitySerializer
 
@@ -19,6 +20,7 @@ class AttendancePolicyViewSet(DataIsolationMixin, viewsets.ModelViewSet):
 
 
 class BranchViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Branches'
     queryset = Branch.objects.all()
     serializer_class = BranchSerializer
 
@@ -92,6 +94,7 @@ def provision_contact_person(site):
 
 
 class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Sites'
     queryset = Site.objects.all()
     serializer_class = SiteSerializer
 
@@ -106,10 +109,12 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             provision_contact_person(site)
 
 class DepartmentViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Departments'
     queryset = Department.objects.all()
     serializer_class = DepartmentSerializer
 
 class DesignationViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Designations'
     queryset = Designation.objects.all()
     serializer_class = DesignationSerializer
 

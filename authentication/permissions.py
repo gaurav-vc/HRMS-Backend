@@ -274,3 +274,51 @@ class DataIsolationMixin:
         if request is None or not request.user.is_authenticated:
             return qs.none()
         return isolate_queryset(qs, request.user)
+
+# ---------------------------------------------------------------------------
+# Dynamic CRUD Permission
+# ---------------------------------------------------------------------------
+
+class DynamicCRUDPermission(permissions.BasePermission):
+    """
+    Enforces strict backend CRUD boundaries based on dynamic_role.permissions.
+    Only checks if the view defines an `rbac_module` (e.g. `rbac_module = 'Employees'`).
+    """
+    def has_permission(self, request, view):
+        # 1. Bypass if unauthenticated
+        if not request.user or not request.user.is_authenticated:
+            return False
+            
+        # 2. Super admins bypass all
+        if request.user.is_superuser:
+            return True
+            
+        employee = getattr(request.user, 'employee_profile', None)
+        if employee and employee.role == 'super_admin':
+            return True
+            
+        # 3. If view doesn't define rbac_module, don't enforce dynamic CRUD here (let other permissions handle it)
+        rbac_module = getattr(view, 'rbac_module', None)
+        if not rbac_module:
+            return True
+            
+        # 4. If no employee or no dynamic role, they can't access an rbac_module protected view
+        if not employee or not employee.dynamic_role or not employee.dynamic_role.permissions:
+            return False
+            
+        # 5. Extract module permissions (fallback to empty)
+        module_perms = employee.dynamic_role.permissions.get(rbac_module, {})
+        
+        # 6. Map request method to Create/Read/Update/Delete
+        method = request.method
+        if method in ['GET', 'HEAD', 'OPTIONS']:
+            view_perm = module_perms.get('view')
+            return view_perm in [True, 'self', 'selected_entities']
+        elif method == 'POST':
+            return module_perms.get('create') is True
+        elif method in ['PUT', 'PATCH']:
+            return module_perms.get('update') is True
+        elif method == 'DELETE':
+            return module_perms.get('delete') is True
+            
+        return False

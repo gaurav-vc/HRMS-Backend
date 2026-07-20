@@ -72,8 +72,10 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
     def get_permissions(self, obj):
         permissions = {}
+            
         if hasattr(obj, 'employee_profile') and obj.employee_profile and obj.employee_profile.dynamic_role:
-            permissions.update(obj.employee_profile.dynamic_role.permissions)
+            permissions.update(obj.employee_profile.dynamic_role.permissions or {})
+            permissions['can_approve'] = obj.employee_profile.dynamic_role.can_approve
             
         from organisation.models import Site
         sites = Site.objects.filter(contact_email=obj.email)

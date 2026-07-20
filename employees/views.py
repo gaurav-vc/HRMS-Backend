@@ -14,7 +14,8 @@ from rest_framework.permissions import IsAuthenticated
 import json
 
 class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
-    queryset = Employee.objects.exclude(user__is_superuser=True)
+    rbac_module = 'Employees'
+    queryset = Employee.objects.all()
     serializer_class = EmployeeSerializer
     permission_classes = [IsAuthenticated]
 
@@ -292,7 +293,7 @@ HRMS Admin
             # Find roles with can_add_ctc
             from organisation.models import Role
             ctc_roles = [r for r in Role.objects.all() if r.permissions.get('can_add_ctc')]
-            ctc_employees = Employee.objects.filter(dynamic_role__in=ctc_roles).exclude(user__is_superuser=True)
+            ctc_employees = Employee.objects.filter(dynamic_role__in=ctc_roles)
             for ctc_emp in ctc_employees:
                 Notification.objects.create(
                     recipient=ctc_emp,
@@ -511,11 +512,13 @@ from .models import OfferLetter, OfferTemplate
 from .serializers import OfferLetterSerializer, OfferTemplateSerializer
 
 class OfferTemplateViewSet(viewsets.ModelViewSet):
+    rbac_module = 'Offer Templates'
     queryset = OfferTemplate.objects.all()
     serializer_class = OfferTemplateSerializer
     permission_classes = [IsAuthenticated]
 
 class OfferLetterViewSet(viewsets.ModelViewSet):
+    rbac_module = 'Offer Letters'
     queryset = OfferLetter.objects.all().order_by('-created_at')
     serializer_class = OfferLetterSerializer
     permission_classes = [IsAuthenticated]

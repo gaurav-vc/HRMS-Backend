@@ -154,6 +154,7 @@ class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
 from authentication.permissions import DataIsolationMixin
 
 class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Leave Requests'
     serializer_class = LeaveRequestSerializer
 
     def get_queryset(self):

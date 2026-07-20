@@ -9,8 +9,9 @@ from leaves.models import LeaveRequest
 from attendance.models import DailyAttendance, PunchLog, RegularizationRequest
 from payroll.models import PayrollRun, Loan, Reimbursement
 from decimal import Decimal
-from django.db.models import Count
+from django.db.models import Count, Sum
 from datetime import date
+from leaves.models import LeaveRequest, LeaveBalance
 
 class DashboardStatsAPIView(APIView):
     def get(self, request):
@@ -79,9 +80,6 @@ class DashboardStatsAPIView(APIView):
         qr_count = punches_today.filter(source='QR').count()
         face_count = punches_today.filter(source='FACE').count()
         gps_count = punches_today.filter(source='GPS').count()
-        
-        if qr_count == 0 and face_count == 0 and gps_count == 0:
-            qr_count, face_count, gps_count = 12, 34, 2 # dummy fallback if empty today
             
         # 4. Leaves & Exceptions
         pending_leaves = isolate_queryset(LeaveRequest.objects.all(), user).filter(status='Pending')
@@ -119,19 +117,18 @@ class DashboardStatsAPIView(APIView):
             
         super_admin_stats = {}
         if is_super_admin:
+            from admin_org.models import Invoice
+            
+            total_revenue_query = Invoice.objects.aggregate(Sum('amount'))['amount__sum']
+            total_revenue = float(total_revenue_query) if total_revenue_query else 0.0
+
             # Stats for super admin
             super_admin_stats = {
-                "totalRevenue": 24000, # mock for now
+                "totalRevenue": total_revenue,
                 "activeSites": Site.objects.filter(status='Active').count(),
                 "totalUsers": Employee.objects.count(),
                 "totalCompany": Organization.objects.count(),
-                "moduleWiseRevenue": [
-                    {"module": "Dashboard", "revenue": 0},
-                    {"module": "my-day", "revenue": 0},
-                    {"module": "calendar", "revenue": 0},
-                    {"module": "projects", "revenue": 0},
-                    {"module": "tasks", "revenue": 0}
-                ]
+                "moduleWiseRevenue": []
             }
             
             try:
@@ -191,7 +188,7 @@ class DashboardStatsAPIView(APIView):
                 "exceptionAlerts": exceptions
             },
             "payroll": {
-                "activeCycle": "2026-06",
+                "activeCycle": recent_runs[0]['period'] if recent_runs else today.strftime("%Y-%m"),
                 "employeesInCycle": total_headcount,
                 "activeLoans": isolate_queryset(Loan.objects.all(), user).filter(status='Active').count(),
                 "pendingReimbursements": isolate_queryset(Reimbursement.objects.all(), user).filter(status='Pending').count(),
@@ -206,8 +203,8 @@ class DashboardStatsAPIView(APIView):
             },
             "employee": {
                 "presentThisMonth": isolate_queryset(DailyAttendance.objects.all(), user).filter(attendance_date__month=today.month, attendance_status='Present').count(),
-                "workingDays": 22,
-                "leaveBalance": 12, # mock
+                "workingDays": ((today.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)).day,
+                "leaveBalance": float(isolate_queryset(LeaveBalance.objects.all(), user).aggregate(total=Sum('remaining_days'))['total'] or 0) if hasattr(user, 'employee_profile') else 0,
                 "lastNetPay": last_run_net,
                 "recentAttendance": [{"id": a.id, "date": str(a.attendance_date), "checkIn": a.first_check_in.strftime("%H:%M") if a.first_check_in else "N/A", "checkOut": a.last_check_out.strftime("%H:%M") if a.last_check_out else "N/A"} for a in isolate_queryset(DailyAttendance.objects.all(), user).order_by('-attendance_date')[:5]],
                 "myLeaveRequests": [{"id": l.id, "type": l.leave_type.name, "from": str(l.start_date), "status": l.status} for l in isolate_queryset(LeaveRequest.objects.all(), user).order_by('-created_at')[:5]],
