@@ -216,6 +216,9 @@ def isolate_queryset(qs, user):
                 return qs.filter(employee=employee)
             elif qs.model.__name__ == 'Employee':
                 return qs.filter(id=employee.id)
+            elif qs.model.__name__ == 'Site':
+                from django.db.models import Q
+                return qs.model.objects.filter(Q(id=employee.site_id) | Q(id__in=employee.enrolled_sites.all()))
             return qs.none()
 
     # ── LEGACY ROLE LOGIC ────────────────────────────────────────────────────
@@ -243,6 +246,9 @@ def isolate_queryset(qs, user):
         return qs.filter(employee=employee)
     elif qs.model.__name__ == 'Employee':
         return qs.filter(id=employee.id)
+    elif qs.model.__name__ == 'Site':
+        from django.db.models import Q
+        return qs.model.objects.filter(Q(id=employee.site_id) | Q(id__in=employee.enrolled_sites.all()))
 
     return qs.none()
 

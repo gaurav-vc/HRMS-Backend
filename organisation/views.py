@@ -13,6 +13,12 @@ class EntityViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = Entity.objects.all()
     serializer_class = EntitySerializer
 
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve']:
+            from rest_framework.permissions import IsAuthenticated
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
 class AttendancePolicyViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = AttendancePolicy.objects.all()
     serializer_class = AttendancePolicySerializer
@@ -23,6 +29,12 @@ class BranchViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Branches'
     queryset = Branch.objects.all()
     serializer_class = BranchSerializer
+
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve']:
+            from rest_framework.permissions import IsAuthenticated
+            return [IsAuthenticated()]
+        return super().get_permissions()
 
 import string
 import random
@@ -98,6 +110,12 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = Site.objects.all()
     serializer_class = SiteSerializer
 
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve']:
+            from rest_framework.permissions import IsAuthenticated
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
     def perform_create(self, serializer):
         site = serializer.save()
         provision_contact_person(site)
@@ -113,10 +131,22 @@ class DepartmentViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = Department.objects.all()
     serializer_class = DepartmentSerializer
 
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve']:
+            from rest_framework.permissions import IsAuthenticated
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
 class DesignationViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Designations'
     queryset = Designation.objects.all()
     serializer_class = DesignationSerializer
+
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve']:
+            from rest_framework.permissions import IsAuthenticated
+            return [IsAuthenticated()]
+        return super().get_permissions()
 
 from org_engine.models import OrganizationNode
 from org_engine.engine import HierarchyEngine

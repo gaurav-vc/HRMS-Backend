@@ -223,7 +223,7 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         )
 
         # 5. Dispatch Welcome Email
-        login_url = "http://localhost:5173/auth" 
+        login_url = "https://hrms.vibecopilot.ai/" 
         subject = "Welcome to HRMS - Your Login Credentials"
         message = f"""Hello {first_name},
 
@@ -358,7 +358,7 @@ HRMS Admin
                 emp.user = user
                 emp.save(update_fields=['user'])
                 
-                login_url = "http://localhost:5173/auth"
+                login_url = "https://hrms.vibecopilot.ai/"
                 subject = "Welcome to HRMS - Your Login Credentials"
                 message = f"Hello {emp.first_name},\n\nWelcome to the HRMS portal! Your account has been successfully created.\n\nWebsite: {login_url}\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password immediately.\n\nRegards,\nHRMS Admin"
                 try:

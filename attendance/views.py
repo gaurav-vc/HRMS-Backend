@@ -301,7 +301,12 @@ class AttendanceViewSet(viewsets.ViewSet):
                     verification_status = 'VERIFIED'
                     # Fallback to provided employee ID just for testing the bypass
                     emp_id = request.data.get('employee')
-                    employee = Employee.objects.get(id=emp_id) if emp_id else Employee.objects.first()
+                    if emp_id:
+                        employee = Employee.objects.get(id=emp_id)
+                    elif hasattr(request.user, 'employee_profile') and request.user.employee_profile:
+                        employee = request.user.employee_profile
+                    else:
+                        employee = Employee.objects.first()
                 else:
                     image_bytes = file_obj.read()
                     
@@ -336,7 +341,12 @@ class AttendanceViewSet(viewsets.ViewSet):
             else:
                 # If manual punch without face
                 emp_id = request.data.get('employee')
-                employee = Employee.objects.get(id=emp_id) if emp_id else Employee.objects.first()
+                if emp_id:
+                    employee = Employee.objects.get(id=emp_id)
+                elif hasattr(request.user, 'employee_profile') and request.user.employee_profile:
+                    employee = request.user.employee_profile
+                else:
+                    employee = Employee.objects.first()
                 verification_status = 'VERIFIED'
 
             if not employee:
