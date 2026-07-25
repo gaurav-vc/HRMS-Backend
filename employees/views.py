@@ -212,6 +212,20 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         # 4. Save Employee with linked user
         employee = serializer.save(user=user)
 
+        # 4.0 Add Create Audit Log
+        try:
+            from .models import EmployeeAuditLog
+            performed_by = req_user.username if req_user and req_user.is_authenticated else 'System'
+            EmployeeAuditLog.objects.create(
+                employee=employee,
+                action='Create',
+                performed_by=performed_by,
+                changes={"all": "Initial creation of record."}
+            )
+        except Exception as e:
+            print(f"Failed to create audit log: {e}")
+
+
         # 4.1 Generate Offer Letter
         from .models import OfferLetter
         import uuid
@@ -331,7 +345,28 @@ HRMS Admin
         old_name = f"{old_first} {old_last}"
         old_role = serializer.instance.dynamic_role
         
+        # Calculate diff before saving
+        changes = {}
+        for attr, new_val in validated_data.items():
+            old_val = getattr(serializer.instance, attr, None)
+            if old_val != new_val:
+                changes[attr] = {'old': str(old_val), 'new': str(new_val)}
+                
         emp = serializer.save()
+        
+        if changes:
+            try:
+                from .models import EmployeeAuditLog
+                req_user = self.request.user
+                performed_by = req_user.username if req_user and req_user.is_authenticated else 'System'
+                EmployeeAuditLog.objects.create(
+                    employee=emp,
+                    action='Update',
+                    performed_by=performed_by,
+                    changes=changes
+                )
+            except Exception as e:
+                print(f"Failed to create audit log for update: {e}")
         new_name = f"{emp.first_name} {emp.last_name}"
         
         # Draft to Active Transition
@@ -429,6 +464,21 @@ HRMS Admin
         except Exception as e:
             print(f"Failed to sync org engine graph deletion: {e}")
         instance.delete()
+
+    @action(detail=True, methods=['get'])
+    def audit_logs(self, request, pk=None):
+        employee = self.get_object()
+        logs = employee.audit_logs.all().order_by('-timestamp')
+        data = []
+        for log in logs:
+            data.append({
+                'id': log.id,
+                'action': log.action,
+                'performed_by': log.performed_by,
+                'changes': log.changes,
+                'timestamp': log.timestamp.isoformat()
+            })
+        return Response(data)
 
 from .models import EmployeeDocument, EmployeeTransfer, EmployeeExit
 from .serializers import EmployeeDocumentSerializer, EmployeeTransferSerializer, EmployeeExitSerializer

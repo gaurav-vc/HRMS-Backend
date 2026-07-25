@@ -210,3 +210,16 @@ class OfferLetter(models.Model):
 
     def __str__(self):
         return f"{self.offer_number} - {self.employee.first_name} {self.employee.last_name}"
+
+class EmployeeAuditLog(models.Model):
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='audit_logs')
+    performed_by = models.CharField(max_length=255, default='System')
+    action = models.CharField(max_length=50) # 'Create', 'Update', 'Delete'
+    changes = models.JSONField(default=dict)
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-timestamp']
+
+    def __str__(self):
+        return f"{self.action} on {self.employee} by {self.performed_by}"
