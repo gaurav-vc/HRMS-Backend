@@ -83,7 +83,18 @@ class UserProfileSerializer(serializers.ModelSerializer):
             for site in sites:
                 if site.modules:
                     for module in site.modules:
-                        permissions[module] = {'view': True}
+                        if isinstance(module, dict):
+                            name = module.get('name')
+                            if name:
+                                permissions[name] = {
+                                    'view': module.get('view', True),
+                                    'create': module.get('create', True),
+                                    'update': module.get('update', True),
+                                    'delete': module.get('delete', True),
+                                }
+                        else:
+                            # Fallback for simple string arrays - grant full access
+                            permissions[module] = {'view': True, 'create': True, 'update': True, 'delete': True}
         return permissions
 
     def get_role_name(self, obj):

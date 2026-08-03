@@ -215,6 +215,7 @@ class RegularizationRequest(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
 class ShiftDefinition(models.Model):
+    site = models.ForeignKey(Site, on_delete=models.CASCADE, related_name='shift_definitions', null=True, blank=True)
     name = models.CharField(max_length=100)
     code = models.CharField(max_length=20, unique=True)
     start_time = models.TimeField()
@@ -245,6 +246,7 @@ class ShiftAssignment(models.Model):
         return f"{self.employee.code} - {self.shift.code} on {self.date}"
 
 class Holiday(models.Model):
+    site = models.ForeignKey(Site, on_delete=models.CASCADE, related_name='holidays', null=True, blank=True)
     name = models.CharField(max_length=100)
     date = models.DateField()
     holiday_type = models.CharField(max_length=50, default='Festival') # National, Festival, Company, Optional, Restricted, Regional

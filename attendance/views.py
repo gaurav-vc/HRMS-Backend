@@ -1,4 +1,5 @@
 from rest_framework import viewsets, status
+from authentication.permissions import DataIsolationMixin
 from rest_framework.decorators import action, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -634,11 +635,11 @@ from .models import ShiftDefinition, ShiftAssignment
 from .serializers import ShiftDefinitionSerializer, ShiftAssignmentSerializer
 from collections import defaultdict
 
-class ShiftDefinitionViewSet(viewsets.ModelViewSet):
+class ShiftDefinitionViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Shift Definitions'
     queryset = ShiftDefinition.objects.all().order_by('start_time')
     serializer_class = ShiftDefinitionSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated]
 
 class RosterViewSet(viewsets.ViewSet):
     permission_classes = [AllowAny]
@@ -655,7 +656,9 @@ class RosterViewSet(viewsets.ViewSet):
         for a in assignments:
             assignments_map[a.employee_id][str(a.date)] = ShiftAssignmentSerializer(a).data
 
+        from authentication.permissions import isolate_queryset
         employees = Employee.objects.filter(status='Active')
+        employees = isolate_queryset(employees, request.user)
         data = []
         for emp in employees:
             data.append({
@@ -787,10 +790,11 @@ class RosterViewSet(viewsets.ViewSet):
             
         return Response({"message": f"Successfully assigned shift to {employees.count()} employees for {len(dates)} days ({len(assignments_to_create)} total assignments)."})
 
-class HolidayViewSet(viewsets.ModelViewSet):
+class HolidayViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Holidays'
     queryset = Holiday.objects.all().order_by('date')
     serializer_class = HolidaySerializer
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated]
     
     @action(detail=False, methods=['get'])
     def stats(self, request):
@@ -805,7 +809,7 @@ class HolidayViewSet(viewsets.ModelViewSet):
             "regional_festival": holidays.filter(holiday_type__in=['Regional', 'Festival']).count()
         })
         
-class HolidayRuleGroupViewSet(viewsets.ModelViewSet):
+class HolidayRuleGroupViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = HolidayRuleGroup.objects.all()
     serializer_class = HolidayRuleGroupSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated]

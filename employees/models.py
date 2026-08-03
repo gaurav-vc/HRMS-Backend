@@ -179,6 +179,7 @@ class CompensationHistory(models.Model):
         return f"{self.employee.code} | {self.ctc} | {self.effective_from}"
 
 class OfferTemplate(models.Model):
+    site = models.ForeignKey('organisation.Site', on_delete=models.CASCADE, related_name='offer_templates', null=True, blank=True)
     name = models.CharField(max_length=150)
     category = models.CharField(max_length=100) # e.g. Graduate Hire, Experienced Hire
     body_html = models.TextField(blank=True, null=True)

@@ -86,8 +86,9 @@ def provision_contact_person(site):
                 first_name=site.contact_name or email.split('@')[0],
                 email=email,
                 code=f"EMP-{user.id:04d}",
-                role='admin',
+                role='site_admin',
                 dynamic_role=role_obj,
+                site=site,
                 status='Active'
             )
         except Exception as e:

@@ -1,0 +1,6 @@
+Employee Code,First Name,Last Name,Email,Department,Designation,CTC,Tax Regime,Tax Saving,Salary Structure,PF Applicable,Bonus Applicable,Bonus Type,Bonus Value,Bonus Month/Quarter
+TATA-005,Vikram,Singh,vikram.singh@example.com,,,0,New,0.00,,False,False,,0.00,1
+TATA-004,Sneha,Reddy,sneha.reddy@example.com,,,0,New,0.00,,False,False,,0.00,1
+TATA-003,Ravi,Patel,ravi.patel@example.com,,,0,New,0.00,,False,False,,0.00,1
+TATA-002,Priya,Sharma,priya.sharma@example.com,,,0,New,0.00,,False,False,,0.00,1
+TATA-001,Arjun,Kumar,arjun.kumar@example.com,,Software Engineer,0,New,0.00,,False,False,,0.00,1

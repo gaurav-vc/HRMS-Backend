@@ -561,7 +561,7 @@ class NotificationViewSet(viewsets.ViewSet):
 from .models import OfferLetter, OfferTemplate
 from .serializers import OfferLetterSerializer, OfferTemplateSerializer
 
-class OfferTemplateViewSet(viewsets.ModelViewSet):
+class OfferTemplateViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Offer Templates'
     queryset = OfferTemplate.objects.all()
     serializer_class = OfferTemplateSerializer

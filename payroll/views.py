@@ -10,13 +10,13 @@ from django.utils import timezone
 from authentication.permissions import DataIsolationMixin, IsHR
 from rest_framework.permissions import IsAuthenticated
 
-class SalaryStructureViewSet(viewsets.ModelViewSet):
+class SalaryStructureViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Salary Structure'
     permission_classes = [IsAuthenticated, IsHR]
     queryset = SalaryStructure.objects.all()
     serializer_class = SalaryStructureSerializer
 
-class ComponentRuleViewSet(viewsets.ModelViewSet):
+class ComponentRuleViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Salary Structure'
     permission_classes = [IsAuthenticated, IsHR]
     queryset = ComponentRule.objects.all()
@@ -66,7 +66,7 @@ class ComponentRuleViewSet(viewsets.ModelViewSet):
         self.perform_create(serializer)
         return Response(serializer.data, status=201)
 
-class ComplianceReportViewSet(viewsets.ModelViewSet):
+class ComplianceReportViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Compliance'
     queryset = ComplianceReport.objects.all().order_by('due')
     serializer_class = ComplianceReportSerializer

@@ -62,6 +62,7 @@ class EmployeeAllocation(models.Model):
 # ==========================================
 
 class SalaryStructure(models.Model):
+    site = models.ForeignKey('organisation.Site', on_delete=models.CASCADE, related_name='salary_structures', null=True, blank=True)
     STATUS_CHOICES = (('Active', 'Active'), ('Draft', 'Draft'))
     name = models.CharField(max_length=100)
     description = models.TextField(blank=True, null=True)
@@ -221,6 +222,7 @@ class Reimbursement(models.Model):
     receipt = models.FileField(upload_to='reimbursements/receipts/', null=True, blank=True)
 
 class ComplianceReport(models.Model):
+    site = models.ForeignKey('organisation.Site', on_delete=models.CASCADE, related_name='compliance_reports', null=True, blank=True)
     STATUS_CHOICES = (('Draft', 'Draft'), ('Pending', 'Pending'), ('Generated', 'Generated'), ('Filed', 'Filed'))
     CATEGORY_CHOICES = (('Provident Fund', 'Provident Fund'), ('ESI', 'ESI'), ('Professional Tax', 'Professional Tax'), ('TDS', 'TDS'))
     category = models.CharField(max_length=50, choices=CATEGORY_CHOICES, default='Provident Fund')

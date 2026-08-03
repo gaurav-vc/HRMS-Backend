@@ -77,21 +77,27 @@ def _get_admin_sites(user):
     Return a queryset of Sites that `user` administers.
 
     Detection order:
-      1. user.email matches Site.contact_email  (primary path)
-      2. user.auth_profile.user_type == 'site_admin' and org_profile.site is set (legacy path)
+      1. user.email matches Site.contact_email
+      2. employee.role == 'site_admin' -> employee.site and employee.enrolled_sites
     """
     from organisation.models import Site
+    from django.db.models import Q
 
-    admin_sites = Site.objects.filter(contact_email=user.email)
-    if admin_sites.exists():
-        return admin_sites
+    admin_sites_by_email = Site.objects.filter(contact_email=user.email)
+    
+    employee = getattr(user, 'employee_profile', None)
+    if employee and employee.role == 'site_admin':
+        site_ids = list(admin_sites_by_email.values_list('id', flat=True))
+        if employee.site_id:
+            site_ids.append(employee.site_id)
+        if employee.enrolled_sites.exists():
+            site_ids.extend(employee.enrolled_sites.values_list('id', flat=True))
+        
+        if site_ids:
+            return Site.objects.filter(id__in=set(site_ids))
 
-    # Legacy / secondary path
-    auth_profile = getattr(user, 'auth_profile', None)
-    if auth_profile and getattr(auth_profile, 'user_type', None) == 'site_admin':
-        org_profile = getattr(user, 'org_profile', None)
-        if org_profile and org_profile.site_id:
-            return Site.objects.filter(id=org_profile.site_id)
+    if admin_sites_by_email.exists():
+        return admin_sites_by_email
 
     return Site.objects.none()
 
@@ -127,25 +133,38 @@ def isolate_queryset(qs, user):
     # ── SITE ADMIN ───────────────────────────────────────────────────────────
     admin_sites = _get_admin_sites(user)
     if admin_sites.exists():
+        from django.db.models import Q
         if hasattr(qs.model, 'site'):
             return qs.filter(site__in=admin_sites)
         if hasattr(qs.model, 'employee'):
-            return qs.filter(employee__site__in=admin_sites)
+            return qs.filter(Q(employee__site__in=admin_sites) | Q(employee__enrolled_sites__in=admin_sites)).distinct()
         if qs.model.__name__ == 'Employee':
-            return qs.filter(site__in=admin_sites)
+            return qs.filter(Q(site__in=admin_sites) | Q(enrolled_sites__in=admin_sites)).distinct()
         if qs.model.__name__ == 'Site':
-            return qs.filter(id__in=admin_sites.values('id'))
+            return qs.filter(id__in=admin_sites)
 
-        # Restrict to orgs that own these sites
+        # Restrict structural data (Orgs, Entities, Branches, Departments) to what the site belongs to
         org_ids = admin_sites.values_list('organization_id', flat=True).distinct()
+        entity_ids = admin_sites.values_list('branch__entity_id', flat=True).distinct()
+        branch_ids = admin_sites.values_list('branch_id', flat=True).distinct()
+        
         if qs.model.__name__ == 'Organization':
             return qs.filter(id__in=org_ids)
+        if qs.model.__name__ == 'Entity':
+            return qs.filter(id__in=entity_ids)
+        if qs.model.__name__ == 'Branch':
+            return qs.filter(id__in=branch_ids)
+        if qs.model.__name__ == 'Department':
+            return qs.filter(entity_id__in=entity_ids)
+        if qs.model.__name__ == 'Designation':
+            return qs.filter(department__entity_id__in=entity_ids)
+            
         if hasattr(qs.model, 'organization'):
             return qs.filter(organization_id__in=org_ids)
         if hasattr(qs.model, 'entity'):
-            return qs.filter(entity__organization_id__in=org_ids)
+            return qs.filter(entity_id__in=entity_ids)
         if hasattr(qs.model, 'department'):
-            return qs.filter(department__entity__organization_id__in=org_ids)
+            return qs.filter(department__entity_id__in=entity_ids)
 
         return qs.none()
 
@@ -241,14 +260,40 @@ def isolate_queryset(qs, user):
         if qs.model.__name__ == 'Employee':
             return qs.filter(entity=employee.entity)
 
-    # ── DEFAULT: employee sees only their own records ────────────────────────
+    # ── DEFAULT: employee sees only their own records (and their site's structural data) ────────────────────────
     if hasattr(qs.model, 'employee'):
         return qs.filter(employee=employee)
-    elif qs.model.__name__ == 'Employee':
-        return qs.filter(id=employee.id)
-    elif qs.model.__name__ == 'Site':
+    
+    # Allow seeing colleagues in the same site
+    if qs.model.__name__ == 'Employee':
         from django.db.models import Q
-        return qs.model.objects.filter(Q(id=employee.site_id) | Q(id__in=employee.enrolled_sites.all()))
+        site_filter = Q(site=employee.site) if employee.site else Q(id=employee.id)
+        if employee.enrolled_sites.exists():
+            site_filter |= Q(site__in=employee.enrolled_sites.all())
+        return qs.filter(site_filter).distinct()
+        
+    if qs.model.__name__ == 'Site':
+        from django.db.models import Q
+        return qs.model.objects.filter(Q(id=employee.site_id) | Q(id__in=employee.enrolled_sites.all())).distinct()
+
+    # Allow seeing structural data related to their site's entity
+    if employee.site and employee.site.branch:
+        entity = employee.site.branch.entity
+        if qs.model.__name__ == 'Organization':
+            return qs.filter(id=entity.organization_id)
+        if qs.model.__name__ == 'Entity':
+            return qs.filter(id=entity.id)
+        if qs.model.__name__ == 'Branch':
+            return qs.filter(entity=entity)
+        if qs.model.__name__ == 'Department':
+            return qs.filter(entity=entity)
+            
+        if hasattr(qs.model, 'organization'):
+            return qs.filter(organization=entity.organization)
+        if hasattr(qs.model, 'entity'):
+            return qs.filter(entity=entity)
+        if hasattr(qs.model, 'department'):
+            return qs.filter(department__entity=entity)
 
     return qs.none()
 
