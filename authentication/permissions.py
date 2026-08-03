@@ -304,6 +304,21 @@ def isolate_queryset(qs, user):
         if qs.model.__name__ == 'Department':
             return qs.filter(entity=entity)
             
+        if hasattr(qs.model, 'site'):
+            from django.db.models import Q
+            site_filter = Q(site=employee.site) if employee.site else Q(id=0)
+            if employee.enrolled_sites.exists():
+                site_filter |= Q(site__in=employee.enrolled_sites.all())
+            
+            if hasattr(qs.model, 'organization'):
+                site_filter |= Q(site__isnull=True, organization=entity.organization)
+            elif hasattr(qs.model, 'entity'):
+                site_filter |= Q(site__isnull=True, entity=entity)
+            else:
+                site_filter |= Q(site__isnull=True)
+                
+            return qs.filter(site_filter).distinct()
+            
         if hasattr(qs.model, 'organization'):
             return qs.filter(organization=entity.organization)
         if hasattr(qs.model, 'entity'):
