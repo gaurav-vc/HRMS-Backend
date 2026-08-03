@@ -13,6 +13,18 @@ class EntityViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = Entity.objects.all()
     serializer_class = EntitySerializer
 
+    def perform_create(self, serializer):
+        user = self.request.user
+        org = None
+        if hasattr(user, 'employee_profile') and user.employee_profile and user.employee_profile.organization:
+            org = user.employee_profile.organization
+        else:
+            from organisation.models import Site
+            site = Site.objects.filter(contact_email=user.email).first()
+            if site and site.organization:
+                org = site.organization
+        serializer.save(organization=org)
+
     def get_permissions(self):
         if self.action in ['list', 'retrieve']:
             from rest_framework.permissions import IsAuthenticated

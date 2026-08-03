@@ -130,6 +130,26 @@ def isolate_queryset(qs, user):
 
     employee = getattr(user, 'employee_profile', None)
 
+    # ── ROLE-BASED SUPER ADMIN ───────────────────────────────────────────────
+    if employee and employee.role == 'super_admin':
+        return qs
+
+    # ── MULTI-TENANT BOUNDARY: apply organisation scope first ────────────────
+    # If the user is an org_admin, they shouldn't be restricted by admin_sites
+    if employee and employee.role in ('admin', 'org_admin'):
+        if hasattr(employee, 'organization') and employee.organization:
+            if hasattr(qs.model, 'organization'):
+                qs = qs.filter(organization=employee.organization)
+            elif qs.model.__name__ == 'Employee':
+                qs = qs.filter(organization=employee.organization)
+            elif hasattr(qs.model, 'entity'):
+                qs = qs.filter(entity__organization=employee.organization)
+            elif hasattr(qs.model, 'department'):
+                qs = qs.filter(department__entity__organization=employee.organization)
+            elif hasattr(qs.model, 'employee'):
+                qs = qs.filter(employee__organization=employee.organization)
+            return qs
+
     # ── SITE ADMIN ───────────────────────────────────────────────────────────
     admin_sites = _get_admin_sites(user)
     if admin_sites.exists():
@@ -140,13 +160,13 @@ def isolate_queryset(qs, user):
             return qs.filter(Q(employee__site__in=admin_sites) | Q(employee__enrolled_sites__in=admin_sites)).distinct()
         if qs.model.__name__ == 'Employee':
             return qs.filter(Q(site__in=admin_sites) | Q(enrolled_sites__in=admin_sites)).distinct()
-        if qs.model.__name__ == 'Site':
-            return qs.filter(id__in=admin_sites)
-
         # Restrict structural data (Orgs, Entities, Branches, Departments) to what the site belongs to
         org_ids = admin_sites.values_list('organization_id', flat=True).distinct()
         entity_ids = admin_sites.values_list('branch__entity_id', flat=True).distinct()
         branch_ids = admin_sites.values_list('branch_id', flat=True).distinct()
+
+        if qs.model.__name__ == 'Site':
+            return qs.filter(id__in=admin_sites)
         
         if qs.model.__name__ == 'Organization':
             return qs.filter(id__in=org_ids)
@@ -192,10 +212,6 @@ def isolate_queryset(qs, user):
             qs = qs.filter(department__entity__organization=employee.organization)
         elif hasattr(qs.model, 'employee'):
             qs = qs.filter(employee__organization=employee.organization)
-
-        # Org admins see everything in their org (already scoped above)
-        if role in ('admin', 'org_admin'):
-            return qs
 
     # ── DYNAMIC ROLE SCOPING ─────────────────────────────────────────────────
     has_org_access = False
@@ -325,6 +341,61 @@ class DataIsolationMixin:
         if request is None or not request.user.is_authenticated:
             return qs.none()
         return isolate_queryset(qs, request.user)
+
+    def create(self, request, *args, **kwargs):
+        """
+        Intercept creation to auto-assign the user's isolated scope (Site/Entity/Org) 
+        if the frontend didn't provide it. This prevents records from 'disappearing' 
+        due to missing scope fields triggering isolation filters.
+        """
+        if request.user.is_authenticated and not request.user.is_superuser:
+            model = self.get_queryset().model
+            from organisation.models import Site
+            
+            target_site = None
+            target_org = None
+            target_entity = None
+            
+            employee = getattr(request.user, 'employee_profile', None)
+            admin_sites = Site.objects.filter(contact_email=request.user.email)
+            
+            if admin_sites.exists():
+                site = admin_sites.first()
+                target_site = site.id
+                target_org = site.organization_id
+                target_entity = site.branch.entity_id if site.branch else None
+            elif employee:
+                target_site = employee.site_id
+                target_org = employee.organization_id
+                target_entity = employee.entity_id
+                
+            if target_org or target_site or target_entity:
+                if hasattr(request.data, 'copy'):
+                    mutable_data = request.data.copy()
+                else:
+                    mutable_data = dict(request.data)
+                    
+                modified = False
+                if hasattr(model, 'site') and 'site' not in mutable_data and target_site:
+                    mutable_data['site'] = target_site
+                    modified = True
+                if hasattr(model, 'organization') and 'organization' not in mutable_data and target_org:
+                    mutable_data['organization'] = target_org
+                    modified = True
+                if hasattr(model, 'entity') and 'entity' not in mutable_data and target_entity:
+                    mutable_data['entity'] = target_entity
+                    modified = True
+                    
+                if modified:
+                    serializer = self.get_serializer(data=mutable_data)
+                    serializer.is_valid(raise_exception=True)
+                    self.perform_create(serializer)
+                    from rest_framework.response import Response
+                    from rest_framework import status
+                    headers = self.get_success_headers(serializer.data)
+                    return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+                    
+        return super().create(request, *args, **kwargs)
 
 # ---------------------------------------------------------------------------
 # Dynamic CRUD Permission
