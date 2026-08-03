@@ -354,11 +354,34 @@ class DynamicCRUDPermission(permissions.BasePermission):
             return True
             
         # 4. If no employee or no dynamic role, they can't access an rbac_module protected view
-        if not employee or not employee.dynamic_role or not employee.dynamic_role.permissions:
-            return False
+        # 4. Extract module permissions
+        module_perms = {}
+        if employee and employee.dynamic_role and employee.dynamic_role.permissions:
+            module_perms = employee.dynamic_role.permissions.get(rbac_module, {})
             
-        # 5. Extract module permissions (fallback to empty)
-        module_perms = employee.dynamic_role.permissions.get(rbac_module, {})
+        # 5. If user is a Site Admin, merge permissions from their assigned site modules
+        from organisation.models import Site
+        sites = Site.objects.filter(contact_email=request.user.email)
+        if sites.exists():
+            for site in sites:
+                if site.modules:
+                    for module in site.modules:
+                        if isinstance(module, dict):
+                            if module.get('name') == rbac_module:
+                                module_perms = {
+                                    'view': module.get('view', True),
+                                    'create': module.get('create', True),
+                                    'update': module.get('update', True),
+                                    'delete': module.get('delete', True),
+                                }
+                                break
+                        elif module == rbac_module:
+                            module_perms = {'view': True, 'create': True, 'update': True, 'delete': True}
+                            break
+                            
+        # If no permissions found, deny
+        if not module_perms:
+            return False
         
         # 6. Map request method to Create/Read/Update/Delete
         method = request.method
