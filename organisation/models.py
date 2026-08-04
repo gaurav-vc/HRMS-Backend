@@ -118,6 +118,7 @@ class AttendancePolicy(models.Model):
 class Role(models.Model):
     name = models.CharField(max_length=100)
     code = models.CharField(max_length=50, unique=True)
+    organization = models.ForeignKey('admin_org.Organization', on_delete=models.CASCADE, null=True, blank=True, related_name='roles')
     department = models.ForeignKey(Department, on_delete=models.SET_NULL, null=True, blank=True, related_name='roles')
     access_scope = models.CharField(max_length=50, default='Self') # Corporate, Region, Site, Self
     dashboard_type = models.CharField(max_length=50, blank=True, null=True)

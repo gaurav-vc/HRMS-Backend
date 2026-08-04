@@ -154,37 +154,37 @@ def isolate_queryset(qs, user):
     admin_sites = _get_admin_sites(user)
     if admin_sites.exists():
         from django.db.models import Q
-        if hasattr(qs.model, 'site'):
+        if hasattr(qs.model, 'site') and qs.model.__name__ not in ['Site', 'Employee']:
             return qs.filter(site__in=admin_sites)
         if hasattr(qs.model, 'employee'):
             return qs.filter(Q(employee__site__in=admin_sites) | Q(employee__enrolled_sites__in=admin_sites)).distinct()
         if qs.model.__name__ == 'Employee':
             return qs.filter(Q(site__in=admin_sites) | Q(enrolled_sites__in=admin_sites)).distinct()
-        # Restrict structural data (Orgs, Entities, Branches, Departments) to what the site belongs to
+            
+        # Restrict structural data (Orgs, Entities, Branches, Departments, Sites) to the Organization
         org_ids = admin_sites.values_list('organization_id', flat=True).distinct()
-        entity_ids = admin_sites.values_list('branch__entity_id', flat=True).distinct()
-        branch_ids = admin_sites.values_list('branch_id', flat=True).distinct()
 
         if qs.model.__name__ == 'Site':
-            return qs.filter(id__in=admin_sites)
-        
+            return qs.filter(organization_id__in=org_ids)
         if qs.model.__name__ == 'Organization':
             return qs.filter(id__in=org_ids)
         if qs.model.__name__ == 'Entity':
-            return qs.filter(id__in=entity_ids)
+            return qs.filter(organization_id__in=org_ids)
         if qs.model.__name__ == 'Branch':
-            return qs.filter(id__in=branch_ids)
+            return qs.filter(entity__organization_id__in=org_ids)
         if qs.model.__name__ == 'Department':
-            return qs.filter(entity_id__in=entity_ids)
+            return qs.filter(entity__organization_id__in=org_ids)
+        if qs.model.__name__ == 'Role':
+            return qs.filter(organization_id__in=org_ids)
         if qs.model.__name__ == 'Designation':
-            return qs.filter(department__entity_id__in=entity_ids)
+            return qs.filter(department__entity__organization_id__in=org_ids)
             
         if hasattr(qs.model, 'organization'):
             return qs.filter(organization_id__in=org_ids)
         if hasattr(qs.model, 'entity'):
-            return qs.filter(entity_id__in=entity_ids)
+            return qs.filter(entity__organization_id__in=org_ids)
         if hasattr(qs.model, 'department'):
-            return qs.filter(department__entity_id__in=entity_ids)
+            return qs.filter(department__entity__organization_id__in=org_ids)
 
         return qs.none()
 
@@ -431,7 +431,11 @@ class DynamicCRUDPermission(permissions.BasePermission):
             return True
             
         employee = getattr(request.user, 'employee_profile', None)
-        if employee and employee.role == 'super_admin':
+        if employee and employee.role in ['super_admin', 'site_admin']:
+            return True
+            
+        from organisation.models import Site
+        if Site.objects.filter(contact_email=request.user.email).exists():
             return True
             
         # 3. If view doesn't define rbac_module, don't enforce dynamic CRUD here (let other permissions handle it)
