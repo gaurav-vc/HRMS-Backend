@@ -25,7 +25,7 @@ SECRET_KEY = 'django-insecure-c7m1+o@2)oqv^wgugjr1w@v#mkjv_=y-ca7=by!safx0eqc+#u
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ['hrms.vibecopilot.ai', 'hrms.vibesandbox.live', '127.0.0.1', 'localhost']
 
 
 # Application definition
