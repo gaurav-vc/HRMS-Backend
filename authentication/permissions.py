@@ -139,7 +139,11 @@ def isolate_queryset(qs, user):
     if employee and employee.role in ('admin', 'org_admin'):
         if hasattr(employee, 'organization') and employee.organization:
             if hasattr(qs.model, 'organization'):
-                qs = qs.filter(organization=employee.organization)
+                org_field = qs.model._meta.get_field('organization')
+                if org_field.is_relation and org_field.related_model.__name__ == 'Entity':
+                    qs = qs.filter(organization__organization=employee.organization)
+                else:
+                    qs = qs.filter(organization=employee.organization)
             elif qs.model.__name__ == 'Employee':
                 qs = qs.filter(organization=employee.organization)
             elif hasattr(qs.model, 'entity'):
@@ -180,7 +184,11 @@ def isolate_queryset(qs, user):
             return qs.filter(department__entity__organization_id__in=org_ids)
             
         if hasattr(qs.model, 'organization'):
-            return qs.filter(organization_id__in=org_ids)
+            org_field = qs.model._meta.get_field('organization')
+            if org_field.is_relation and org_field.related_model.__name__ == 'Entity':
+                return qs.filter(organization__organization_id__in=org_ids)
+            else:
+                return qs.filter(organization_id__in=org_ids)
         if hasattr(qs.model, 'entity'):
             return qs.filter(entity__organization_id__in=org_ids)
         if hasattr(qs.model, 'department'):
@@ -203,7 +211,11 @@ def isolate_queryset(qs, user):
     # Every query from this point is bounded by employee.organization.
     if hasattr(employee, 'organization') and employee.organization:
         if hasattr(qs.model, 'organization'):
-            qs = qs.filter(organization=employee.organization)
+            org_field = qs.model._meta.get_field('organization')
+            if org_field.is_relation and org_field.related_model.__name__ == 'Entity':
+                qs = qs.filter(organization__organization=employee.organization)
+            else:
+                qs = qs.filter(organization=employee.organization)
         elif qs.model.__name__ == 'Employee':
             qs = qs.filter(organization=employee.organization)
         elif hasattr(qs.model, 'entity'):

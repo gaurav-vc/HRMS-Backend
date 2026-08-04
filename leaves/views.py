@@ -98,6 +98,13 @@ class LeaveTypeViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = LeaveType.objects.all()
     serializer_class = LeaveTypeSerializer
 
+    def list(self, request, *args, **kwargs):
+        try:
+            return super().list(request, *args, **kwargs)
+        except Exception as e:
+            import traceback
+            return Response({"detail": traceback.format_exc()}, status=400)
+
     def get_queryset(self):
         try:
             qs = super().get_queryset()
@@ -154,6 +161,13 @@ from authentication.permissions import DataIsolationMixin
 class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Leave Requests'
     serializer_class = LeaveRequestSerializer
+
+    def list(self, request, *args, **kwargs):
+        try:
+            return super().list(request, *args, **kwargs)
+        except Exception as e:
+            import traceback
+            return Response({"detail": traceback.format_exc()}, status=400)
 
     def get_queryset(self):
         qs = LeaveRequest.objects.all().order_by('-created_at')
