@@ -1,5 +1,5 @@
 from rest_framework import viewsets, status
-from authentication.permissions import DataIsolationMixin
+from authentication.permissions import DataIsolationMixin, isolate_queryset
 from rest_framework.decorators import action, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -485,17 +485,15 @@ class AttendanceViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'])
     def history(self, request):
-        viewset = DailyAttendanceViewSet()
-        viewset.request = request
-        queryset = viewset.get_queryset().order_by('-attendance_date')
+        qs = isolate_queryset(DailyAttendance.objects.all(), request.user)
+        queryset = qs.order_by('-attendance_date')
         return Response(DailyAttendanceSerializer(queryset, many=True).data)
 
     @action(detail=False, methods=['get'])
     def today(self, request):
         today = timezone.now().date()
-        viewset = DailyAttendanceViewSet()
-        viewset.request = request
-        queryset = viewset.get_queryset().filter(attendance_date=today).order_by('-attendance_date')
+        qs = isolate_queryset(DailyAttendance.objects.all(), request.user)
+        queryset = qs.filter(attendance_date=today).order_by('-attendance_date')
         return Response(DailyAttendanceSerializer(queryset, many=True).data)
 
     @action(detail=False, methods=['post'])

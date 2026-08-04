@@ -313,8 +313,7 @@ class SalarySlipAPIView(APIView):
                         emp_filter['employee'] = emp
         except Exception as e:
             import traceback
-            with open(r'C:\Users\MC VIP\OneDrive\Desktop\HRMS\backend\error_log.txt', 'w') as f:
-                f.write(traceback.format_exc())
+            print("Payroll Query Error:", traceback.format_exc())
             raise e
         
         try:
@@ -517,8 +516,7 @@ class SalarySlipAPIView(APIView):
             return Response({ 'period': period, 'slips': slips, 'diagnostics': diagnostics })
         except Exception as e:
             import traceback
-            with open(r'C:\Users\MC VIP\OneDrive\Desktop\HRMS\backend\error_log2.txt', 'w') as f:
-                f.write(traceback.format_exc())
+            print("Payroll Process Error:", traceback.format_exc())
             raise e
 
 from django.http import HttpResponse

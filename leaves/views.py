@@ -109,9 +109,7 @@ class LeaveTypeViewSet(viewsets.ReadOnlyModelViewSet):
             return qs
         except Exception as e:
             import traceback
-            trace = traceback.format_exc()
-            with open(r"C:\Users\MC VIP\.gemini\antigravity-ide\brain\e67bb007-f83e-496e-af2d-2e9dcae7f046\scratch\error_log_types.txt", "w") as f:
-                f.write(trace)
+            print("LeaveType Query Error:", traceback.format_exc())
             return super().get_queryset()
 
 class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):

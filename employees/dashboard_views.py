@@ -15,7 +15,8 @@ from leaves.models import LeaveRequest, LeaveBalance
 
 class DashboardStatsAPIView(APIView):
     def get(self, request):
-        today = timezone.localdate()
+        try:
+            today = timezone.localdate()
         user = request.user
         can_view_confidential = False
         is_super_admin = user.is_superuser
@@ -213,4 +214,7 @@ class DashboardStatsAPIView(APIView):
             }
         }
         
-        return Response(payload)
+            return Response(payload)
+        except Exception as e:
+            import traceback
+            return Response({"error": str(e), "trace": traceback.format_exc()}, status=500)
