@@ -152,6 +152,10 @@ def isolate_queryset(qs, user):
                 qs = qs.filter(department__entity__organization=employee.organization)
             elif hasattr(qs.model, 'employee'):
                 qs = qs.filter(employee__organization=employee.organization)
+            elif hasattr(qs.model, 'structure'):
+                qs = qs.filter(structure__site__organization=employee.organization)
+            elif qs.model.__name__ == 'SalaryStructure':
+                qs = qs.filter(site__organization=employee.organization)
             return qs
 
     # ── SITE ADMIN ───────────────────────────────────────────────────────────
@@ -193,6 +197,10 @@ def isolate_queryset(qs, user):
             return qs.filter(entity__organization_id__in=org_ids)
         if hasattr(qs.model, 'department'):
             return qs.filter(department__entity__organization_id__in=org_ids)
+        if hasattr(qs.model, 'structure'):
+            return qs.filter(structure__site__in=admin_sites)
+        if qs.model.__name__ == 'SalaryStructure':
+            return qs.filter(site__in=admin_sites)
 
         return qs.none()
 
@@ -224,6 +232,10 @@ def isolate_queryset(qs, user):
             qs = qs.filter(department__entity__organization=employee.organization)
         elif hasattr(qs.model, 'employee'):
             qs = qs.filter(employee__organization=employee.organization)
+        elif hasattr(qs.model, 'structure'):
+            qs = qs.filter(structure__site__organization=employee.organization)
+        elif qs.model.__name__ == 'SalaryStructure':
+            qs = qs.filter(site__organization=employee.organization)
 
     # ── DYNAMIC ROLE SCOPING ─────────────────────────────────────────────────
     has_org_access = False
@@ -246,6 +258,10 @@ def isolate_queryset(qs, user):
                     return qs.filter(department__entity_id__in=custom_allowed)
                 if hasattr(qs.model, 'employee'):
                     return qs.filter(employee__entity_id__in=custom_allowed)
+                if hasattr(qs.model, 'structure'):
+                    return qs.filter(structure__site__entity_id__in=custom_allowed)
+                if qs.model.__name__ == 'SalaryStructure':
+                    return qs.filter(site__entity_id__in=custom_allowed)
                 if qs.model.__name__ == 'Employee':
                     return qs.filter(entity_id__in=custom_allowed)
 
@@ -255,6 +271,10 @@ def isolate_queryset(qs, user):
                 return qs.filter(department__entity=employee.entity) if employee.entity else qs
             if hasattr(qs.model, 'employee'):
                 return qs.filter(employee__entity=employee.entity) if employee.entity else qs
+            if hasattr(qs.model, 'structure'):
+                return qs.filter(structure__site__organization=employee.organization) if employee.organization else qs
+            if qs.model.__name__ == 'SalaryStructure':
+                return qs.filter(site__organization=employee.organization) if employee.organization else qs
             if qs.model.__name__ == 'Employee':
                 return qs.filter(entity=employee.entity)
         else:
@@ -263,6 +283,10 @@ def isolate_queryset(qs, user):
                 return qs.filter(employee=employee)
             elif qs.model.__name__ == 'Employee':
                 return qs.filter(id=employee.id)
+            elif hasattr(qs.model, 'structure'):
+                return qs.filter(structure__site=employee.site) if employee.site else qs
+            elif qs.model.__name__ == 'SalaryStructure':
+                return qs.filter(site=employee.site) if employee.site else qs
             elif qs.model.__name__ == 'Site':
                 from django.db.models import Q
                 return qs.model.objects.filter(Q(id=employee.site_id) | Q(id__in=employee.enrolled_sites.all()))
@@ -293,6 +317,10 @@ def isolate_queryset(qs, user):
                 return qs.filter(department__entity=employee.entity)
             if hasattr(qs.model, 'employee'):
                 return qs.filter(employee__entity=employee.entity)
+            if hasattr(qs.model, 'structure'):
+                return qs.filter(structure__site__entity=employee.entity)
+            if qs.model.__name__ == 'SalaryStructure':
+                return qs.filter(site__entity=employee.entity)
             if qs.model.__name__ == 'Employee':
                 return qs.filter(entity=employee.entity)
                 
