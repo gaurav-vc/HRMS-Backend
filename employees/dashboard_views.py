@@ -15,8 +15,7 @@ from leaves.models import LeaveRequest, LeaveBalance
 
 class DashboardStatsAPIView(APIView):
     def get(self, request):
-        try:
-            today = timezone.localdate()
+        today = timezone.localdate()
         user = request.user
         can_view_confidential = False
         is_super_admin = user.is_superuser
@@ -203,18 +202,15 @@ class DashboardStatsAPIView(APIView):
                 "todayAttendance": [{"id": a.id, "empName": f"{a.employee.first_name} {a.employee.last_name}", "checkIn": a.first_check_in.strftime("%H:%M") if a.first_check_in else "N/A", "status": a.attendance_status} for a in isolate_queryset(DailyAttendance.objects.all(), user).filter(attendance_date=today)[:6]]
             },
             "employee": {
-                "presentThisMonth": isolate_queryset(DailyAttendance.objects.all(), user).filter(attendance_date__month=today.month, attendance_status='Present').count(),
+                "presentThisMonth": DailyAttendance.objects.filter(employee=emp, attendance_date__month=today.month, attendance_status='Present').count() if emp else 0,
                 "workingDays": ((today.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)).day,
-                "leaveBalance": float(isolate_queryset(LeaveBalance.objects.all(), user).aggregate(total=Sum('remaining_days'))['total'] or 0) if hasattr(user, 'employee_profile') else 0,
+                "leaveBalance": float(LeaveBalance.objects.filter(employee=emp).aggregate(total=Sum('remaining_days'))['total'] or 0) if emp else 0,
                 "lastNetPay": last_run_net,
-                "recentAttendance": [{"id": a.id, "date": str(a.attendance_date), "checkIn": a.first_check_in.strftime("%H:%M") if a.first_check_in else "N/A", "checkOut": a.last_check_out.strftime("%H:%M") if a.last_check_out else "N/A"} for a in isolate_queryset(DailyAttendance.objects.all(), user).order_by('-attendance_date')[:5]],
-                "myLeaveRequests": [{"id": l.id, "type": l.leave_type.name, "from": str(l.start_date), "status": l.status} for l in isolate_queryset(LeaveRequest.objects.all(), user).order_by('-created_at')[:5]],
+                "recentAttendance": [{"id": a.id, "date": str(a.attendance_date), "checkIn": a.first_check_in.strftime("%H:%M") if a.first_check_in else "N/A", "checkOut": a.last_check_out.strftime("%H:%M") if a.last_check_out else "N/A"} for a in DailyAttendance.objects.filter(employee=emp).order_by('-attendance_date')[:5]] if emp else [],
+                "myLeaveRequests": [{"id": l.id, "type": l.leave_type.name, "from": str(l.start_date), "status": l.status} for l in LeaveRequest.objects.filter(employee=emp).order_by('-created_at')[:5]] if emp else [],
                 "siteQrEnabled": emp.site.qr_enabled if emp and hasattr(emp, 'site') and emp.site else True,
                 "siteFaceEnabled": emp.site.face_enabled if emp and hasattr(emp, 'site') and emp.site else True,
             }
         }
         
-            return Response(payload)
-        except Exception as e:
-            import traceback
-            return Response({"error": str(e), "trace": traceback.format_exc()}, status=500)
+        return Response(payload)

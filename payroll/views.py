@@ -287,13 +287,13 @@ class SalarySlipAPIView(APIView):
                     has_org_access = False
                     custom_allowed = []
                     
-                    if emp.dynamic_role.access_scope in ['Corporate', 'Region', 'Custom']:
+                    if emp.dynamic_role.access_scope in ['Corporate', 'Region', 'Custom'] or emp.dynamic_role.cross_department_access:
                         has_org_access = True
                         if emp.dynamic_role.access_scope == 'Custom':
                             custom_allowed = emp.dynamic_role.permissions.get('allowed_entities', [])
                     
                     if has_org_access:
-                        if emp.dynamic_role.access_scope == 'Corporate':
+                        if emp.dynamic_role.access_scope == 'Corporate' or emp.dynamic_role.cross_department_access:
                             pass # No filter, see all
                         elif custom_allowed:
                             emp_filter['employee__entity_id__in'] = custom_allowed

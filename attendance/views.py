@@ -327,6 +327,10 @@ class AttendanceViewSet(viewsets.ViewSet):
                     if not identified_id:
                         return Response({"error": "Rejected: Face mismatch (No employee recognized)"}, status=400)
                         
+                    emp_id = request.data.get('employee')
+                    if emp_id and str(emp_id) != str(identified_id):
+                        return Response({"error": "Rejected: Face mismatch. The recognized face does not match the selected employee ID."}, status=400)
+                        
                     # Validate Device Attestation AFTER identifying the employee
                     if webauthn_signature:
                         attest_passed, attest_msg = WebAuthnService.verify_authentication_response(

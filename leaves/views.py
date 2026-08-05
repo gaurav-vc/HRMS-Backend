@@ -6,7 +6,7 @@ from django.utils import timezone
 from .models import LeaveType, LeaveBalance, LeaveRequest, Holiday, LeavePolicyConfiguration
 from .serializers import LeaveTypeSerializer, LeaveBalanceSerializer, LeaveRequestSerializer, HolidaySerializer, LeavePolicyConfigurationSerializer
 from decimal import Decimal
-from datetime import timedelta
+from datetime import timedelta, date
 from django.db.models import Q
 import threading
 from django.core.mail import EmailMultiAlternatives
@@ -98,13 +98,6 @@ class LeaveTypeViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = LeaveType.objects.all()
     serializer_class = LeaveTypeSerializer
 
-    def list(self, request, *args, **kwargs):
-        try:
-            return super().list(request, *args, **kwargs)
-        except Exception as e:
-            import traceback
-            return Response({"detail": traceback.format_exc()}, status=400)
-
     def get_queryset(self):
         try:
             qs = super().get_queryset()
@@ -162,13 +155,6 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Leave Requests'
     serializer_class = LeaveRequestSerializer
 
-    def list(self, request, *args, **kwargs):
-        try:
-            return super().list(request, *args, **kwargs)
-        except Exception as e:
-            import traceback
-            return Response({"detail": traceback.format_exc()}, status=400)
-
     def get_queryset(self):
         qs = LeaveRequest.objects.all().order_by('-created_at')
         
@@ -182,9 +168,12 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         if mode == 'inbox' and employee:
             # Show all leaves they have access to, EXCEPT their own
             return qs.exclude(employee=employee)
-        elif mode == 'my_leaves' and employee:
+        elif mode == 'my_leaves':
             # Show only their own leaves
-            return qs.filter(employee=employee)
+            if employee:
+                return qs.filter(employee=employee)
+            else:
+                return qs.none()
             
         return qs
 
@@ -221,10 +210,8 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             if not balance:
                 # Auto-create balance for testing/convenience
                 entitlement = leave_type.annual_entitlement
-                if leave_type.code == 'AL' and employee and employee.doj:
-                    from datetime import date
-                    from decimal import Decimal
-                    config = LeavePolicyConfiguration.get_settings()
+                config = LeavePolicyConfiguration.get_settings()
+                if entitlement == config.standard_annual_leaves and employee and employee.doj:
                     years_of_service = (date.today() - employee.doj).days / 365.25
                     if years_of_service >= config.tenured_years_threshold:
                         entitlement = config.tenured_annual_leaves
@@ -240,8 +227,9 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                     remaining_days=entitlement
                 )
     
-            if balance.remaining_days < total_days:
-                raise ValidationError({"detail": "Insufficient leave balance."})
+            is_unpaid = (leave_type.annual_entitlement == 0)
+            if not is_unpaid and balance.remaining_days < total_days:
+                raise ValidationError({"detail": f"Insufficient leave balance. You have {balance.remaining_days} days remaining."})
     
             # Apply Leave Policy Restrictions
             config = LeavePolicyConfiguration.get_settings()
@@ -268,7 +256,9 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                              (start_date.year == five_years_later.year and start_date.month > five_years_later.month)
                 # You can use `is_tenured` to automatically upgrade their leave allocations here if desired.
     
-            serializer.save(employee=employee, total_days=total_days, salary_deduction_days=salary_deduction_days, status='Pending')
+            organization = getattr(employee, 'entity', None)
+            site = getattr(employee, 'site', None)
+            serializer.save(employee=employee, organization=organization, site=site, total_days=total_days, salary_deduction_days=salary_deduction_days, status='Pending')
         except Exception as e:
             import traceback
             trace = traceback.format_exc()

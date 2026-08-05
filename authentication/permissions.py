@@ -169,7 +169,7 @@ def isolate_queryset(qs, user):
         org_ids = admin_sites.values_list('organization_id', flat=True).distinct()
 
         if qs.model.__name__ == 'Site':
-            return qs.filter(organization_id__in=org_ids)
+            return qs.filter(id__in=admin_sites.values_list('id', flat=True))
         if qs.model.__name__ == 'Organization':
             return qs.filter(id__in=org_ids)
         if qs.model.__name__ == 'Entity':
@@ -229,14 +229,14 @@ def isolate_queryset(qs, user):
     has_org_access = False
     custom_allowed = []
     if dynamic_role:
-        if dynamic_role.access_scope in ['Corporate', 'Region', 'Custom']:
+        if dynamic_role.access_scope in ['Corporate', 'Region', 'Custom'] or dynamic_role.cross_department_access:
             has_org_access = True
             if dynamic_role.access_scope == 'Custom':
                 custom_allowed = dynamic_role.permissions.get('allowed_entities', [])
 
     if dynamic_role:
         if has_org_access:
-            if dynamic_role.access_scope == 'Corporate':
+            if dynamic_role.access_scope == 'Corporate' or dynamic_role.cross_department_access:
                 return qs
 
             if custom_allowed:
@@ -279,18 +279,37 @@ def isolate_queryset(qs, user):
             return qs.filter(Q(site=employee.site) | Q(enrolled_sites=employee.site)).distinct()
 
     if role in ('hr', 'manager'):
-        if hasattr(qs.model, 'entity'):
-            return qs.filter(entity=employee.entity)
-        if hasattr(qs.model, 'department'):
-            return qs.filter(department__entity=employee.entity)
+        from django.db.models import Q
+        
+        # Build filter for organization and site
+        manager_org = employee.organization_id
+        manager_site = employee.site_id
+        
+        # If manager doesn't have an org/site, fallback to entity
+        if not manager_org or not manager_site:
+            if hasattr(qs.model, 'entity'):
+                return qs.filter(entity=employee.entity)
+            if hasattr(qs.model, 'department'):
+                return qs.filter(department__entity=employee.entity)
+            if hasattr(qs.model, 'employee'):
+                return qs.filter(employee__entity=employee.entity)
+            if qs.model.__name__ == 'Employee':
+                return qs.filter(entity=employee.entity)
+                
+        # Filter by org and site
+        if hasattr(qs.model, 'site') and hasattr(qs.model, 'organization'):
+            return qs.filter(organization_id=manager_org, site_id=manager_site)
+        if hasattr(qs.model, 'site'):
+            return qs.filter(site_id=manager_site)
         if hasattr(qs.model, 'employee'):
-            return qs.filter(employee__entity=employee.entity)
+            return qs.filter(employee__organization_id=manager_org, employee__site_id=manager_site)
         if qs.model.__name__ == 'Employee':
-            return qs.filter(entity=employee.entity)
+            return qs.filter(organization_id=manager_org, site_id=manager_site)
 
     # ── DEFAULT: employee sees only their own records (and their site's structural data) ────────────────────────
     if hasattr(qs.model, 'employee'):
-        return qs.filter(employee=employee)
+        from django.db.models import Q
+        return qs.filter(Q(employee=employee) | Q(employee__manager=employee)).distinct()
     
     # Allow seeing colleagues in the same site
     if qs.model.__name__ == 'Employee':
@@ -403,13 +422,19 @@ class DataIsolationMixin:
                     mutable_data = dict(request.data)
                     
                 modified = False
-                if hasattr(model, 'site') and 'site' not in mutable_data and target_site:
+                if hasattr(model, 'site') and not mutable_data.get('site') and target_site:
                     mutable_data['site'] = target_site
                     modified = True
-                if hasattr(model, 'organization') and 'organization' not in mutable_data and target_org:
-                    mutable_data['organization'] = target_org
-                    modified = True
-                if hasattr(model, 'entity') and 'entity' not in mutable_data and target_entity:
+                if hasattr(model, 'organization') and not mutable_data.get('organization'):
+                    org_field = model._meta.get_field('organization')
+                    if org_field.is_relation and org_field.related_model.__name__ == 'Entity':
+                        if target_entity:
+                            mutable_data['organization'] = target_entity
+                            modified = True
+                    elif target_org:
+                        mutable_data['organization'] = target_org
+                        modified = True
+                if hasattr(model, 'entity') and not mutable_data.get('entity') and target_entity:
                     mutable_data['entity'] = target_entity
                     modified = True
                     
@@ -493,8 +518,51 @@ class DynamicCRUDPermission(permissions.BasePermission):
         elif method == 'POST':
             return module_perms.get('create') is True
         elif method in ['PUT', 'PATCH']:
-            return module_perms.get('update') is True
+            # We will allow the request to proceed to has_object_permission
+            # if they are a manager. We'll enforce the strict check there.
+            if module_perms.get('update') is True:
+                return True
+            if employee:
+                from employees.models import Employee
+                if Employee.objects.filter(manager=employee).exists():
+                    return True
+            return False
         elif method == 'DELETE':
             return module_perms.get('delete') is True
             
         return False
+
+    def has_object_permission(self, request, view, obj):
+        # 1. Super admins bypass all
+        if request.user.is_superuser:
+            return True
+            
+        employee = getattr(request.user, 'employee_profile', None)
+        if employee and employee.role in ['super_admin', 'site_admin']:
+            return True
+            
+        from organisation.models import Site
+        if Site.objects.filter(contact_email=request.user.email).exists():
+            return True
+
+        # Check if they are updating a reportee's object
+        method = request.method
+        if method in ['PUT', 'PATCH'] and employee and hasattr(obj, 'employee'):
+            if getattr(obj.employee, 'manager_id', None) == employee.id:
+                return True
+                
+        # Otherwise fallback to the module permissions
+        rbac_module = getattr(view, 'rbac_module', None)
+        if not rbac_module:
+            return True
+            
+        module_perms = {}
+        if employee and employee.dynamic_role and employee.dynamic_role.permissions:
+            module_perms = employee.dynamic_role.permissions.get(rbac_module, {})
+            
+        if method in ['PUT', 'PATCH']:
+            return module_perms.get('update') is True
+        elif method == 'DELETE':
+            return module_perms.get('delete') is True
+            
+        return True
