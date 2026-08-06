@@ -883,15 +883,26 @@ class OfferLetterViewSet(viewsets.ModelViewSet):
                 sRoot = getattr(settings, 'STATIC_ROOT', None)
                 mUrl = settings.MEDIA_URL
                 mRoot = settings.MEDIA_ROOT
-                if uri.startswith(mUrl):
-                    path = os.path.join(mRoot, uri.replace(mUrl, ""))
-                elif sUrl and uri.startswith(sUrl):
-                    path = os.path.join(sRoot, uri.replace(sUrl, ""))
+                
+                # Handle absolute URLs by stripping the domain
+                import urllib.parse
+                parsed = urllib.parse.urlparse(uri)
+                path = parsed.path
+                
+                # Handle the proxy prefix
+                if path.startswith('/api/media/'):
+                    path = path.replace('/api/media/', '/media/')
+                    
+                if path.startswith(mUrl):
+                    local_path = os.path.join(mRoot, path.replace(mUrl, ""))
+                elif sUrl and path.startswith(sUrl):
+                    local_path = os.path.join(sRoot, path.replace(sUrl, ""))
                 else:
                     return uri
-                if not os.path.isfile(path):
+                    
+                if not os.path.isfile(local_path):
                     return uri
-                return path
+                return local_path
 
             try:
                 request_user = getattr(self, 'request', None).user if getattr(self, 'request', None) else None
@@ -1113,15 +1124,26 @@ class OfferLetterViewSet(viewsets.ModelViewSet):
                     sRoot = getattr(settings, 'STATIC_ROOT', None)
                     mUrl = settings.MEDIA_URL
                     mRoot = settings.MEDIA_ROOT
-                    if uri.startswith(mUrl):
-                        path = os.path.join(mRoot, uri.replace(mUrl, ""))
-                    elif sUrl and uri.startswith(sUrl):
-                        path = os.path.join(sRoot, uri.replace(sUrl, ""))
+                    
+                    # Handle absolute URLs by stripping the domain
+                    import urllib.parse
+                    parsed = urllib.parse.urlparse(uri)
+                    path = parsed.path
+                    
+                    # Handle the proxy prefix
+                    if path.startswith('/api/media/'):
+                        path = path.replace('/api/media/', '/media/')
+                        
+                    if path.startswith(mUrl):
+                        local_path = os.path.join(mRoot, path.replace(mUrl, ""))
+                    elif sUrl and path.startswith(sUrl):
+                        local_path = os.path.join(sRoot, path.replace(sUrl, ""))
                     else:
                         return uri
-                    if not os.path.isfile(path):
+                        
+                    if not os.path.isfile(local_path):
                         return uri
-                    return path
+                    return local_path
 
                 result = BytesIO()
                 
