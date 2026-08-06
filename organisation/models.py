@@ -58,6 +58,11 @@ class Site(models.Model):
     radius = models.IntegerField(default=150)
     qr_enabled = models.BooleanField(default=True)
     face_enabled = models.BooleanField(default=True)
+    
+    # Branding for Site
+    logo = models.ImageField(upload_to='site_logos/', null=True, blank=True)
+    branding_text = models.CharField(max_length=100, default='PeoplePulse HRMS', blank=True, null=True)
+    
     created_at = models.DateTimeField(default=timezone.now)
 
     class Meta:

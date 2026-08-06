@@ -16,6 +16,10 @@ class Organization(models.Model):
     white_label_enabled = models.BooleanField(default=False)
     sub_domain = models.CharField(max_length=100, blank=True, null=True)
     
+    # Branding
+    logo = models.ImageField(upload_to='org_logos/', null=True, blank=True)
+    branding_text = models.CharField(max_length=100, default='PeoplePulse HRMS', blank=True, null=True)
+    
     # Billing Config
     solution_type = models.CharField(max_length=50, blank=True, null=True)
     solution_for = models.CharField(max_length=50, blank=True, null=True)

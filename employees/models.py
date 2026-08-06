@@ -183,6 +183,14 @@ class OfferTemplate(models.Model):
     name = models.CharField(max_length=150)
     category = models.CharField(max_length=100) # e.g. Graduate Hire, Experienced Hire
     body_html = models.TextField(blank=True, null=True)
+    header_html = models.TextField(blank=True, null=True, help_text="Custom HTML for the PDF header")
+    footer_html = models.TextField(blank=True, null=True, help_text="Custom HTML for the PDF footer")
+    header_image = models.ImageField(upload_to='offer_templates/headers/', null=True, blank=True)
+    header_image_width = models.CharField(max_length=50, default='535', help_text="Width in points or px")
+    header_image_align = models.CharField(max_length=20, default='center', help_text="left, right, or center")
+    footer_image = models.ImageField(upload_to='offer_templates/footers/', null=True, blank=True)
+    footer_image_width = models.CharField(max_length=50, default='535', help_text="Width in points or px")
+    footer_image_align = models.CharField(max_length=20, default='center', help_text="left, right, or center")
     placeholders = models.JSONField(default=list) # e.g. ["EmployeeName", "Designation", "JoiningDate"]
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -202,9 +210,11 @@ class OfferLetter(models.Model):
     ]
     
     employee = models.OneToOneField(Employee, on_delete=models.CASCADE, related_name='offer_letter')
+    template = models.ForeignKey(OfferTemplate, on_delete=models.SET_NULL, null=True, blank=True)
     offer_number = models.CharField(max_length=50, unique=True)
     status = models.CharField(max_length=50, choices=STATUS_CHOICES, default='Pending Approval')
     joining_date = models.DateField(null=True, blank=True)
+    pdf_file = models.FileField(upload_to='offer_letters/', null=True, blank=True)
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
