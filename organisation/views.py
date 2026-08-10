@@ -139,8 +139,6 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = Site.objects.all()
     serializer_class = SiteSerializer
     
-    from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
-    parser_classes = (MultiPartParser, FormParser, JSONParser)
 
     def get_permissions(self):
         if self.action in ['list', 'retrieve']:
