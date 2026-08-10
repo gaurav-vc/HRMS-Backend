@@ -40,13 +40,15 @@ class UserProfileSerializer(serializers.ModelSerializer):
     permissions = serializers.SerializerMethodField()
     role_name = serializers.SerializerMethodField()
     dashboard_type = serializers.SerializerMethodField()
+    site_name = serializers.SerializerMethodField()
+    org_name = serializers.SerializerMethodField()
     
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'role', 'employee_id', 'first_name', 'last_name', 'permissions', 'role_name', 'dashboard_type')
+        fields = ('id', 'username', 'email', 'role', 'employee_id', 'first_name', 'last_name', 'permissions', 'role_name', 'dashboard_type', 'site_name', 'org_name')
 
     def get_employee_id(self, obj):
-        return obj.employee_profile.id if hasattr(obj, 'employee_profile') else None
+        return obj.employee_profile.code if hasattr(obj, 'employee_profile') and obj.employee_profile else None
 
     def get_first_name(self, obj):
         if hasattr(obj, 'employee_profile') and obj.employee_profile:
@@ -111,4 +113,23 @@ class UserProfileSerializer(serializers.ModelSerializer):
             return 'manager' # Site Admins see the manager/executive dashboard
         if hasattr(obj, 'employee_profile') and obj.employee_profile and obj.employee_profile.dynamic_role:
             return obj.employee_profile.dynamic_role.dashboard_type
+        return None
+
+    def get_site_name(self, obj):
+        from organisation.models import Site
+        site = Site.objects.filter(contact_email=obj.email).first()
+        if site:
+            return site.name
+        if hasattr(obj, 'employee_profile') and obj.employee_profile and hasattr(obj.employee_profile, 'site') and obj.employee_profile.site:
+            return obj.employee_profile.site.name
+        return None
+
+    def get_org_name(self, obj):
+        from organisation.models import Site
+        site = Site.objects.filter(contact_email=obj.email).first()
+        if site and site.organization:
+            return site.organization.name
+        if hasattr(obj, 'employee_profile') and obj.employee_profile and hasattr(obj.employee_profile, 'site') and obj.employee_profile.site:
+            if obj.employee_profile.site.organization:
+                return obj.employee_profile.site.organization.name
         return None
