@@ -72,7 +72,7 @@ def provision_contact_person(site, origin=None):
             user.save()
         else:
             password = "[Your existing password]"
-        login_url = f"{origin}/" if origin else "http://localhost:5173/"
+        login_url = f"{origin}/" if origin else "https://hrms.vibesandbox.live/"
         subject = f"You have been assigned to Site: {site.name}"
         message = f"Hello {site.contact_name or 'User'},\n\nYou have been assigned as the Site Admin for {site.name}.\n\nWebsite URL: {login_url}\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
         import threading
@@ -123,7 +123,7 @@ def provision_contact_person(site, origin=None):
             print(f"Failed to create employee profile: {e}")
             
         subject = f"Welcome to VibeCopilot - Site Admin Credentials"
-        message = f"Hello {site.contact_name or 'User'},\n\nAn account has been created for you as the Site Admin for {site.name}.\n\nWebsite URL: http://localhost:5173\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
+        message = f"Hello {site.contact_name or 'User'},\n\nAn account has been created for you as the Site Admin for {site.name}.\n\nWebsite URL: https://hrms.vibesandbox.live\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
         
         import threading
         def send_async_new():

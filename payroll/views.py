@@ -280,7 +280,7 @@ class SalarySlipAPIView(APIView):
             if not user.is_superuser:
                 emp = getattr(user, 'employee_profile', None)
                 if not emp:
-                    return Response({'error': 'Unauthorized'}, status=403)
+                    return Response({'period': period, 'slips': [], 'diagnostics': {'error': 'No employee profile linked to user'}})
                 
                 # Use dynamic_role if available
                 if emp.dynamic_role:

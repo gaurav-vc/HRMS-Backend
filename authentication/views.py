@@ -94,7 +94,7 @@ class PasswordResetRequestView(APIView):
             token = default_token_generator.make_token(user)
             uid = urlsafe_base64_encode(force_bytes(user.pk))
             # Frontend URL
-            reset_link = f"http://localhost:5173/reset-password?uid={uid}&token={token}"
+            reset_link = f"https://hrms.vibesandbox.live/reset-password?uid={uid}&token={token}"
             
             try:
                 send_mail(

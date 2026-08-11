@@ -48,7 +48,7 @@ def provision_organization_admin(org):
             user.set_password(password)
             user.save()
         subject = f"You have been assigned as Admin for {org.name}"
-        message = f"Hello Admin,\n\nYou have been assigned as the Admin for {org.name}.\n\nWebsite URL: http://localhost:5173\nLogin ID: {email}\nPassword: {password if not user.is_superuser else '[Your existing password]'}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
+        message = f"Hello Admin,\n\nYou have been assigned as the Admin for {org.name}.\n\nWebsite URL: https://hrms.vibesandbox.live\nLogin ID: {email}\nPassword: {password if not user.is_superuser else '[Your existing password]'}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
         
         import threading
         threading.Thread(target=send_mail_sync, args=(subject, message, [email])).start()
@@ -78,8 +78,8 @@ def provision_organization_admin(org):
         except Exception as e:
             print(f"Failed to create employee profile: {e}")
             
-        subject = f"Welcome to VibeCopilot - Admin Credentials"
-        message = f"Hello Admin,\n\nAn account has been created for you as the Admin for {org.name}.\n\nWebsite URL: http://localhost:5173\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
+        subject = f"Welcome to VibeCopilot HRMS - Admin Credentials"
+        message = f"Hello Admin,\n\nAn account has been created for you as the Admin for {org.name}.\n\nWebsite URL: https://hrms.vibesandbox.live\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
         
         import threading
         threading.Thread(target=send_mail_sync, args=(subject, message, [email])).start()

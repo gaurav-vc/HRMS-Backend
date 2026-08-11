@@ -138,7 +138,10 @@ def isolate_queryset(qs, user):
     # If the user is an org_admin, they shouldn't be restricted by admin_sites
     if employee and employee.role in ('admin', 'org_admin'):
         if hasattr(employee, 'organization') and employee.organization:
-            if hasattr(qs.model, 'organization'):
+            from django.db.models import Q
+            if hasattr(qs.model, 'employee'):
+                qs = qs.filter(employee__organization=employee.organization)
+            elif hasattr(qs.model, 'organization'):
                 org_field = qs.model._meta.get_field('organization')
                 if org_field.is_relation and org_field.related_model.__name__ == 'Entity':
                     qs = qs.filter(organization__organization=employee.organization)
@@ -150,8 +153,6 @@ def isolate_queryset(qs, user):
                 qs = qs.filter(entity__organization=employee.organization)
             elif hasattr(qs.model, 'department'):
                 qs = qs.filter(department__entity__organization=employee.organization)
-            elif hasattr(qs.model, 'employee'):
-                qs = qs.filter(employee__organization=employee.organization)
             elif hasattr(qs.model, 'structure'):
                 qs = qs.filter(structure__site__organization=employee.organization)
             elif qs.model.__name__ == 'SalaryStructure':
@@ -218,7 +219,12 @@ def isolate_queryset(qs, user):
     # ── MULTI-TENANT BOUNDARY: apply organisation scope first ────────────────
     # Every query from this point is bounded by employee.organization.
     if hasattr(employee, 'organization') and employee.organization:
-        if hasattr(qs.model, 'organization'):
+        from django.db.models import Q
+        # If the model has an employee field, it's safest to scope by employee's organization
+        # to prevent missing records if intermediate entities lack an organization link.
+        if hasattr(qs.model, 'employee'):
+            qs = qs.filter(employee__organization=employee.organization)
+        elif hasattr(qs.model, 'organization'):
             org_field = qs.model._meta.get_field('organization')
             if org_field.is_relation and org_field.related_model.__name__ == 'Entity':
                 qs = qs.filter(organization__organization=employee.organization)
@@ -230,8 +236,6 @@ def isolate_queryset(qs, user):
             qs = qs.filter(entity__organization=employee.organization)
         elif hasattr(qs.model, 'department'):
             qs = qs.filter(department__entity__organization=employee.organization)
-        elif hasattr(qs.model, 'employee'):
-            qs = qs.filter(employee__organization=employee.organization)
         elif hasattr(qs.model, 'structure'):
             qs = qs.filter(structure__site__organization=employee.organization)
         elif qs.model.__name__ == 'SalaryStructure':
