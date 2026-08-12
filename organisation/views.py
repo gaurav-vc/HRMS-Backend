@@ -65,6 +65,7 @@ def provision_contact_person(site, origin=None):
     email = site.contact_email
     user = User.objects.filter(email=email).first() or User.objects.filter(username=email).first()
     
+    password = None
     if user:
         if not user.is_superuser:
             password = generate_random_password()
@@ -72,16 +73,6 @@ def provision_contact_person(site, origin=None):
             user.save()
         else:
             password = "[Your existing password]"
-        login_url = f"{origin}/" if origin else "https://hrms.vibesandbox.live/"
-        subject = f"You have been assigned to Site: {site.name}"
-        message = f"Hello {site.contact_name or 'User'},\n\nYou have been assigned as the Site Admin for {site.name}.\n\nWebsite URL: {login_url}\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
-        import threading
-        def send_async():
-            try:
-                send_mail(subject, message, getattr(settings, 'EMAIL_HOST_USER', 'noreply@vibecopilot.ai'), [email], fail_silently=False)
-            except Exception as e:
-                print(f"SITE EMAIL FAILED. Google SMTP Error: {str(e)}")
-        threading.Thread(target=send_async).start()
     else:
         password = generate_random_password()
         user = User.objects.create_user(
@@ -90,48 +81,76 @@ def provision_contact_person(site, origin=None):
             password=password,
             first_name=site.contact_name or ''
         )
-        try:
-            from employees.models import Employee
-            from organisation.models import Role
-            default_perms = {
-                'Entities': {'view': True, 'create': True, 'update': True, 'delete': True},
-                'Branches': {'view': True, 'create': True, 'update': True, 'delete': True},
-                'Sites': {'view': True, 'create': True, 'update': True, 'delete': True},
-                'Departments': {'view': True, 'create': True, 'update': True, 'delete': True},
-                'Designations': {'view': True, 'create': True, 'update': True, 'delete': True},
-                'Roles & Users': {'view': True, 'create': True, 'update': True, 'delete': True},
-                'Employees': {'view': True, 'create': True, 'update': True, 'delete': True},
-                'Attendance': {'view': True, 'create': True, 'update': True, 'delete': True},
-                'Leaves': {'view': True, 'create': True, 'update': True, 'delete': True},
-                'Payroll': {'view': True, 'create': True, 'update': True, 'delete': True},
-            }
-            role_obj, created = Role.objects.get_or_create(name='Site Admin', defaults={'code': 'SITE_ADMIN', 'permissions': default_perms})
-            if not created and not role_obj.permissions:
-                role_obj.permissions = default_perms
-                role_obj.save(update_fields=['permissions'])
-            Employee.objects.create(
+
+    try:
+        from employees.models import Employee
+        from organisation.models import Role
+        default_perms = {
+            'Entities': {'view': True, 'create': True, 'update': True, 'delete': True},
+            'Branches': {'view': True, 'create': True, 'update': True, 'delete': True},
+            'Sites': {'view': True, 'create': True, 'update': True, 'delete': True},
+            'Departments': {'view': True, 'create': True, 'update': True, 'delete': True},
+            'Designations': {'view': True, 'create': True, 'update': True, 'delete': True},
+            'Roles & Users': {'view': True, 'create': True, 'update': True, 'delete': True},
+            'Employees': {'view': True, 'create': True, 'update': True, 'delete': True},
+            'Attendance': {'view': True, 'create': True, 'update': True, 'delete': True},
+            'Leaves': {'view': True, 'create': True, 'update': True, 'delete': True},
+            'Payroll': {'view': True, 'create': True, 'update': True, 'delete': True},
+        }
+        role_obj, created = Role.objects.get_or_create(name='Site Admin', defaults={'code': 'SITE_ADMIN', 'permissions': default_perms})
+        if not created and not role_obj.permissions:
+            role_obj.permissions = default_perms
+            role_obj.save(update_fields=['permissions'])
+
+        emp = getattr(user, 'employee_profile', None)
+        
+        branch = site.branch if hasattr(site, 'branch') else None
+        entity = branch.entity if branch else None
+        
+        if not emp:
+            name_parts = (site.contact_name or email.split('@')[0]).split(' ', 1)
+            f_name = name_parts[0]
+            l_name = name_parts[1] if len(name_parts) > 1 else ''
+            
+            emp = Employee.objects.create(
                 user=user,
-                first_name=site.contact_name or email.split('@')[0],
+                first_name=f_name,
+                last_name=l_name,
                 email=email,
                 code=f"EMP-{user.id:04d}",
                 role='site_admin',
                 dynamic_role=role_obj,
                 site=site,
+                branch=branch,
+                entity=entity,
+                organization=site.organization if hasattr(site, 'organization') else None,
                 status='Active'
             )
-        except Exception as e:
-            print(f"Failed to create employee profile: {e}")
+        else:
+            if not emp.site:
+                emp.site = site
+            if emp.role == 'employee':
+                emp.role = 'site_admin'
+                emp.dynamic_role = role_obj
+            emp.save()
             
-        subject = f"Welcome to VibeCopilot - Site Admin Credentials"
-        message = f"Hello {site.contact_name or 'User'},\n\nAn account has been created for you as the Site Admin for {site.name}.\n\nWebsite URL: https://hrms.vibesandbox.live\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
-        
-        import threading
-        def send_async_new():
-            try:
-                send_mail(subject, message, getattr(settings, 'EMAIL_HOST_USER', 'noreply@vibecopilot.ai'), [email], fail_silently=False)
-            except Exception as e:
-                print(f"SITE EMAIL FAILED. Google SMTP Error: {str(e)}")
-        threading.Thread(target=send_async_new).start()
+        if site not in emp.enrolled_sites.all():
+            emp.enrolled_sites.add(site)
+            
+    except Exception as e:
+        print(f"Failed to create/update employee profile: {e}")
+
+    login_url = f"{origin}/" if origin else "https://hrms.vibesandbox.live/"
+    subject = f"You have been assigned to Site: {site.name}"
+    message = f"Hello {site.contact_name or 'User'},\n\nYou have been assigned as the Site Admin for {site.name}.\n\nWebsite URL: {login_url}\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
+    
+    import threading
+    def send_async():
+        try:
+            send_mail(subject, message, getattr(settings, 'EMAIL_HOST_USER', 'noreply@vibecopilot.ai'), [email], fail_silently=False)
+        except Exception as e:
+            print(f"SITE EMAIL FAILED. Google SMTP Error: {str(e)}")
+    threading.Thread(target=send_async).start()
 
 
 class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):

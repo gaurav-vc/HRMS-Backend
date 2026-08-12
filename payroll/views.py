@@ -109,31 +109,6 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = PayrollRun.objects.all().order_by('-period')
     serializer_class = PayrollRunSerializer
 
-    def get_queryset(self):
-        qs = super().get_queryset()
-        user = self.request.user
-        if not user or not user.is_authenticated:
-            return qs.none()
-            
-        # Give full access to superusers, staff, or any account named admin/ceo
-        uname = user.username.lower()
-        if user.is_superuser or user.is_staff or 'admin' in uname or 'ceo' in uname:
-            return PayrollRun.objects.all().order_by('-period')
-            
-        emp = getattr(user, 'employee_profile', None)
-        
-        if emp:
-            # Check role independently of dynamic_role
-            if emp.role in ['super_admin', 'org_admin']:
-                return PayrollRun.objects.all().order_by('-period')
-                
-            if emp.dynamic_role:
-                perms = emp.dynamic_role.permissions or {}
-                can_approve = perms.get('can_approve_payroll')
-                if can_approve in [True, 'true', 'True', 1, '1']:
-                    return PayrollRun.objects.all().order_by('-period')
-                
-        return qs
 
     def create(self, request, *args, **kwargs):
         period = request.data.get('period')
@@ -255,62 +230,18 @@ class SalarySlipAPIView(APIView):
         try:
             period = request.query_params.get('period')
             from .models import Payslip
-            if not period:
-                last_slip = Payslip.objects.order_by('-id').first()
+            user = request.user
+            from authentication.permissions import isolate_queryset
+            
+            # If period was missing, check if last_slip exists in isolated scope
+            if not request.query_params.get('period'):
+                last_slip = isolate_queryset(Payslip.objects.all(), user).order_by('-id').first()
                 if last_slip:
                     period = last_slip.period
                 else:
                     from django.utils import timezone
                     period = timezone.now().strftime('%Y-%m')
-            
-            user = request.user
-            emp_filter = {}
-            from django.db.models import Q
-            emp_q = Q()
-            can_view_confidential = False
-            
-            if user.is_superuser:
-                can_view_confidential = True
-            elif hasattr(user, 'employee_profile') and user.employee_profile:
-                emp = user.employee_profile
-                if emp.role == 'super_admin':
-                    can_view_confidential = True
-                elif emp.dynamic_role and emp.dynamic_role.permissions and emp.dynamic_role.permissions.get('can_view_confidential_payroll'):
-                    can_view_confidential = True
-            if not user.is_superuser:
-                emp = getattr(user, 'employee_profile', None)
-                if not emp:
-                    return Response({'period': period, 'slips': [], 'diagnostics': {'error': 'No employee profile linked to user'}})
-                
-                # Use dynamic_role if available
-                if emp.dynamic_role:
-                    has_org_access = False
-                    custom_allowed = []
                     
-                    if emp.dynamic_role.access_scope in ['Corporate', 'Region', 'Custom'] or emp.dynamic_role.cross_department_access:
-                        has_org_access = True
-                        if emp.dynamic_role.access_scope == 'Custom':
-                            custom_allowed = emp.dynamic_role.permissions.get('allowed_entities', [])
-                    
-                    if has_org_access:
-                        if emp.dynamic_role.access_scope == 'Corporate' or emp.dynamic_role.cross_department_access:
-                            pass # No filter, see all
-                        elif custom_allowed:
-                            emp_filter['employee__entity_id__in'] = custom_allowed
-                        else:
-                            emp_q = Q(employee__entity=emp.entity) | Q(employee__branch__entity=emp.entity) | Q(employee__site__branch__entity=emp.entity)
-                    else:
-                        emp_filter['employee'] = emp
-                else:
-                    # Legacy fallback
-                    if emp.role in ['super_admin']:
-                        pass
-                    elif emp.role in ['org_admin', 'hr', 'manager']:
-                        emp_q = Q(employee__entity=emp.entity) | Q(employee__branch__entity=emp.entity) | Q(employee__site__branch__entity=emp.entity)
-                    elif emp.role == 'site_admin':
-                        emp_q = Q(employee__site=emp.site) | Q(employee__enrolled_sites=emp.site)
-                    else:
-                        emp_filter['employee'] = emp
         except Exception as e:
             import traceback
             print("Payroll Query Error:", traceback.format_exc())
@@ -325,7 +256,7 @@ class SalarySlipAPIView(APIView):
             month_start = date(p_year, p_month, 1)
             month_end = date(p_year, p_month, total_days_in_month)
             calc_end = month_end
-            db_slips = Payslip.objects.filter(emp_q, period=period, **emp_filter).select_related('employee', 'employee__manager', 'employee__department').prefetch_related('lines', 'lines__rule')
+            db_slips = isolate_queryset(Payslip.objects.all(), user).filter(period=period).select_related('employee', 'employee__manager', 'employee__department').prefetch_related('lines', 'lines__rule')
             
             # Determine if we should dynamically calculate
             from payroll.models import PayrollRun
@@ -341,12 +272,12 @@ class SalarySlipAPIView(APIView):
 
             slips = []
             
-            # If no slips exist yet (but a run exists) we can preview for all employees
+            # If no slips exist yet (but a run exists) we can preview for all isolated employees
             if not db_slips and is_draft:
                 from django.db.models import Q
-                preview_emps = Employee.objects.filter(Q(entity=run.entity) | Q(branch__entity=run.entity) | Q(site__branch__entity=run.entity), status='Active')
-                if 'employee' in emp_filter:
-                    preview_emps = preview_emps.filter(id=emp_filter['employee'].id)
+                preview_emps = isolate_queryset(Employee.objects.filter(status='Active'), user).filter(
+                    Q(entity=run.entity) | Q(branch__entity=run.entity) | Q(site__branch__entity=run.entity)
+                )
                 db_slips = [Payslip(employee=e, run=run, period=period) for e in preview_emps]
 
             from attendance.models import DailyAttendance
@@ -524,19 +455,13 @@ from django.http import HttpResponse
 class PayslipPDFView(APIView):
     def get(self, request, pk=None):
         from .models import Payslip
+        from authentication.permissions import isolate_queryset
         try:
-            slip = Payslip.objects.select_related('employee', 'employee__department').prefetch_related('lines', 'lines__rule').get(pk=pk)
+            # isolate_queryset will filter Payslips the user is authorized to see
+            qs = isolate_queryset(Payslip.objects.all(), request.user)
+            slip = qs.select_related('employee', 'employee__department').prefetch_related('lines', 'lines__rule').get(pk=pk)
         except Payslip.DoesNotExist:
-            return Response({'error': 'Payslip not found'}, status=404)
-            
-        # Basic auth check:
-        user = request.user
-        if user.is_authenticated and not user.is_superuser:
-            emp = getattr(user, 'employee_profile', None)
-            if not emp:
-                pass # Allow for now since window.open doesn't send JWT
-            elif emp.role == 'employee' and slip.employee_id != emp.id:
-                return Response({'error': 'Unauthorized'}, status=403)
+            return Response({'error': 'Payslip not found or unauthorized'}, status=404)
                 
         response = HttpResponse(content_type='application/pdf')
         response['Content-Disposition'] = f'attachment; filename="payslip_{slip.period}_{slip.employee.code}.pdf"'
@@ -581,10 +506,12 @@ class PayslipPDFView(APIView):
 class PayslipEmailView(APIView):
     def post(self, request, pk=None):
         from .models import Payslip
+        from authentication.permissions import isolate_queryset
         try:
-            slip = Payslip.objects.select_related('employee', 'employee__department').prefetch_related('lines', 'lines__rule').get(pk=pk)
+            qs = isolate_queryset(Payslip.objects.all(), request.user)
+            slip = qs.select_related('employee', 'employee__department').prefetch_related('lines', 'lines__rule').get(pk=pk)
         except Payslip.DoesNotExist:
-            return Response({'error': 'Payslip not found'}, status=404)
+            return Response({'error': 'Payslip not found or unauthorized'}, status=404)
             
         try:
             import io
@@ -706,8 +633,11 @@ class PayrollPreviewAPIView(APIView):
                 run = PayrollRun(period=period, entity=entity, status='Draft')
                 precomputed_data = PayrollService._precompute_payroll_data(run)
                 
+                from authentication.permissions import isolate_queryset
                 from django.db.models import Q
-                employees = Employee.objects.filter(Q(entity=entity) | Q(branch__entity=entity) | Q(site__branch__entity=entity), status='Active').select_related('salary_structure').prefetch_related('salary_structure__components')
+                employees = isolate_queryset(Employee.objects.filter(status='Active'), request.user).filter(
+                    Q(entity=entity) | Q(branch__entity=entity) | Q(site__branch__entity=entity)
+                ).select_related('salary_structure').prefetch_related('salary_structure__components')
                 
                 emp_count = 0
                 total_gross = Decimal('0.00')
