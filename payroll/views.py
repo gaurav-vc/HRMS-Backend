@@ -233,6 +233,18 @@ class SalarySlipAPIView(APIView):
             user = request.user
             from authentication.permissions import isolate_queryset
             
+            can_view_confidential = False
+            if user.is_superuser:
+                can_view_confidential = True
+            elif hasattr(user, 'employee_profile') and user.employee_profile:
+                emp_profile = user.employee_profile
+                if getattr(emp_profile, 'is_hr', False) or getattr(emp_profile, 'is_admin', False) or getattr(emp_profile, 'is_superadmin', False):
+                    can_view_confidential = True
+                elif getattr(emp_profile, 'dynamic_role', None):
+                    perms = emp_profile.dynamic_role.permissions or {}
+                    if perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1']:
+                        can_view_confidential = True
+            
             # If period was missing, check if last_slip exists in isolated scope
             if not request.query_params.get('period'):
                 last_slip = isolate_queryset(Payslip.objects.all(), user).order_by('-id').first()
