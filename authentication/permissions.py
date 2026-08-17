@@ -124,13 +124,11 @@ def isolate_queryset(qs, user):
     if not user.is_authenticated:
         return qs.none()
 
-    # ── PLATFORM SUPER ADMIN ─────────────────────────────────────────────────
     if user.is_superuser:
         return qs
 
     employee = getattr(user, 'employee_profile', None)
 
-    # ── ROLE-BASED SUPER ADMIN ───────────────────────────────────────────────
     if employee and employee.role == 'super_admin':
         return qs
 
@@ -211,10 +209,6 @@ def isolate_queryset(qs, user):
 
     role = employee.role
     dynamic_role = getattr(employee, 'dynamic_role', None)
-
-    # ── ROLE-BASED SUPER ADMIN ───────────────────────────────────────────────
-    if role == 'super_admin':
-        return qs
 
     # ── MULTI-TENANT BOUNDARY: apply organisation scope first ────────────────
     # Every query from this point is bounded by employee.organization.
@@ -494,19 +488,12 @@ class DynamicCRUDPermission(permissions.BasePermission):
         # 1. Bypass if unauthenticated
         if not request.user or not request.user.is_authenticated:
             return False
-            
-        # 2. Super admins bypass all
+        # Bypass for superadmins
         if request.user.is_superuser:
             return True
-            
         employee = getattr(request.user, 'employee_profile', None)
-        if employee and employee.role in ['super_admin', 'site_admin']:
+        if employee and employee.role == 'super_admin':
             return True
-            
-        from organisation.models import Site
-        if Site.objects.filter(contact_email=request.user.email).exists():
-            return True
-            
         # 3. If view doesn't define rbac_module, don't enforce dynamic CRUD here (let other permissions handle it)
         rbac_module = getattr(view, 'rbac_module', None)
         if not rbac_module:
@@ -517,26 +504,6 @@ class DynamicCRUDPermission(permissions.BasePermission):
         module_perms = {}
         if employee and employee.dynamic_role and employee.dynamic_role.permissions:
             module_perms = employee.dynamic_role.permissions.get(rbac_module, {})
-            
-        # 5. If user is a Site Admin, merge permissions from their assigned site modules
-        from organisation.models import Site
-        sites = Site.objects.filter(contact_email=request.user.email)
-        if sites.exists():
-            for site in sites:
-                if site.modules:
-                    for module in site.modules:
-                        if isinstance(module, dict):
-                            if module.get('name') == rbac_module:
-                                module_perms = {
-                                    'view': module.get('view', True),
-                                    'create': module.get('create', True),
-                                    'update': module.get('update', True),
-                                    'delete': module.get('delete', True),
-                                }
-                                break
-                        elif module == rbac_module:
-                            module_perms = {'view': True, 'create': True, 'update': True, 'delete': True}
-                            break
                             
         # If no permissions found, deny
         if not module_perms:
@@ -565,16 +532,10 @@ class DynamicCRUDPermission(permissions.BasePermission):
         return False
 
     def has_object_permission(self, request, view, obj):
-        # 1. Super admins bypass all
         if request.user.is_superuser:
             return True
-            
         employee = getattr(request.user, 'employee_profile', None)
-        if employee and employee.role in ['super_admin', 'site_admin']:
-            return True
-            
-        from organisation.models import Site
-        if Site.objects.filter(contact_email=request.user.email).exists():
+        if employee and employee.role == 'super_admin':
             return True
 
         # Check if they are updating a reportee's object

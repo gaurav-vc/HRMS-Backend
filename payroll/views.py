@@ -127,13 +127,21 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def execute(self, request, pk=None):
         try:
+            run = self.get_object()
             overrides = request.data.get('overrides')
             include_variable_bonus = request.data.get('include_variable_bonus', False)
-            run = PayrollService.execute_run(pk, overrides=overrides, include_variable_bonus=include_variable_bonus)
-            run.maker = request.user
-            run.save()
-            # execute_run delegates to a background thread and returns 'Processing'
-            return Response({'status': 'success', 'run_status': run.status})
+            
+            if run.status in ['Frozen', 'Disbursed']:
+                if overrides:
+                    PayrollService.file_arrears(run.id, overrides)
+                return Response({'status': 'success', 'run_status': run.status, 'msg': 'Arrears processed'})
+                
+            run = PayrollService.execute_run(run.id, overrides=overrides, include_variable_bonus=include_variable_bonus)
+            if hasattr(request, 'user') and request.user.is_authenticated:
+                run.maker = request.user
+                run.save()
+            
+            return Response({'status': 'success', 'run_status': run.status, 'msg': 'Engine started in background'})
         except Exception as e:
             import traceback
             tb = traceback.format_exc()
@@ -151,7 +159,7 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         
         # Mark approved reimbursements as Paid for employees who got a payslip in this run
         from .models import Reimbursement
-        paid_employees = run.payslips.values_list('employee_id', flat=True)
+        paid_employees = run.payslip_set.values_list('employee_id', flat=True)
         Reimbursement.objects.filter(employee_id__in=paid_employees, status='Approved').update(status='Paid')
         
         comment_text = request.data.get('comment', 'Approved')
@@ -417,11 +425,12 @@ class SalarySlipAPIView(APIView):
                     'basic': 0 if hide_money else components.get('basic', 0),
                     'hra': 0 if hide_money else components.get('hra', 0),
                     'special': 0 if hide_money else components.get('special', 0),
-                    'pf': 0 if hide_money else components.get('pf', 0),
-                    'pt': 0 if hide_money else components.get('pt', 0),
-                    'tds': 0 if hide_money else components.get('tds', 0),
+                    'pf': 0 if hide_money else components.get('pf', components.get('Provident Fund', 0)),
+                    'pt': 0 if hide_money else components.get('pt', components.get('Professional Tax', 0)),
+                    'tds': 0 if hide_money else components.get('tds', components.get('Income Tax', 0)),
                     'ded': 0 if hide_money else slip_ded,
                     'net': 0 if hide_money else slip_net,
+                    'arrears': 0 if hide_money else components.get('Retroactive Arrears', 0),
                     'bankName': emp.bank_name,
                     'bankAccount': emp.bank_account,
                     'pan': emp.pan,
@@ -605,12 +614,13 @@ class PayrollPreviewAPIView(APIView):
                     can_view_confidential = True
                 else:
                     emp = getattr(user, 'employee_profile', None)
-                    if emp and emp.role == 'super_admin':
-                        can_view_confidential = True
-                    elif emp and emp.dynamic_role:
-                        perms = emp.dynamic_role.permissions or {}
-                        if perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1']:
+                    if emp:
+                        if getattr(emp, 'is_hr', False) or getattr(emp, 'is_admin', False) or getattr(emp, 'is_superadmin', False) or emp.role == 'super_admin':
                             can_view_confidential = True
+                        elif emp.dynamic_role:
+                            perms = emp.dynamic_role.permissions or {}
+                            if perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1'] or perms.get('can_view_confidential') in [True, 'true', 'True', 1, '1']:
+                                can_view_confidential = True
             
             from organisation.models import Entity
             from payroll.models import PayrollRun
@@ -632,12 +642,13 @@ class PayrollPreviewAPIView(APIView):
                     can_view_confidential = True
                 else:
                     emp = getattr(user, 'employee_profile', None)
-                    if emp and emp.role == 'super_admin':
-                        can_view_confidential = True
-                    elif emp and emp.dynamic_role:
-                        perms = emp.dynamic_role.permissions or {}
-                        if perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1']:
+                    if emp:
+                        if getattr(emp, 'is_hr', False) or getattr(emp, 'is_admin', False) or getattr(emp, 'is_superadmin', False) or emp.role == 'super_admin':
                             can_view_confidential = True
+                        elif emp.dynamic_role:
+                            perms = emp.dynamic_role.permissions or {}
+                            if perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1'] or perms.get('can_view_confidential') in [True, 'true', 'True', 1, '1']:
+                                can_view_confidential = True
             results = []
 
             for entity in entities:
@@ -681,12 +692,14 @@ class PayrollPreviewAPIView(APIView):
                         pt_amount = 0
                         reimbursement = 0
                         incentive = 0
+                        arrears = 0
                         
                         try:
                             pf_amount = sum(item['amount'] for item in line_items if getattr(item['rule'], 'name', None) and 'PF' in str(item['rule'].name).upper())
                             pt_amount = sum(item['amount'] for item in line_items if getattr(item['rule'], 'name', None) and ('PT' in str(item['rule'].name).upper() or 'PROFESSIONAL TAX' in str(item['rule'].name).upper()))
                             reimbursement = sum(item['amount'] for item in line_items if getattr(item['rule'], 'name', None) and 'REIMBURSEMENT' in str(item['rule'].name).upper())
                             incentive = sum(item['amount'] for item in line_items if getattr(item['rule'], 'name', None) and ('INCENTIVE' in str(item['rule'].name).upper() or 'BONUS' in str(item['rule'].name).upper()))
+                            arrears = sum(item['amount'] for item in line_items if getattr(item['rule'], 'name', None) and 'ARREAR' in str(item['rule'].name).upper())
                         except Exception as e:
                             print(f"Error summing items: {e}")
                         
@@ -733,6 +746,7 @@ class PayrollPreviewAPIView(APIView):
                             'latePenalties': sfloat(context.get('late_penalty_days', 0)),
                             'daysPaid': sfloat(context.get('paid_days', 0)),
                             'totalAmount': 0 if hide_money else sfloat(gross),
+                            'arrears': 0 if hide_money else sfloat(arrears),
                             'deduction': 0 if hide_money else sfloat(ded),
                             'pf': 0 if hide_money else sfloat(pf_amount),
                             'pt': 0 if hide_money else sfloat(pt_amount),

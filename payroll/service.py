@@ -117,7 +117,7 @@ class PayrollService:
         }
 
     @staticmethod
-    def _get_context_for_employee(employee, precomputed_data):
+    def _get_context_for_employee(employee, precomputed_data, emp_override=None):
         settings = PayrollSettings.objects.first() or PayrollSettings()
         
         total_days = precomputed_data.get('total_days', 30)
@@ -133,20 +133,40 @@ class PayrollService:
         paid_leave_days = precomputed_data.get('leave_map', {}).get(employee.id, 0)
         lop_days = precomputed_data.get('lop_map', {}).get(employee.id, 0)
         
-        # Late coming penalty: For every 3 days late, cut 0.5 days of salary
         late_penalty_days = (late_count // 3) * 0.5
         
-        # Dynamic Punch-Driven Model (Deduction Based)
-        # We start with the full month (total_days) and explicitly deduct infractions.
+        # Override attendance variables if provided (check both camel/snake case due to DRF middleware)
+        if emp_override:
+            if 'present_days' in emp_override: present_count = float(emp_override['present_days'])
+            elif 'presentDays' in emp_override: present_count = float(emp_override['presentDays'])
+            
+            if 'lop_days' in emp_override: lop_days = float(emp_override['lop_days'])
+            elif 'lopDays' in emp_override: lop_days = float(emp_override['lopDays'])
+            
+            if 'half_days' in emp_override: half_day_count = float(emp_override['half_days'])
+            elif 'halfDays' in emp_override: half_day_count = float(emp_override['halfDays'])
+            
+            if 'late_penalties' in emp_override: late_penalty_days = float(emp_override['late_penalties'])
+            elif 'latePenalties' in emp_override: late_penalty_days = float(emp_override['latePenalties'])
+            
+            if 'ot' in emp_override: overtime_hours = Decimal(str(emp_override['ot']))
+        
         worked_days = float(present_count) + (float(half_day_count) * 0.5)
         
-        if worked_days == 0 and paid_leave_days == 0 and absent_count > 0:
-            # If they didn't work at all and have no paid leaves, they get 0 (unless they are new joined with no punches yet)
+        if worked_days == 0 and paid_leave_days == 0 and absent_count > 0 and not emp_override:
             calculated_paid_days = 0.0
         else:
             calculated_paid_days = float(total_days) - float(absent_count) - (float(half_day_count) * 0.5) - float(lop_days) - float(late_penalty_days)
             
-        present_days = max(0.0, min(calculated_paid_days, float(total_days)))
+        # DRF camelCase middleware converts incoming presentDays to present_days
+        if emp_override and 'present_days' in emp_override:
+            present_days = float(emp_override['present_days'])
+        elif emp_override and 'presentDays' in emp_override:
+            present_days = float(emp_override['presentDays'])
+        elif emp_override and 'daysPaid' in emp_override:
+            present_days = float(emp_override['daysPaid'])
+        else:
+            present_days = max(0.0, min(calculated_paid_days, float(total_days)))
         
         reimbursement_amount = precomputed_data.get('reimb_map', {}).get(employee.id, Decimal('0.00'))
         if not reimbursement_amount:
@@ -173,9 +193,9 @@ class PayrollService:
         }
 
     @staticmethod
-    def process_employee_in_memory(employee, run, precomputed_data, is_simulation=False, include_variable_bonus=False):
+    def process_employee_in_memory(employee, run, precomputed_data, is_simulation=False, include_variable_bonus=False, emp_override=None):
         rules_dag = getattr(employee, '_cached_dag', [])
-        context = PayrollService._get_context_for_employee(employee, precomputed_data)
+        context = PayrollService._get_context_for_employee(employee, precomputed_data, emp_override=emp_override)
         
         total_gross = Decimal('0.00')
         total_deductions = Decimal('0.00')
@@ -238,15 +258,26 @@ class PayrollService:
         from payroll.models import RetroPayrollEntry, ComponentRule
         
         total_arrears = Decimal('0.00')
-        if run and run.pk:
-            retros = RetroPayrollEntry.objects.filter(
-                original_payslip__employee=employee,
-                target_run=run,
-                approved_for_merge=True
-            )
+        
+        if emp_override and 'arrears' in emp_override:
+            total_arrears = Decimal(str(emp_override['arrears'] or 0))
+        elif run:
+            if run.pk:
+                retros = RetroPayrollEntry.objects.filter(
+                    original_payslip__employee=employee,
+                    target_run=run,
+                    approved_for_merge=True
+                )
+            else:
+                retros = RetroPayrollEntry.objects.filter(
+                    original_payslip__employee=employee,
+                    target_run__period=run.period,
+                    target_run__entity=run.entity,
+                    approved_for_merge=True
+                )
             total_arrears = sum(r.diff_amount for r in retros)
         
-        if total_arrears > 0:
+        if total_arrears != 0:
             total_gross += total_arrears
             
             # Create a virtual ComponentRule reference for the LineItem
@@ -380,27 +411,31 @@ class PayrollService:
                         if not getattr(emp, '_cached_dag', []):
                             raise ValueError(f"Assigned structure '{emp.salary_structure.name}' has no components.")
                             
-                        gross, ded, net, line_items = PayrollService.process_employee_in_memory(
-                            emp, run, precomputed_data, is_simulation, include_variable_bonus
-                        )
-                        
+                        emp_override = None
                         if overrides:
                             emp_override = next((o for o in overrides if o.get('id') == emp.id), None)
-                            if emp_override:
-                                from decimal import Decimal
-                                gross = Decimal(str(emp_override.get('totalAmount', gross)))
-                                ded = Decimal(str(emp_override.get('deduction', ded)))
-                                net = Decimal(str(emp_override.get('payableSalary', net)))
-                                for item in line_items:
-                                    rule_name = getattr(item['rule'], 'name', '').upper()
-                                    if 'PF' in rule_name:
-                                        item['amount'] = Decimal(str(emp_override.get('pf', item['amount'])))
-                                    elif 'PT' in rule_name or 'PROFESSIONAL TAX' in rule_name:
-                                        item['amount'] = Decimal(str(emp_override.get('pt', item['amount'])))
-                                    elif 'REIMBURSEMENT' in rule_name:
-                                        item['amount'] = Decimal(str(emp_override.get('reimbursement', item['amount'])))
-                                    elif 'INCENTIVE' in rule_name or 'BONUS' in rule_name:
-                                        item['amount'] = Decimal(str(emp_override.get('incentive', item['amount'])))
+                            
+                        gross, ded, net, line_items = PayrollService.process_employee_in_memory(
+                            emp, run, precomputed_data, is_simulation, include_variable_bonus, emp_override=emp_override
+                        )
+                        
+                        if emp_override:
+                            from decimal import Decimal
+                            # Allow hard overrides of financial amounts if they were edited directly
+                            # The engine already recalculated based on attendance, but if user explicitly edited gross/net, honor it
+                            if 'totalAmount' in emp_override: gross = Decimal(str(emp_override['totalAmount']))
+                            if 'deduction' in emp_override: ded = Decimal(str(emp_override['deduction']))
+                            if 'payableSalary' in emp_override: net = Decimal(str(emp_override['payableSalary']))
+                            for item in line_items:
+                                rule_name = getattr(item['rule'], 'name', '').upper()
+                                if 'PF' in rule_name and 'pf' in emp_override:
+                                    item['amount'] = Decimal(str(emp_override['pf']))
+                                elif ('PT' in rule_name or 'PROFESSIONAL TAX' in rule_name) and 'pt' in emp_override:
+                                    item['amount'] = Decimal(str(emp_override['pt']))
+                                elif 'REIMBURSEMENT' in rule_name and 'reimbursement' in emp_override:
+                                    item['amount'] = Decimal(str(emp_override['reimbursement']))
+                                elif ('INCENTIVE' in rule_name or 'BONUS' in rule_name) and 'incentive' in emp_override:
+                                    item['amount'] = Decimal(str(emp_override['incentive']))
                         
                         if is_simulation:
                             slip = SimulatedPayslip(employee=emp, run=run, period=run.period, gross=gross, deductions=ded, net=net)
@@ -477,3 +512,85 @@ class PayrollService:
         PayrollService._run_async_worker(run_id, is_simulation, overrides=overrides, include_variable_bonus=include_variable_bonus)
         run.refresh_from_db()
         return run
+
+    @staticmethod
+    def file_arrears(run_id, overrides):
+        run = PayrollRun.objects.get(id=run_id)
+        if not overrides:
+            return
+            
+        precomputed_data = PayrollService._precompute_payroll_data(run)
+        
+        # Find next active run
+        from datetime import datetime
+        import calendar
+        
+        next_run = PayrollRun.objects.filter(entity=run.entity, status__in=['Draft', 'Processing', 'Maker-Submitted']).order_by('-period').first()
+        if not next_run:
+            # Create a draft run for next month
+            y, m = map(int, run.period.split('-'))
+            m += 1
+            if m > 12:
+                m = 1
+                y += 1
+            next_period = f"{y}-{m:02d}"
+            next_run, _ = PayrollRun.objects.get_or_create(
+                period=next_period,
+                entity=run.entity,
+                run_type='Live',
+                defaults={'status': 'Draft'}
+            )
+            
+        from payroll.models import RetroPayrollEntry
+        
+        logs = []
+        logs.append(f"DEBUG file_arrears: started for run_id={run_id} overrides count: {len(overrides)}")
+        for override in overrides:
+            emp_id = override.get('id')
+            if not emp_id: continue
+            logs.append(f"DEBUG file_arrears: processing emp_id={emp_id}, override_presentDays={override.get('presentDays')}")
+            try:
+                emp = Employee.objects.get(id=emp_id)
+                original_slip = Payslip.objects.filter(employee=emp, run=run).first()
+                if not original_slip:
+                    logs.append(f"DEBUG file_arrears: No original_slip found for emp_id={emp_id} run={run.id}!")
+                    continue
+                
+                logs.append(f"DEBUG file_arrears: Found original_slip net={original_slip.net}")
+                
+                # Pre-cache DAG
+                struct = emp.salary_structure
+                if struct:
+                    emp._cached_dag = build_dag_and_sort(list(struct.components.all()))
+                else:
+                    emp._cached_dag = []
+                    
+                gross, ded, net, line_items = PayrollService.process_employee_in_memory(
+                    emp, run, precomputed_data, is_simulation=True, emp_override=override
+                )
+                
+                context = PayrollService._get_context_for_employee(emp, precomputed_data, emp_override=override)
+                logs.append(f"DEBUG file_arrears: context present_days={context.get('present_days')}, total_days={context.get('total_days')}")
+                
+                diff_amount = net - original_slip.net
+                logs.append(f"DEBUG file_arrears: Calculated new net={net}, diff_amount={diff_amount}")
+                
+                if diff_amount != 0:
+                    RetroPayrollEntry.objects.update_or_create(
+                        original_payslip=original_slip,
+                        target_run=next_run,
+                        defaults={
+                            'diff_amount': diff_amount,
+                            'approved_for_merge': True
+                        }
+                    )
+                    logs.append(f"DEBUG file_arrears: Created RetroPayrollEntry for diff={diff_amount}")
+                else:
+                    logs.append(f"DEBUG file_arrears: Diff is 0, no entry created.")
+            except Exception as e:
+                import traceback
+                logs.append(f"DEBUG file_arrears: Failed to process arrears for {emp_id}: {e}")
+                traceback.print_exc()
+                pass
+                
+        return logs

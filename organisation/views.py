@@ -96,11 +96,22 @@ def provision_contact_person(site, origin=None):
             'Attendance': {'view': True, 'create': True, 'update': True, 'delete': True},
             'Leaves': {'view': True, 'create': True, 'update': True, 'delete': True},
             'Payroll': {'view': True, 'create': True, 'update': True, 'delete': True},
+            'Organization Tree': {'view': True, 'create': True, 'update': True, 'delete': True},
+            'Reports': {'view': True, 'create': True, 'update': True, 'delete': True},
+            'Settings': {'view': True, 'create': True, 'update': True, 'delete': True},
         }
         role_obj, created = Role.objects.get_or_create(name='Site Admin', defaults={'code': 'SITE_ADMIN', 'permissions': default_perms})
-        if not created and not role_obj.permissions:
-            role_obj.permissions = default_perms
-            role_obj.save(update_fields=['permissions'])
+        if not created:
+            # Always ensure Site Admin has the latest full permissions
+            changed = False
+            if not role_obj.permissions:
+                role_obj.permissions = {}
+            for k, v in default_perms.items():
+                if k not in role_obj.permissions:
+                    role_obj.permissions[k] = v
+                    changed = True
+            if changed:
+                role_obj.save(update_fields=['permissions'])
 
         emp = getattr(user, 'employee_profile', None)
         

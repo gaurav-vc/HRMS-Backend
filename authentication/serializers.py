@@ -79,24 +79,6 @@ class UserProfileSerializer(serializers.ModelSerializer):
             permissions.update(obj.employee_profile.dynamic_role.permissions or {})
             permissions['can_approve'] = obj.employee_profile.dynamic_role.can_approve
             
-        from organisation.models import Site
-        sites = Site.objects.filter(contact_email=obj.email)
-        if sites.exists():
-            for site in sites:
-                if site.modules:
-                    for module in site.modules:
-                        if isinstance(module, dict):
-                            name = module.get('name')
-                            if name:
-                                permissions[name] = {
-                                    'view': module.get('view', True),
-                                    'create': module.get('create', True),
-                                    'update': module.get('update', True),
-                                    'delete': module.get('delete', True),
-                                }
-                        else:
-                            # Fallback for simple string arrays - grant full access
-                            permissions[module] = {'view': True, 'create': True, 'update': True, 'delete': True}
         return permissions
 
     def get_role_name(self, obj):
