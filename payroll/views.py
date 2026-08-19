@@ -39,11 +39,9 @@ class ComponentRuleViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-    def create(self, request, *args, **kwargs):
-        data = request.data.copy()
-        
-        # Automatically derive formula if not provided, but don't pop calc/value since they are real fields now
-        if 'calc' in data and 'formula' not in data:
+    def _derive_formula(self, data):
+        # Automatically derive formula if not provided or empty
+        if 'calc' in data and not data.get('formula'):
             calc = data.get('calc')[0] if isinstance(data.get('calc'), list) else data.get('calc')
             val = data.get('value')[0] if isinstance(data.get('value'), list) else data.get('value', 0)
             
@@ -55,6 +53,11 @@ class ComponentRuleViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 data['formula'] = f"monthly_ctc * ({val} / 100)"
             else:
                 data['formula'] = str(val)
+        return data
+
+    def create(self, request, *args, **kwargs):
+        data = request.data.copy()
+        data = self._derive_formula(data)
                 
         # Engine Phase 1: Set effective_from by default if not provided
         if 'effective_from' not in data:
@@ -65,6 +68,18 @@ class ComponentRuleViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         self.perform_create(serializer)
         return Response(serializer.data, status=201)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        data = request.data.copy()
+        
+        data = self._derive_formula(data)
+        
+        serializer = self.get_serializer(instance, data=data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return Response(serializer.data)
 
 class ComplianceReportViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Compliance'
