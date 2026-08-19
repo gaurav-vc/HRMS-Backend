@@ -64,6 +64,26 @@ class UserProfileView(APIView):
         serializer = UserProfileSerializer(request.user)
         return Response(serializer.data)
 
+    def patch(self, request):
+        user = request.user
+        name = request.data.get('name')
+        if name:
+            parts = name.split(' ', 1)
+            first_name = parts[0]
+            last_name = parts[1] if len(parts) > 1 else ''
+            
+            user.first_name = first_name
+            user.last_name = last_name
+            user.save(update_fields=['first_name', 'last_name'])
+            
+            if hasattr(user, 'employee_profile') and user.employee_profile:
+                user.employee_profile.first_name = first_name
+                user.employee_profile.last_name = last_name
+                user.employee_profile.save(update_fields=['first_name', 'last_name'])
+                
+        serializer = UserProfileSerializer(user)
+        return Response(serializer.data)
+
 class LogoutView(APIView):
     permission_classes = [IsAuthenticated]
     

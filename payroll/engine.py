@@ -97,6 +97,9 @@ def evaluate_component(rule, context):
     Returns a Decimal.
     """
     try:
+        if not getattr(rule, 'formula', None) or not str(rule.formula).strip():
+            return Decimal('0.00')
+
         # simpleeval allows safe mathematical evaluation natively supporting Decimal
         eval_context = {}
         for k, v in context.items():

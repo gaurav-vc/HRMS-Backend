@@ -15,6 +15,7 @@ class BranchSerializer(serializers.ModelSerializer):
 class SiteSerializer(serializers.ModelSerializer):
     organization_name = serializers.CharField(source='organization.name', read_only=True)
     users_count = serializers.SerializerMethodField()
+    entity = serializers.SerializerMethodField()
 
     class Meta:
         model = Site
@@ -22,6 +23,9 @@ class SiteSerializer(serializers.ModelSerializer):
 
     def get_users_count(self, obj):
         return obj.employees.count() if hasattr(obj, 'employees') else 0
+
+    def get_entity(self, obj):
+        return obj.branch.entity_id if obj.branch else None
 
 class DepartmentSerializer(serializers.ModelSerializer):
     class Meta:

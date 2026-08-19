@@ -100,7 +100,13 @@ def provision_contact_person(site, origin=None):
             'Reports': {'view': True, 'create': True, 'update': True, 'delete': True},
             'Settings': {'view': True, 'create': True, 'update': True, 'delete': True},
         }
-        role_obj, created = Role.objects.get_or_create(name='Site Admin', defaults={'code': 'SITE_ADMIN', 'permissions': default_perms})
+        role_obj = Role.objects.filter(name='Site Admin').first()
+        if not role_obj:
+            role_obj = Role.objects.create(name='Site Admin', code='SITE_ADMIN', permissions=default_perms)
+            created = True
+        else:
+            created = False
+            
         if not created:
             # Always ensure Site Admin has the latest full permissions
             changed = False
@@ -164,10 +170,13 @@ def provision_contact_person(site, origin=None):
     threading.Thread(target=send_async).start()
 
 
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+
 class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Sites'
     queryset = Site.objects.all()
     serializer_class = SiteSerializer
+    parser_classes = (MultiPartParser, FormParser, JSONParser)
     
 
     def get_permissions(self):

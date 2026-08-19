@@ -499,10 +499,18 @@ class DynamicCRUDPermission(permissions.BasePermission):
         if not rbac_module:
             return True
             
-        # 4. If no employee or no dynamic role, they can't access an rbac_module protected view
         # 4. Extract module permissions
         module_perms = {}
-        if employee and employee.dynamic_role and employee.dynamic_role.permissions:
+        from organisation.models import Site
+        site = Site.objects.filter(contact_email=request.user.email).first()
+        if site:
+            if site.modules:
+                for mod in site.modules:
+                    mod_name = mod if isinstance(mod, str) else mod.get('name', '')
+                    if mod_name == rbac_module:
+                        module_perms = {'view': True, 'create': True, 'update': True, 'delete': True}
+                        break
+        elif employee and employee.dynamic_role and employee.dynamic_role.permissions:
             module_perms = employee.dynamic_role.permissions.get(rbac_module, {})
                             
         # If no permissions found, deny
@@ -550,7 +558,16 @@ class DynamicCRUDPermission(permissions.BasePermission):
             return True
             
         module_perms = {}
-        if employee and employee.dynamic_role and employee.dynamic_role.permissions:
+        from organisation.models import Site
+        site = Site.objects.filter(contact_email=request.user.email).first()
+        if site:
+            if site.modules:
+                for mod in site.modules:
+                    mod_name = mod if isinstance(mod, str) else mod.get('name', '')
+                    if mod_name == rbac_module:
+                        module_perms = {'view': True, 'create': True, 'update': True, 'delete': True}
+                        break
+        elif employee and employee.dynamic_role and employee.dynamic_role.permissions:
             module_perms = employee.dynamic_role.permissions.get(rbac_module, {})
             
         if method in ['PUT', 'PATCH']:

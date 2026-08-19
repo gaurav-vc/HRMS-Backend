@@ -153,7 +153,7 @@ class PayrollService:
         
         worked_days = float(present_count) + (float(half_day_count) * 0.5)
         
-        if worked_days == 0 and paid_leave_days == 0 and absent_count > 0 and not emp_override:
+        if worked_days == 0 and paid_leave_days == 0 and not emp_override:
             calculated_paid_days = 0.0
         else:
             calculated_paid_days = float(total_days) - float(absent_count) - (float(half_day_count) * 0.5) - float(lop_days) - float(late_penalty_days)
@@ -525,15 +525,17 @@ class PayrollService:
         from datetime import datetime
         import calendar
         
-        next_run = PayrollRun.objects.filter(entity=run.entity, status__in=['Draft', 'Processing', 'Maker-Submitted']).order_by('-period').first()
+        # Calculate exact next period string
+        y, m = map(int, run.period.split('-'))
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+        next_period = f"{y}-{m:02d}"
+        
+        # Find or create the exact next run for this entity
+        next_run = PayrollRun.objects.filter(entity=run.entity, period=next_period).first()
         if not next_run:
-            # Create a draft run for next month
-            y, m = map(int, run.period.split('-'))
-            m += 1
-            if m > 12:
-                m = 1
-                y += 1
-            next_period = f"{y}-{m:02d}"
             next_run, _ = PayrollRun.objects.get_or_create(
                 period=next_period,
                 entity=run.entity,

@@ -79,6 +79,15 @@ class UserProfileSerializer(serializers.ModelSerializer):
             permissions.update(obj.employee_profile.dynamic_role.permissions or {})
             permissions['can_approve'] = obj.employee_profile.dynamic_role.can_approve
             
+        from organisation.models import Site
+        site = Site.objects.filter(contact_email=obj.email).first()
+        if site:
+            if site.modules:
+                for mod in site.modules:
+                    mod_name = mod if isinstance(mod, str) else mod.get('name', '')
+                    if mod_name:
+                        permissions[mod_name] = {'view': True, 'create': True, 'update': True, 'delete': True}
+            
         return permissions
 
     def get_role_name(self, obj):
