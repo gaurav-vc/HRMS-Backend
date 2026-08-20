@@ -565,6 +565,83 @@ class AttendanceViewSet(viewsets.ViewSet):
             "late_today": 0, # Placeholder
         })
 
+    @action(detail=False, methods=['get'])
+    def employee_report(self, request):
+        employee_id = request.query_params.get('employee_id')
+        year = request.query_params.get('year')
+        month = request.query_params.get('month')
+        
+        if not employee_id or not year or not month:
+            return Response({"error": "employee_id, year, and month are required"}, status=400)
+            
+        try:
+            year = int(year)
+            month = int(month)
+        except ValueError:
+            return Response({"error": "year and month must be integers"}, status=400)
+            
+        try:
+            employee = Employee.objects.get(id=employee_id)
+        except Employee.DoesNotExist:
+            return Response({"error": "Employee not found"}, status=404)
+            
+        from authentication.permissions import isolate_queryset
+        qs = isolate_queryset(DailyAttendance.objects.all(), request.user)
+        
+        records = qs.filter(
+            employee_id=employee_id,
+            attendance_date__year=year,
+            attendance_date__month=month
+        ).order_by('attendance_date')
+        
+        present_count = 0
+        absent_count = 0
+        half_day_count = 0
+        late_count = 0
+        total_ot_hours = 0.0
+        
+        serialized_records = []
+        
+        for record in records:
+            if record.attendance_status == 'Present':
+                present_count += 1
+            elif record.attendance_status == 'Absent':
+                absent_count += 1
+            elif record.attendance_status == 'Half Day':
+                half_day_count += 1
+            elif record.attendance_status == 'Late':
+                late_count += 1
+                present_count += 1
+                
+            total_ot_hours += float(record.overtime_hours)
+            
+            serialized_records.append({
+                "id": record.id,
+                "date": record.attendance_date.isoformat() if record.attendance_date else None,
+                "status": record.attendance_status,
+                "first_check_in": record.first_check_in.isoformat() if record.first_check_in else None,
+                "last_check_out": record.last_check_out.isoformat() if record.last_check_out else None,
+                "total_hours": float(record.total_work_hours or 0.0),
+                "ot_hours": float(record.overtime_hours or 0.0)
+            })
+            
+        summary = {
+            "present_days": present_count,
+            "absent_days": absent_count,
+            "half_days": half_day_count,
+            "late_marks": late_count,
+            "total_overtime_hours": round(total_ot_hours, 2),
+        }
+        
+        return Response({
+            "employee_name": f"{employee.first_name} {employee.last_name}",
+            "employee_code": employee.code,
+            "month": month,
+            "year": year,
+            "summary": summary,
+            "records": serialized_records
+        })
+
 from authentication.permissions import DataIsolationMixin
 from rest_framework.permissions import IsAuthenticated
 
