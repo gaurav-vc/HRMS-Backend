@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Happy Birthday</title>
+<!-- Fun fonts -->
+<link href="https://fonts.googleapis.com/css2?family=Caveat:wght@700&family=Fredoka+One&display=swap" rel="stylesheet">
+<style>
+  .card-container {
+    background-color: #fff0f5; /* Light pink */
+    max-width: 600px;
+    margin: 0 auto;
+    padding: 40px 20px;
+    border-radius: 15px;
+    box-shadow: 0 5px 20px rgba(0,0,0,0.05);
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+  }
+  .celebrate-text {
+    font-family: 'Caveat', cursive, Arial, sans-serif;
+    font-size: 28px;
+    color: #888888;
+    margin-bottom: -10px;
+  }
+  .its-your {
+    font-family: 'Fredoka One', 'Arial Black', sans-serif;
+    font-size: 32px;
+    margin-bottom: 5px;
+  }
+  .birthday-text {
+    font-family: 'Fredoka One', 'Arial Black', sans-serif;
+    font-size: 55px;
+    letter-spacing: 2px;
+    margin-bottom: 30px;
+  }
+  .c-orange { color: #FF9800; }
+  .c-blue { color: #00BCD4; }
+  .c-purple { color: #9C27B0; }
+  .c-red { color: #F44336; }
+  .c-green { color: #8BC34A; }
+  .decorations {
+    font-size: 24px;
+    line-height: 1;
+    margin-bottom: 20px;
+  }
+  .message {
+    font-family: Arial, sans-serif;
+    font-size: 18px;
+    color: #555555;
+    line-height: 1.5;
+    margin-top: 30px;
+    padding: 0 20px;
+  }
+  .emp-name {
+    font-family: 'Fredoka One', 'Arial Black', sans-serif;
+    font-size: 28px;
+    color: #333333;
+    margin-top: 25px;
+  }
+</style>
+</head>
+<body style="margin: 0; padding: 0; background-color: #ffeaf0; font-family: Arial, sans-serif;">
+
+<table width="100%" border="0" cellpadding="0" cellspacing="0" style="background-color: #ffeaf0; padding: 40px 0;">
+  <tr>
+    <td align="center">
+      
+      <div class="card-container">
+        
+        <!-- Entity Name -->
+        <div style="text-align: right; margin-bottom: 20px; font-weight: bold; color: #aaaaaa; text-transform: uppercase;">
+          {{ entity_name }}
+        </div>
+
+        <div class="decorations">
+          🎉 🎈 🎊 🎈 🎉
+        </div>
+
+        <div class="celebrate-text">Let's Celebrate!</div>
+        <div class="its-your">
+          <span class="c-orange">i</span><span class="c-red">t</span><span class="c-green">'</span><span class="c-blue">s</span>
+          &nbsp;
+          <span class="c-blue">Y</span><span class="c-purple">o</span><span class="c-orange">u</span><span class="c-red">r</span>
+        </div>
+        
+        <div class="birthday-text">
+          <span class="c-red">b</span><span class="c-blue">i</span><span class="c-green">r</span><span class="c-purple">t</span><span class="c-orange">h</span><span class="c-red">d</span><span class="c-blue">a</span><span class="c-green">y</span>
+        </div>
+        
+        <!-- Image Container -->
+        <table border="0" cellpadding="0" cellspacing="0" align="center" style="margin: 0 auto;">
+          <tr>
+            <td>
+              {% if photo_url %}
+              <div style="width: 220px; height: 220px; background-image: url('{{ photo_url }}'); background-size: cover; background-position: center; border-radius: 50%; box-shadow: 0 8px 16px rgba(0,0,0,0.1); border: 5px solid #ffffff;"></div>
+              {% else %}
+              <!-- Fallback candle image (Attached CID) -->
+              <div style="width: 220px; height: 220px; background-image: url('cid:fallback_cake'); background-size: cover; background-position: center; border-radius: 50%; box-shadow: 0 8px 16px rgba(0,0,0,0.1); border: 5px solid #ffffff;"></div>
+              {% endif %}
+            </td>
+          </tr>
+        </table>
+
+        <div class="emp-name">{{ employee_name }}</div>
+        
+        <div class="message">
+          Wishing you a fantastic birthday filled with joy, success, and wonderful moments!
+        </div>
+        
+        <div class="decorations" style="margin-top: 30px; margin-bottom: 0;">
+          🎂 🎁 🌟 🎁 🎂
+        </div>
+
+      </div>
+      
+    </td>
+  </tr>
+</table>
+
+</body>
+</html>

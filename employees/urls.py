@@ -1,6 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import EmployeeViewSet, EmployeeDocumentViewSet, EmployeeTransferViewSet, EmployeeExitViewSet, NotificationViewSet, OfferLetterViewSet, OfferTemplateViewSet, GlobalSearchAPIView
+from .views import EmployeeViewSet, EmployeeDocumentViewSet, EmployeeTransferViewSet, EmployeeExitViewSet, NotificationViewSet, OfferLetterViewSet, OfferTemplateViewSet, GlobalSearchAPIView, WorkspaceNotificationView
 from .dashboard_views import DashboardStatsAPIView
 
 router = DefaultRouter()
@@ -15,6 +15,6 @@ router.register(r'offer-templates', OfferTemplateViewSet, basename='offer-templa
 urlpatterns = [
     path('dashboard/stats/', DashboardStatsAPIView.as_view(), name='dashboard-stats'),
     path('search/', GlobalSearchAPIView.as_view(), name='global-search'),
-    path('workspace/notifications/', NotificationViewSet.as_view({'get': 'list'}), name='workspace-notifications'),
+    path('workspace/notifications/', WorkspaceNotificationView.as_view(), name='workspace-notifications'),
     path('', include(router.urls)),
 ]

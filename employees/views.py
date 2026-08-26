@@ -10,7 +10,8 @@ from django.conf import settings
 from .models import Employee
 from .serializers import EmployeeSerializer
 from authentication.permissions import DataIsolationMixin
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.views import APIView
 import json
 
 class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
@@ -526,6 +527,11 @@ class EmployeeExitViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             if emp.user:
                 emp.user.is_active = False
                 emp.user.save()
+
+class WorkspaceNotificationView(APIView):
+    permission_classes = [AllowAny]
+    def get(self, request):
+        return Response([])
 
 class NotificationViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]

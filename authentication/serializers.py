@@ -42,10 +42,11 @@ class UserProfileSerializer(serializers.ModelSerializer):
     dashboard_type = serializers.SerializerMethodField()
     site_name = serializers.SerializerMethodField()
     org_name = serializers.SerializerMethodField()
+    photo_url = serializers.SerializerMethodField()
     
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'role', 'employee_id', 'first_name', 'last_name', 'permissions', 'role_name', 'dashboard_type', 'site_name', 'org_name')
+        fields = ('id', 'username', 'email', 'role', 'employee_id', 'first_name', 'last_name', 'permissions', 'role_name', 'dashboard_type', 'site_name', 'org_name', 'photo_url')
 
     def get_employee_id(self, obj):
         return obj.employee_profile.code if hasattr(obj, 'employee_profile') and obj.employee_profile else None
@@ -123,4 +124,12 @@ class UserProfileSerializer(serializers.ModelSerializer):
         if hasattr(obj, 'employee_profile') and obj.employee_profile and hasattr(obj.employee_profile, 'site') and obj.employee_profile.site:
             if obj.employee_profile.site.organization:
                 return obj.employee_profile.site.organization.name
+        return None
+
+    def get_photo_url(self, obj):
+        if hasattr(obj, 'employee_profile') and obj.employee_profile and obj.employee_profile.photo:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.employee_profile.photo.url)
+            return obj.employee_profile.photo.url
         return None

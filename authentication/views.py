@@ -34,8 +34,11 @@ class CustomTokenObtainPairView(TokenObtainPairView):
             )
             raise e
 
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+
 class UserProfileView(APIView):
     permission_classes = [IsAuthenticated]
+    parser_classes = (MultiPartParser, FormParser, JSONParser)
     
     def get(self, request):
         # Auto-create employee profile for superadmin if missing
@@ -61,12 +64,13 @@ class UserProfileView(APIView):
             except Exception as e:
                 print(f"Failed to auto-create employee profile: {e}")
 
-        serializer = UserProfileSerializer(request.user)
+        serializer = UserProfileSerializer(request.user, context={'request': request})
         return Response(serializer.data)
 
     def patch(self, request):
         user = request.user
         name = request.data.get('name')
+        
         if name:
             parts = name.split(' ', 1)
             first_name = parts[0]
@@ -81,7 +85,13 @@ class UserProfileView(APIView):
                 user.employee_profile.last_name = last_name
                 user.employee_profile.save(update_fields=['first_name', 'last_name'])
                 
-        serializer = UserProfileSerializer(user)
+        # Handle photo upload
+        photo = request.FILES.get('photo')
+        if photo and hasattr(user, 'employee_profile') and user.employee_profile:
+            user.employee_profile.photo = photo
+            user.employee_profile.save(update_fields=['photo'])
+                
+        serializer = UserProfileSerializer(user, context={'request': request})
         return Response(serializer.data)
 
 class LogoutView(APIView):

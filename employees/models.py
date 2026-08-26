@@ -37,6 +37,7 @@ class Employee(models.Model):
     dob = models.DateField(blank=True, null=True)
     gender = models.CharField(max_length=20, default="Male")
     address = models.TextField(blank=True, null=True)
+    photo = models.ImageField(upload_to='employee_photos/', null=True, blank=True)
     
     # Employment Details
     doj = models.DateField(blank=True, null=True)

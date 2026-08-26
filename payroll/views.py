@@ -241,10 +241,13 @@ class LoanViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = Loan.objects.all()
     serializer_class = LoanSerializer
 
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+
 class ReimbursementViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Reimbursements'
     queryset = Reimbursement.objects.all()
     serializer_class = ReimbursementSerializer
+    parser_classes = (MultiPartParser, FormParser, JSONParser)
 
 class SalarySlipAPIView(APIView):
     permission_classes = [IsAuthenticated]
