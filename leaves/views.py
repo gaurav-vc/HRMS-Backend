@@ -117,10 +117,41 @@ class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         qs = LeaveBalance.objects.all()
-        from .models import LeavePolicyConfiguration
+        from .models import LeavePolicyConfiguration, LeaveType
         from datetime import date
         from decimal import Decimal
-        
+
+        user = self.request.user
+
+        # Auto-initialize balances for the current user if they don't exist
+        if hasattr(user, 'employee_profile') and user.employee_profile:
+            emp = user.employee_profile
+            year = date.today().year
+            if not LeaveBalance.objects.filter(employee=emp, year=year).exists():
+                leave_types = LeaveType.objects.all()
+                config = LeavePolicyConfiguration.get_settings()
+                for lt in leave_types:
+                    entitlement = lt.annual_entitlement
+                    if lt.code == 'AL' and emp.doj:
+                        years = (date.today() - emp.doj).days / 365.25
+                        if years >= config.tenured_years_threshold:
+                            entitlement = config.tenured_annual_leaves
+                        else:
+                            entitlement = config.standard_annual_leaves
+                    LeaveBalance.objects.create(
+                        employee=emp,
+                        leave_type=lt,
+                        year=year,
+                        allocated_days=entitlement,
+                        used_days=0,
+                        remaining_days=entitlement
+                    )
+
+        # Filter for non-admins so they only see their own balances
+        if not (user.is_superuser or getattr(user, 'role', '') in ['HR Admin', 'Site Admin']):
+            if hasattr(user, 'employee_profile'):
+                qs = qs.filter(employee=user.employee_profile)
+
         try:
             config = LeavePolicyConfiguration.get_settings()
             for balance in qs:
