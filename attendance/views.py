@@ -298,9 +298,33 @@ class AttendanceViewSet(viewsets.ViewSet):
                     return Response({"error": "challenge_id required for Active Liveness validation"}, status=400)
 
                 if not HAVE_FACE_REC:
-                    # TEMPORARY OVERRIDE: User requested to bypass the ML check
-                    verification_status = 'VERIFIED'
-                    # Fallback to provided employee ID just for testing the bypass
+                    # TEMPORARY OVERRIDE: ML Bypass with Strict Pixel Comparison
+                    image_bytes = file_obj.read()
+                    import cv2
+                    import numpy as np
+                    import os
+                    np_img = np.frombuffer(image_bytes, np.uint8)
+                    img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+                    
+                    if img is None:
+                        return Response({"error": "Invalid image format uploaded."}, status=400)
+                        
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+                    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+                    
+                    if len(faces) == 0:
+                        return Response({"error": "Security Alert: No face detected. Please ensure your face is clearly visible."}, status=400)
+                    
+                    # Sort to get the largest face in the frame
+                    faces = sorted(faces, key=lambda x: x[2]*x[3], reverse=True)
+                    x, y, w, h = faces[0]
+                    
+                    # Crop and normalize the face pixels
+                    face_crop = gray[y:y+h, x:x+w]
+                    face_crop = cv2.resize(face_crop, (150, 150))
+                        
+                    # Resolve Employee Identity First
                     emp_id = request.data.get('employee')
                     if emp_id:
                         employee = Employee.objects.get(id=emp_id)
@@ -308,6 +332,29 @@ class AttendanceViewSet(viewsets.ViewSet):
                         employee = request.user.employee_profile
                     else:
                         employee = Employee.objects.first()
+                        
+                    # Strict Pixel Matching Boundary
+                    from django.conf import settings
+                    # We store fallback references in the media directory
+                    fallback_dir = os.path.join(settings.MEDIA_ROOT, 'fallback_faces') if hasattr(settings, 'MEDIA_ROOT') and settings.MEDIA_ROOT else os.path.join(os.path.dirname(os.path.dirname(__file__)), 'media', 'fallback_faces')
+                    os.makedirs(fallback_dir, exist_ok=True)
+                    ref_path = os.path.join(fallback_dir, f"{employee.id}_ref.png")
+                    
+                    if os.path.exists(ref_path):
+                        ref_img = cv2.imread(ref_path, cv2.IMREAD_GRAYSCALE)
+                        if ref_img is not None:
+                            # Compare current pixel crop with the stored reference crop using normalized correlation
+                            res = cv2.matchTemplate(face_crop, ref_img, cv2.TM_CCOEFF_NORMED)
+                            similarity = res[0][0]
+                            
+                            # A completely different person typically yields < 0.35 similarity.
+                            if similarity < 0.45:
+                                return Response({"error": f"Security Alert: Identity verification failed. Your face pixels do not match the registered user's face. (Sim: {similarity:.2f})"}, status=400)
+                    else:
+                        # First time punch-in: Store the pixel reference!
+                        cv2.imwrite(ref_path, face_crop)
+                        
+                    verification_status = 'VERIFIED'
                 else:
                     image_bytes = file_obj.read()
                     
