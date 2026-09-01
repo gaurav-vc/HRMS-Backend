@@ -1,11 +1,11 @@
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.utils import timezone
-from .models import LoginAuditLog
+from .models import LoginAuditLog, PasswordResetOTP
 from .serializers import CustomTokenObtainPairSerializer, UserProfileSerializer
 
 from django.contrib.auth.models import User
@@ -114,6 +114,7 @@ class LogoutView(APIView):
             return Response(status=status.HTTP_400_BAD_REQUEST)
 
 class PasswordResetRequestView(APIView):
+    permission_classes = [AllowAny]
     def post(self, request):
         email = request.data.get('email')
         if not email:
@@ -121,15 +122,12 @@ class PasswordResetRequestView(APIView):
             
         user = User.objects.filter(email=email).first()
         if user:
-            token = default_token_generator.make_token(user)
-            uid = urlsafe_base64_encode(force_bytes(user.pk))
-            # Frontend URL
-            reset_link = f"https://hrms.vibesandbox.live/reset-password?uid={uid}&token={token}"
+            otp = PasswordResetOTP.generate_otp(user)
             
             try:
                 send_mail(
-                    "Password Reset Request",
-                    f"Please click the link below to reset your password:\n\n{reset_link}",
+                    "Password Reset OTP",
+                    f"Your OTP for password reset is: {otp}\n\nThis OTP is valid for 10 minutes.",
                     settings.DEFAULT_FROM_EMAIL,
                     [user.email],
                     fail_silently=True,
@@ -138,29 +136,61 @@ class PasswordResetRequestView(APIView):
                 pass
                 
         # Always return success to prevent email enumeration
-        return Response({"message": "If the email exists, a reset link has been sent."}, status=status.HTTP_200_OK)
+        return Response({"message": "If the email exists, an OTP has been sent."}, status=status.HTTP_200_OK)
+
+class PasswordResetVerifyOTPView(APIView):
+    permission_classes = [AllowAny]
+    def post(self, request):
+        email = request.data.get('email')
+        otp_code = request.data.get('otp')
+        
+        if not email or not otp_code:
+            return Response({"error": "Email and OTP are required"}, status=status.HTTP_400_BAD_REQUEST)
+            
+        user = User.objects.filter(email=email).first()
+        if not user:
+            return Response({"error": "Invalid OTP"}, status=status.HTTP_400_BAD_REQUEST)
+            
+        otp_obj = PasswordResetOTP.objects.filter(user=user, otp=otp_code).order_by('-created_at').first()
+        
+        if not otp_obj or not otp_obj.is_valid():
+            return Response({"error": "Invalid or expired OTP"}, status=status.HTTP_400_BAD_REQUEST)
+            
+        return Response({"message": "OTP verified successfully"}, status=status.HTTP_200_OK)
 
 class PasswordResetConfirmView(APIView):
+    permission_classes = [AllowAny]
     def post(self, request):
-        uidb64 = request.data.get('uid')
-        token = request.data.get('token')
+        email = request.data.get('email')
+        otp_code = request.data.get('otp')
         new_password = request.data.get('password')
         
-        if not uidb64 or not token or not new_password:
+        if not email or not otp_code or not new_password:
             return Response({"error": "Missing parameters"}, status=status.HTTP_400_BAD_REQUEST)
             
-        try:
-            uid = force_str(urlsafe_base64_decode(uidb64))
-            user = User.objects.get(pk=uid)
-        except (TypeError, ValueError, OverflowError, User.DoesNotExist):
-            user = None
+        user = User.objects.filter(email=email).first()
+        if not user:
+            return Response({"error": "Invalid OTP"}, status=status.HTTP_400_BAD_REQUEST)
             
-        if user and default_token_generator.check_token(user, token):
-            user.set_password(new_password)
-            user.save()
-            return Response({"message": "Password has been reset successfully."}, status=status.HTTP_200_OK)
+        otp_obj = PasswordResetOTP.objects.filter(user=user, otp=otp_code).order_by('-created_at').first()
+        
+        if not otp_obj or not otp_obj.is_valid():
+            return Response({"error": "Invalid or expired OTP"}, status=status.HTTP_400_BAD_REQUEST)
             
-        return Response({"error": "Invalid or expired token"}, status=status.HTTP_400_BAD_REQUEST)
+        user.set_password(new_password)
+        user.save()
+        
+        # Invalidate OTP after use
+        otp_obj.delete()
+        
+        # Generate tokens to auto-login
+        refresh = RefreshToken.for_user(user)
+        
+        return Response({
+            "message": "Password has been reset successfully.",
+            "access": str(refresh.access_token),
+            "refresh": str(refresh),
+        }, status=status.HTTP_200_OK)
 
 class ChangePasswordView(APIView):
     permission_classes = [IsAuthenticated]
