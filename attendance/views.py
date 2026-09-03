@@ -292,9 +292,11 @@ class AttendanceViewSet(viewsets.ViewSet):
                 if challenge_id:
                     # In a real setup, we'd pass video frames. Mocking with empty list for prototype.
                     liveness_passed, liveness_msg = ActiveLivenessService.validate_challenge(challenge_id, [])
-                    if not liveness_passed:
+                    if not liveness_passed and source != 'FACE':
                         return Response({"error": f"Liveness Check Failed: {liveness_msg}"}, status=400)
                 elif source == 'FACE':
+                    pass # Mobile app bypasses liveness challenge token check
+                else:
                     return Response({"error": "challenge_id required for Active Liveness validation"}, status=400)
 
                 if not HAVE_FACE_REC:
@@ -378,6 +380,7 @@ class AttendanceViewSet(viewsets.ViewSet):
                         
                     verification_status = 'VERIFIED'
                 else:
+                    emp_id = request.data.get('employee')
                     image_bytes = file_obj.read()
                     
                     # Wave 4: Passive Liveness & Deepfake Detection (Must occur before DeepFace)
@@ -386,19 +389,51 @@ class AttendanceViewSet(viewsets.ViewSet):
                     if not passed_passive:
                         return Response({"error": passive_msg}, status=400)
                         
-                    result = get_face_encoding(image_bytes)
-                    
-                    if not result.get('success'):
-                        return Response({"error": f"Liveness/Extraction Failed: {result.get('error')}"}, status=400)
+                    if emp_id and source == 'FACE':
+                        # 1:1 Verification for Mobile App
+                        employee = Employee.objects.filter(id=emp_id).first()
+                        if not employee or not employee.photo or not os.path.exists(employee.photo.path):
+                            return Response({"error": "No reference photo registered for this employee"}, status=400)
+                            
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_img:
+                            tmp_img.write(image_bytes)
+                            tmp_path = tmp_img.name
+                            
+                        try:
+                            from deepface import DeepFace
+                            result = DeepFace.verify(
+                                img1_path=tmp_path,
+                                img2_path=employee.photo.path,
+                                model_name="Facenet512",
+                                detector_backend="opencv",
+                                distance_metric="cosine",
+                                enforce_detection=True
+                            )
+                            os.remove(tmp_path)
+                            if not result.get("verified", False):
+                                return Response({"error": "Face does not match registered employee photo"}, status=400)
+                                
+                            identified_id = employee.id
+                        except ValueError:
+                            if os.path.exists(tmp_path): os.remove(tmp_path)
+                            return Response({"error": "No human face detected. Please retake photo clearly."}, status=400)
+                        except Exception as e:
+                            if os.path.exists(tmp_path): os.remove(tmp_path)
+                            return Response({"error": f"Verification error: {str(e)}"}, status=500)
+                    else:
+                        # 1:N Search across entire FAISS index
+                        result = get_face_encoding(image_bytes)
                         
-                    # 1:N Search across entire FAISS index
-                    identified_id = biometric_search.identify(result['encoding'])
-                    if not identified_id:
-                        return Response({"error": "Rejected: Face mismatch (No employee recognized)"}, status=400)
-                        
-                    emp_id = request.data.get('employee')
-                    if emp_id and str(emp_id) != str(identified_id):
-                        return Response({"error": "Rejected: Face mismatch. The recognized face does not match the selected employee ID."}, status=400)
+                        if not result.get('success'):
+                            return Response({"error": f"Liveness/Extraction Failed: {result.get('error')}"}, status=400)
+                            
+                        identified_id = biometric_search.identify(result['encoding'])
+                        if not identified_id:
+                            return Response({"error": "Rejected: Face mismatch (No employee recognized)"}, status=400)
+                            
+                        if emp_id and str(emp_id) != str(identified_id):
+                            return Response({"error": "Rejected: Face mismatch. The recognized face does not match the selected employee ID."}, status=400)
                         
                     # Validate Device Attestation AFTER identifying the employee
                     if webauthn_signature:
@@ -444,7 +479,12 @@ class AttendanceViewSet(viewsets.ViewSet):
                 if policy.require_gps and not (lat_str and lng_str):
                     return Response({"error": "GPS location is mandatory for your profile as per attendance policy."}, status=400)
                 qr_token = request.data.get('qr_token')
-                if policy.require_qr and not qr_token:
+                
+                # Check WFH status
+                is_wfh = request.data.get('is_wfh') == 'true' or (policy.wfh_employees and employee.id in policy.wfh_employees)
+                
+                # Enforce require_qr only if it's not a FACE punch and not WFH
+                if policy.require_qr and not qr_token and source != 'FACE' and not is_wfh:
                     return Response({"error": "QR Code scan is mandatory for your profile as per attendance policy."}, status=400)
             else:
                 qr_token = request.data.get('qr_token')
