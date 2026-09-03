@@ -330,34 +330,51 @@ class AttendanceViewSet(viewsets.ViewSet):
                         
                     # Resolve Employee Identity First
                     emp_id = request.data.get('employee')
+                    employee = None
                     if emp_id:
-                        employee = Employee.objects.get(id=emp_id)
-                    elif hasattr(request.user, 'employee_profile') and request.user.employee_profile:
+                        employee = Employee.objects.filter(id=emp_id).first()
+                    elif hasattr(request.user, 'employee_profile') and getattr(request.user, 'employee_profile', None):
                         employee = request.user.employee_profile
-                    else:
-                        employee = Employee.objects.first()
                         
                     # Strict Pixel Matching Boundary
                     from django.conf import settings
+                    import glob
+                    
                     # We store fallback references in the media directory
                     fallback_dir = os.path.join(settings.MEDIA_ROOT, 'fallback_faces') if hasattr(settings, 'MEDIA_ROOT') and settings.MEDIA_ROOT else os.path.join(os.path.dirname(os.path.dirname(__file__)), 'media', 'fallback_faces')
                     os.makedirs(fallback_dir, exist_ok=True)
-                    ref_path = os.path.join(fallback_dir, f"{employee.id}_ref.png")
                     
-                    if os.path.exists(ref_path):
-                        ref_img = cv2.imread(ref_path, cv2.IMREAD_GRAYSCALE)
-                        if ref_img is not None:
-                            # Compare current pixel crop with the stored reference crop using normalized correlation
-                            res = cv2.matchTemplate(face_crop, ref_img, cv2.TM_CCOEFF_NORMED)
-                            similarity = res[0][0]
-                            
-                            # A completely different person typically yields < 0.20 similarity.
-                            # Lowering threshold to 0.25 makes it robust to minor angles and lighting changes
-                            if similarity < 0.25:
-                                return Response({"error": f"Security Alert: Identity verification failed. Your face pixels do not match the registered user's face. (Sim: {similarity:.2f})"}, status=400)
+                    if employee:
+                        ref_path = os.path.join(fallback_dir, f"{employee.id}_ref.png")
+                        if os.path.exists(ref_path):
+                            ref_img = cv2.imread(ref_path, cv2.IMREAD_GRAYSCALE)
+                            if ref_img is not None:
+                                res = cv2.matchTemplate(face_crop, ref_img, cv2.TM_CCOEFF_NORMED)
+                                similarity = res[0][0]
+                                if similarity < 0.25:
+                                    return Response({"error": f"Security Alert: Identity verification failed. Your face pixels do not match the registered user's face. (Sim: {similarity:.2f})"}, status=400)
+                        else:
+                            # First time punch-in for known employee: Store the pixel reference!
+                            cv2.imwrite(ref_path, face_crop)
                     else:
-                        # First time punch-in: Store the pixel reference!
-                        cv2.imwrite(ref_path, face_crop)
+                        # 1:N Fallback Search for Kiosk Mode (Identity unknown)
+                        best_match_id = None
+                        best_sim = -1.0
+                        
+                        for ref_path in glob.glob(os.path.join(fallback_dir, "*_ref.png")):
+                            ref_img = cv2.imread(ref_path, cv2.IMREAD_GRAYSCALE)
+                            if ref_img is not None:
+                                res = cv2.matchTemplate(face_crop, ref_img, cv2.TM_CCOEFF_NORMED)
+                                sim = res[0][0]
+                                if sim > best_sim:
+                                    best_sim = sim
+                                    best_match_id = os.path.basename(ref_path).split('_')[0]
+                                    
+                        if best_sim >= 0.25 and best_match_id:
+                            employee = Employee.objects.filter(id=best_match_id).first()
+                            
+                        if not employee:
+                            return Response({"error": f"Security Alert: Identity verification failed. Your face does not match any registered employee. (Max Sim: {best_sim:.2f})"}, status=400)
                         
                     verification_status = 'VERIFIED'
                 else:
