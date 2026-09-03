@@ -335,8 +335,11 @@ class AttendanceViewSet(viewsets.ViewSet):
                     employee = None
                     if emp_id:
                         employee = Employee.objects.filter(id=emp_id).first()
-                    elif hasattr(request.user, 'employee_profile') and getattr(request.user, 'employee_profile', None):
-                        employee = request.user.employee_profile
+                    elif request.user and request.user.is_authenticated:
+                        if hasattr(request.user, 'employee_profile') and getattr(request.user, 'employee_profile', None):
+                            employee = request.user.employee_profile
+                        else:
+                            return Response({"error": "Security Alert: Your user account is not linked to an Employee profile. Please contact HR to link your account before punching in."}, status=400)
                         
                     # Strict Pixel Matching Boundary
                     from django.conf import settings
@@ -474,17 +477,17 @@ class AttendanceViewSet(viewsets.ViewSet):
                 policy = AttendancePolicy.objects.filter(employee__isnull=True, site__isnull=True, organization__isnull=True).first()
 
             if policy:
-                if policy.require_face and source != 'FACE':
+                if policy.require_face and source != 'FACE' and not file_obj:
                     return Response({"error": "Face verification is mandatory for your profile as per attendance policy."}, status=400)
                 if policy.require_gps and not (lat_str and lng_str):
                     return Response({"error": "GPS location is mandatory for your profile as per attendance policy."}, status=400)
                 qr_token = request.data.get('qr_token')
                 
                 # Check WFH status
-                is_wfh = request.data.get('is_wfh') == 'true' or (policy.wfh_employees and employee.id in policy.wfh_employees)
+                is_wfh = request.data.get('is_wfh') == 'true' or (policy.wfh_employees and policy.wfh_employees.filter(id=employee.id).exists())
                 
-                # Enforce require_qr only if it's not a FACE punch and not WFH
-                if policy.require_qr and not qr_token and source != 'FACE' and not is_wfh:
+                # Enforce require_qr only if it's not a personal Face punch (mobile or web) and not WFH
+                if policy.require_qr and not qr_token and source != 'FACE' and not file_obj and not is_wfh:
                     return Response({"error": "QR Code scan is mandatory for your profile as per attendance policy."}, status=400)
             else:
                 qr_token = request.data.get('qr_token')
