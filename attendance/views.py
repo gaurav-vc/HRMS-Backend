@@ -436,7 +436,13 @@ class AttendanceViewSet(viewsets.ViewSet):
                     distance = haversine(lat, lng, float(site.latitude), float(site.longitude))
                     effective_radius = max(site.radius, 500) # Increased to 500m for testing
                     if distance > effective_radius:
-                        return Response({"error": f"Rejected: Outside geofence. Distance: {int(distance)}m (max {effective_radius}m)"}, status=400)
+                        # WFH Bypass Geofence Feature - Strictly explicit list only
+                        is_wfh = False
+                        if policy and policy.wfh_employees.exists():
+                            if policy.wfh_employees.filter(id=employee.id).exists():
+                                is_wfh = True
+                        if not is_wfh:
+                            return Response({"error": f"Rejected: Outside geofence. Distance: {int(distance)}m (max {effective_radius}m)"}, status=400)
                 
                 # Wave 5: Hardened Velocity Replay/Spoof Check
                 last_punch = PunchLog.objects.filter(employee=employee).order_by('-punch_time').first()

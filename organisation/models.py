@@ -110,6 +110,7 @@ class AttendancePolicy(models.Model):
     require_face = models.BooleanField(default=True)
     require_qr = models.BooleanField(default=True)
     require_gps = models.BooleanField(default=True)
+    wfh_employees = models.ManyToManyField('employees.Employee', related_name='wfh_policies', blank=True, help_text="Employees granted Work From Home privileges to bypass geofence.")
 
     def __str__(self):
         if self.employee:
