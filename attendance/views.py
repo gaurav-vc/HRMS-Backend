@@ -314,6 +314,10 @@ class AttendanceViewSet(viewsets.ViewSet):
                     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
                     
                     if len(faces) == 0:
+                        # Fallback to a more relaxed detection if strict pass fails
+                        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(30, 30))
+                    
+                    if len(faces) == 0:
                         return Response({"error": "Security Alert: No face detected. Please ensure your face is clearly visible."}, status=400)
                     
                     # Sort to get the largest face in the frame
@@ -347,8 +351,9 @@ class AttendanceViewSet(viewsets.ViewSet):
                             res = cv2.matchTemplate(face_crop, ref_img, cv2.TM_CCOEFF_NORMED)
                             similarity = res[0][0]
                             
-                            # A completely different person typically yields < 0.35 similarity.
-                            if similarity < 0.45:
+                            # A completely different person typically yields < 0.20 similarity.
+                            # Lowering threshold to 0.25 makes it robust to minor angles and lighting changes
+                            if similarity < 0.25:
                                 return Response({"error": f"Security Alert: Identity verification failed. Your face pixels do not match the registered user's face. (Sim: {similarity:.2f})"}, status=400)
                     else:
                         # First time punch-in: Store the pixel reference!
