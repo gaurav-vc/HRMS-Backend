@@ -132,6 +132,14 @@ def isolate_queryset(qs, user):
     if employee and employee.role == 'super_admin':
         return qs
 
+    if qs.model.__name__ == 'Holiday':
+        from django.db.models import Q
+        if employee and hasattr(employee, 'organization') and employee.organization:
+            return qs.filter(Q(site__organization=employee.organization) | Q(site__isnull=True)).distinct()
+        if employee and employee.site:
+            return qs.filter(Q(site=employee.site) | Q(site__isnull=True)).distinct()
+        return qs.filter(site__isnull=True).distinct()
+
     # ── MULTI-TENANT BOUNDARY: apply organisation scope first ────────────────
     # If the user is an org_admin, they shouldn't be restricted by admin_sites
     if employee and employee.role in ('admin', 'org_admin'):
