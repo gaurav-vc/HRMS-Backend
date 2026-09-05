@@ -186,7 +186,18 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         return super().get_permissions()
 
     def perform_create(self, serializer):
-        site = serializer.save()
+        user = self.request.user
+        org = None
+        if hasattr(user, 'employee_profile') and user.employee_profile and user.employee_profile.organization:
+            org = user.employee_profile.organization
+            
+        site = serializer.save(organization=org)
+        
+        # Auto-enroll the creator into the new site so it shows up in their dashboard immediately
+        if hasattr(user, 'employee_profile') and user.employee_profile:
+            if site not in user.employee_profile.enrolled_sites.all():
+                user.employee_profile.enrolled_sites.add(site)
+                
         origin = self.request.headers.get('Origin')
         provision_contact_person(site, origin=origin)
         

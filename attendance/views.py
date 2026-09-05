@@ -594,21 +594,39 @@ class AttendanceViewSet(viewsets.ViewSet):
                 qr_token = request.data.get('qr_token')
             # ---------------------------------------------
             
-            site = employee.site
+            valid_sites = []
+            if employee.site:
+                valid_sites.append(employee.site)
+            for es in employee.enrolled_sites.all():
+                if es not in valid_sites:
+                    valid_sites.append(es)
             
+            matched_site = employee.site # Default
+
             if source == 'GPS' or (lat_str and lng_str):
                 lat, lng = float(lat_str), float(lng_str)
-                if site and site.latitude and site.longitude:
-                    distance = haversine(lat, lng, float(site.latitude), float(site.longitude))
-                    effective_radius = max(site.radius, 500) # Increased to 500m for testing
-                    if distance > effective_radius:
-                        # WFH Bypass Geofence Feature - Strictly explicit list only
-                        is_wfh = False
-                        if policy and policy.wfh_employees.exists():
-                            if policy.wfh_employees.filter(id=employee.id).exists():
-                                is_wfh = True
-                        if not is_wfh:
-                            return Response({"error": f"Rejected: Outside geofence. Distance: {int(distance)}m (max {effective_radius}m)"}, status=400)
+                site_matched = False
+                min_distance = float('inf')
+                
+                for s in valid_sites:
+                    if s.latitude and s.longitude:
+                        distance = haversine(lat, lng, float(s.latitude), float(s.longitude))
+                        effective_radius = max(s.radius, 500) # Increased to 500m for testing
+                        if distance <= effective_radius:
+                            site_matched = True
+                            matched_site = s
+                            break
+                        if distance < min_distance:
+                            min_distance = distance
+                
+                if not site_matched:
+                    # WFH Bypass Geofence Feature - Strictly explicit list only
+                    is_wfh = False
+                    if policy and policy.wfh_employees.exists():
+                        if policy.wfh_employees.filter(id=employee.id).exists():
+                            is_wfh = True
+                    if not is_wfh:
+                        return Response({"error": f"Rejected: Outside geofence of all assigned sites. Closest distance: {int(min_distance) if min_distance != float('inf') else 'N/A'}m"}, status=400)
                 
                 # Wave 5: Hardened Velocity Replay/Spoof Check
                 last_punch = PunchLog.objects.filter(employee=employee).order_by('-punch_time').first()
@@ -622,16 +640,18 @@ class AttendanceViewSet(viewsets.ViewSet):
 
             # Wave 7: Cryptographic QR Token Validation & Replay Defense (COMMENTED FOR DEMO)
             if qr_token:
-                if site:
-                    # is_valid, qr_msg = CryptographicQRService.validate_token(qr_token, site.id)
-                    # if not is_valid:
-                    #     return Response({"error": qr_msg}, status=400)
-                    
-                    # --- LEGACY DEMO LOGIC ---
+                qr_site_matched = False
+                for s in valid_sites:
                     try:
-                        token_obj = DynamicQRToken.objects.get(site=site, token=qr_token)
+                        token_obj = DynamicQRToken.objects.get(site=s, token=qr_token)
+                        qr_site_matched = True
+                        matched_site = s
+                        break
                     except DynamicQRToken.DoesNotExist:
-                        return Response({"error": "Rejected: Invalid QR Token."}, status=400)
+                        continue
+                
+                if not qr_site_matched:
+                    return Response({"error": "Rejected: Invalid QR Token for any of your assigned sites."}, status=400)
                 
                 # We still keep the employee-specific replay defense just in case
                 if PunchLog.objects.filter(employee=employee, qr_token=qr_token).exists():
@@ -646,7 +666,7 @@ class AttendanceViewSet(viewsets.ViewSet):
                     employee=employee,
                     attendance_date=today,
                     defaults={
-                        'site': employee.site,
+                        'site': matched_site,
                         'organization': employee.entity,
                     }
                 )
@@ -682,7 +702,7 @@ class AttendanceViewSet(viewsets.ViewSet):
                 daily_att, _ = DailyAttendance.objects.get_or_create(
                     employee=employee,
                     attendance_date=now.date(),
-                    defaults={'site': employee.site, 'organization': employee.entity}
+                    defaults={'site': matched_site, 'organization': employee.entity}
                 )
                 
             punch = PunchLog.objects.create(
