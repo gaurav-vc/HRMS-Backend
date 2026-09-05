@@ -329,6 +329,27 @@ class AttendanceViewSet(viewsets.ViewSet):
                     # Crop and normalize the face pixels
                     face_crop = gray[y:y+h, x:x+w]
                     face_crop = cv2.resize(face_crop, (150, 150))
+                    
+                    # --- STRICT ANTI-SPOOFING LIVENESS ENGINE (2D PRINT/SCREEN ATTACK DETECTION) ---
+                    # 1. Laplacian Variance (Focus/Depth Check)
+                    # Real 3D faces have depth and natural focus variance. 2D prints are uniformly flat/blurry.
+                    laplacian_var = cv2.Laplacian(face_crop, cv2.CV_64F).var()
+                    
+                    # 2. Illumination/Contrast Variance
+                    # Real 3D faces cast shadows (eyes, nose). 2D photos are flat and lack dynamic range.
+                    contrast_std = np.std(face_crop)
+                    
+                    # STRICT SECURITY BOUNDARIES:
+                    if laplacian_var < 50.0:
+                        return Response({"error": "Security Alert: Liveness verification failed. Image lacks 3D depth/sharpness (Possible print attack). Please ensure good lighting."}, status=400)
+                        
+                    if contrast_std < 20.0:
+                        return Response({"error": "Security Alert: Liveness verification failed. Unnatural lighting/contrast detected (Possible 2D photo)."}, status=400)
+                        
+                    # Screens (Moiré pattern) generate extreme high-frequency pixel noise when held close to the camera.
+                    if laplacian_var > 2500.0:
+                        return Response({"error": "Security Alert: Liveness verification failed. Digital screen noise detected (Possible phone/screen attack)."}, status=400)
+                    # ---------------------------------------------------------------------------------
                         
                     # Resolve Employee Identity First
                     emp_id = request.data.get('employee')
