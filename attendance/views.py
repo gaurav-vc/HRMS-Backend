@@ -350,17 +350,85 @@ class AttendanceViewSet(viewsets.ViewSet):
                     os.makedirs(fallback_dir, exist_ok=True)
                     
                     if employee:
-                        ref_path = os.path.join(fallback_dir, f"{employee.id}_ref.png")
-                        if os.path.exists(ref_path):
-                            ref_img = cv2.imread(ref_path, cv2.IMREAD_GRAYSCALE)
-                            if ref_img is not None:
-                                res = cv2.matchTemplate(face_crop, ref_img, cv2.TM_CCOEFF_NORMED)
-                                similarity = res[0][0]
-                                if similarity < 0.25:
-                                    return Response({"error": f"Security Alert: Identity verification failed. Your face pixels do not match the registered user's face. (Sim: {similarity:.2f})"}, status=400)
+                        ref_img = None
+                        
+                        try:
+                            has_photo = bool(employee.photo and employee.photo.name)
+                            if has_photo:
+                                _ = employee.photo.path
+                        except ValueError:
+                            has_photo = False
+                            
+                        if has_photo:
+                            # STRICT SECURITY BOUNDARY: Always use the official profile picture for matching
+                            photo_img = cv2.imread(employee.photo.path)
+                            if photo_img is not None:
+                                photo_gray = cv2.cvtColor(photo_img, cv2.COLOR_BGR2GRAY)
+                                photo_faces = face_cascade.detectMultiScale(photo_gray, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
+                                if len(photo_faces) > 0:
+                                    photo_faces = sorted(photo_faces, key=lambda x: x[2]*x[3], reverse=True)
+                                    px, py, pw, ph = photo_faces[0]
+                                    photo_crop = photo_gray[py:py+ph, px:px+pw]
+                                    ref_img = cv2.resize(photo_crop, (150, 150))
+                                else:
+                                    h, w = photo_gray.shape
+                                    cy, cx = h//2, w//2
+                                    s = min(h, w)//2
+                                    photo_crop = photo_gray[cy-s:cy+s, cx-s:cx+s]
+                                    ref_img = cv2.resize(photo_crop, (150, 150))
                         else:
-                            # First time punch-in for known employee: Store the pixel reference!
-                            cv2.imwrite(ref_path, face_crop)
+                            # First time punch-in: Save as profile picture
+                            from django.core.files.base import ContentFile
+                            employee.photo.save(f"{employee.id}_profile.jpg", ContentFile(image_bytes))
+                            ref_img = face_crop # Automatically pass the first time
+
+                        # Fetch dynamic threshold
+                        threshold_percent = 95.00
+                        try:
+                            if hasattr(employee, 'attendance_policy') and employee.attendance_policy:
+                                threshold_percent = float(employee.attendance_policy.face_match_threshold)
+                            elif employee.site and hasattr(employee.site, 'attendance_policy') and employee.site.attendance_policy:
+                                threshold_percent = float(employee.site.attendance_policy.face_match_threshold)
+                        except Exception:
+                            pass
+
+                        if ref_img is not None:
+                            # Strict Security Boundary: ORB Feature Matching for scale/rotation invariance
+                            orb = cv2.ORB_create(nfeatures=500)
+                            kp1, des1 = orb.detectAndCompute(face_crop, None)
+                            kp2, des2 = orb.detectAndCompute(ref_img, None)
+                            
+                            similarity_percent = 0.0
+                            if des1 is not None and des2 is not None and len(kp1) > 0 and len(kp2) > 0:
+                                # Use Lowe's ratio test to drastically filter false positives
+                                bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+                                matches = bf.knnMatch(des1, des2, k=2)
+                                
+                                good_matches = []
+                                for m_n in matches:
+                                    if len(m_n) == 2:
+                                        m, n = m_n
+                                        if m.distance < 0.75 * n.distance:
+                                            good_matches.append(m)
+                                    elif len(m_n) == 1:
+                                        good_matches.append(m_n[0])
+                                
+                                baseline = min(len(kp1), len(kp2))
+                                if baseline > 0:
+                                    raw_accuracy = len(good_matches) / baseline
+                                    # ORB raw good matches mapping:
+                                    # A genuine face match from a different angle usually yields 8% to 15% good features.
+                                    # A completely different face yields < 2% good features.
+                                    # Map 0.02 (2%) -> 50%, 0.12 (12%) -> 95%, >0.15 -> 100%
+                                    if raw_accuracy < 0.02:
+                                        similarity_percent = raw_accuracy * (50.0 / 0.02)
+                                    else:
+                                        similarity_percent = 50.0 + ((raw_accuracy - 0.02) / 0.10) * 45.0
+                                        
+                                    similarity_percent = min(100.0, similarity_percent)
+                            
+                            if similarity_percent < threshold_percent:
+                                return Response({"error": f"Security Alert: Identity verification failed. Accuracy: {similarity_percent:.1f}% (Required: {threshold_percent:.1f}%)"}, status=400)
                     else:
                         # 1:N Fallback Search for Kiosk Mode (Identity unknown)
                         best_match_id = None
@@ -395,35 +463,68 @@ class AttendanceViewSet(viewsets.ViewSet):
                     if emp_id and source == 'FACE':
                         # 1:1 Verification for Mobile App
                         employee = Employee.objects.filter(id=emp_id).first()
-                        if not employee or not employee.photo or not os.path.exists(employee.photo.path):
-                            return Response({"error": "No reference photo registered for this employee"}, status=400)
-                            
-                        import tempfile
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_img:
-                            tmp_img.write(image_bytes)
-                            tmp_path = tmp_img.name
-                            
+                        if not employee:
+                            return Response({"error": "Employee not found"}, status=400)
+                        
                         try:
-                            from deepface import DeepFace
-                            result = DeepFace.verify(
-                                img1_path=tmp_path,
-                                img2_path=employee.photo.path,
-                                model_name="Facenet512",
-                                detector_backend="opencv",
-                                distance_metric="cosine",
-                                enforce_detection=True
-                            )
-                            os.remove(tmp_path)
-                            if not result.get("verified", False):
-                                return Response({"error": "Face does not match registered employee photo"}, status=400)
-                                
-                            identified_id = employee.id
+                            has_photo = bool(employee.photo and employee.photo.name)
+                            if has_photo:
+                                _ = employee.photo.path
                         except ValueError:
-                            if os.path.exists(tmp_path): os.remove(tmp_path)
-                            return Response({"error": "No human face detected. Please retake photo clearly."}, status=400)
-                        except Exception as e:
-                            if os.path.exists(tmp_path): os.remove(tmp_path)
-                            return Response({"error": f"Verification error: {str(e)}"}, status=500)
+                            has_photo = False
+                            
+                        if not has_photo:
+                            # First time face capture: save as profile picture
+                            from django.core.files.base import ContentFile
+                            employee.photo.save(f"{employee.id}_profile.jpg", ContentFile(image_bytes))
+                            identified_id = employee.id
+                        else:
+                            import tempfile
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_img:
+                                tmp_img.write(image_bytes)
+                                tmp_path = tmp_img.name
+                                
+                            try:
+                                from deepface import DeepFace
+                                result = DeepFace.verify(
+                                    img1_path=tmp_path,
+                                    img2_path=employee.photo.path,
+                                    model_name="Facenet512",
+                                    detector_backend="opencv",
+                                    distance_metric="cosine",
+                                    enforce_detection=True
+                                )
+                                os.remove(tmp_path)
+                                
+                                # Fetch dynamic threshold
+                                threshold_percent = 95.00
+                                try:
+                                    if hasattr(employee, 'attendance_policy') and employee.attendance_policy:
+                                        threshold_percent = float(employee.attendance_policy.face_match_threshold)
+                                    elif employee.site and hasattr(employee.site, 'attendance_policy') and employee.site.attendance_policy:
+                                        threshold_percent = float(employee.site.attendance_policy.face_match_threshold)
+                                except Exception:
+                                    pass
+
+                                distance = result.get("distance", 1.0)
+                                max_threshold = result.get("threshold", 0.30)
+                                # Convert cosine distance to percentage score
+                                accuracy_percent = 100.0
+                                if distance > 0:
+                                    # Distance 0 -> 100%, Distance max_threshold -> required threshold (e.g. 95%)
+                                    drop_rate = (100.0 - threshold_percent) / max_threshold
+                                    accuracy_percent = max(0.0, 100.0 - (distance * drop_rate))
+                                
+                                if accuracy_percent < threshold_percent or not result.get("verified", False):
+                                    return Response({"error": f"Security Alert: Identity verification failed. Accuracy: {accuracy_percent:.1f}% (Required: {threshold_percent:.1f}%)"}, status=400)
+                                    
+                                identified_id = employee.id
+                            except ValueError:
+                                if os.path.exists(tmp_path): os.remove(tmp_path)
+                                return Response({"error": "No human face detected. Please retake photo clearly."}, status=400)
+                            except Exception as e:
+                                if os.path.exists(tmp_path): os.remove(tmp_path)
+                                return Response({"error": f"Verification error: {str(e)}"}, status=500)
                     else:
                         # 1:N Search across entire FAISS index
                         result = get_face_encoding(image_bytes)

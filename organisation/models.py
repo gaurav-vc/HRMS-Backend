@@ -108,6 +108,7 @@ class AttendancePolicy(models.Model):
     ot_applicable_after_hours = models.DecimalField(max_digits=4, decimal_places=2, default=2.0)
     
     require_face = models.BooleanField(default=True)
+    face_match_threshold = models.DecimalField(max_digits=5, decimal_places=2, default=95.00, help_text="Strict accuracy percentage required for face verification")
     require_qr = models.BooleanField(default=True)
     require_gps = models.BooleanField(default=True)
     wfh_employees = models.ManyToManyField('employees.Employee', related_name='wfh_policies', blank=True, help_text="Employees granted Work From Home privileges to bypass geofence.")
