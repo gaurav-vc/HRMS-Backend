@@ -23,7 +23,7 @@ def get_face_encoding(image_bytes):
             
         # DeepFace represent extracts embeddings
         # enforce_detection=True ensures there is a face
-        results = DeepFace.represent(img_path=img, model_name="Facenet", enforce_detection=True)
+        results = DeepFace.represent(img_path=img, model_name="Facenet", detector_backend="mtcnn", enforce_detection=True)
         
         if not results:
             return {"success": False, "error": "No face detected"}

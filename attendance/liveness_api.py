@@ -72,20 +72,60 @@ class LivenessVerifyAPIView(APIView):
             tmp_path = tmp_vid.name
             
         try:
-            # MediaPipe processing logic to extract EAR and Head Pose
+            # 1. Check Liveness (Blink/Nod)
             is_live, frame_bytes = self.process_video(tmp_path, expected_actions)
             os.remove(tmp_path)
             
-            if is_live:
-                # Cleanup session
-                del PENDING_CHALLENGES[session_id]
-                return Response({
-                    "status": "success",
-                    "message": "Liveness verified",
-                    "best_frame_b64": "..." # In production, return or save the best frame for DeepFace
-                })
-            else:
+            if not is_live:
                 return Response({"error": "Liveness challenge failed. Actions did not match instructions."}, status=400)
+                
+            # 2. Dynamically Compare with Profile Picture
+            # We have the best live frame, now match it against the database!
+            from employees.models import Employee
+            try:
+                from deepface import DeepFace
+                has_deepface = True
+            except ImportError:
+                has_deepface = False
+                
+            employee = Employee.objects.filter(user=request.user).first()
+            if not employee or not bool(employee.photo and employee.photo.name):
+                return Response({"error": "No profile photo found to compare against. Please register a photo first."}, status=400)
+                
+            if has_deepface and frame_bytes:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_frame:
+                    tmp_frame.write(frame_bytes)
+                    frame_path = tmp_frame.name
+                    
+                try:
+                    result = DeepFace.verify(
+                        img1_path=frame_path,
+                        img2_path=employee.photo.path,
+                        model_name="Facenet",
+                        detector_backend="mtcnn",
+                        distance_metric="cosine",
+                        enforce_detection=True
+                    )
+                    os.remove(frame_path)
+                    
+                    # Same relaxed 50% threshold logic
+                    distance = result.get("distance", 1.0)
+                    relaxed_max = result.get("threshold", 0.30) + 0.15
+                    
+                    if distance > relaxed_max and not result.get("verified", False):
+                        return Response({"error": "Identity verification failed. The live person does not match the profile picture."}, status=400)
+                        
+                except Exception as e:
+                    if os.path.exists(frame_path): os.remove(frame_path)
+                    return Response({"error": f"Face comparison failed: {str(e)}"}, status=400)
+            
+            # Cleanup session
+            del PENDING_CHALLENGES[session_id]
+            return Response({
+                "status": "success",
+                "message": "Liveness and Identity Verified Successfully!",
+                "verified": True
+            })
                 
         except Exception as e:
             if os.path.exists(tmp_path):

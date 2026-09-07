@@ -24,47 +24,38 @@ class PassiveLivenessService:
         Analyzes texture, moiré patterns, and reflection variance.
         Returns: (is_live: bool, confidence: float, reason: str)
         """
-        if not HAVE_ONNX:
-            return True, 1.0, "Passed (Model dependencies missing)"
-            
         try:
-            # We look for the model in backend/models/
-            model_path = os.path.join(os.path.dirname(__file__), "..", "models", "minifasnet.onnx")
-            if not os.path.exists(model_path):
-                return True, 1.0, f"Passed (Model weights missing)"
-                
-            session = ort.InferenceSession(model_path)
-            
             np_img = np.frombuffer(image_bytes, np.uint8)
             img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
             if img is None:
                 return False, 0.0, "Invalid image for liveness check"
-            
-            # MiniFASNet Preprocessing
-            img_resized = cv2.resize(img, (80, 80))
-            img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
-            
-            # HWC to CHW, normalization
-            img_transpose = img_rgb.transpose((2, 0, 1))
-            img_batch = np.expand_dims(img_transpose, axis=0).astype(np.float32)
-            
-            input_name = session.get_inputs()[0].name
-            result = session.run(None, {input_name: img_batch})
-            
-            output = result[0][0]
-            exp_out = np.exp(output - np.max(output))
-            probs = exp_out / np.sum(exp_out)
-            
-            # Assuming Class 0: spoof, Class 1: real (Depends on exact model, usually 1 is real)
-            real_prob = probs[1] if len(probs) > 1 else probs[0]
-            
-            if real_prob < 0.60:
-                return False, float(1.0 - real_prob), "Screen/Print Spoof Detected"
                 
-            return True, float(real_prob), "Passed Print/Screen Liveness"
+            # 1. Texture/Blur Analysis (Laplacian Variance)
+            # Printed photos and screens often lack the high-frequency depth details of a real face.
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+            
+            # If the variance is incredibly low, it's a blurry printed photo or a low-res screen
+            if laplacian_var < 50.0:
+                return False, 1.0, "Spoof Detected: Image lacks natural depth texture (Possible Print/Screen)."
+                
+            # 2. Specular Reflection / Screen Glare Analysis (HSV Value Variance)
+            # Human skin has smooth gradients. Screens emit light with extreme clipping, 
+            # and matte paper has very flat value distribution.
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+            v_channel = hsv[:, :, 2]
+            v_std = np.std(v_channel)
+            
+            # Unnatural lighting variance (too flat = paper, too extreme = screen glare)
+            if v_std < 10.0 or v_std > 100.0:
+                return False, 1.0, "Spoof Detected: Unnatural specular reflection detected (Possible Screen)."
+                
+            # If we had the ONNX model, we would run MiniFASNet here.
+            # Since we don't, we rely on the above heuristics + DeepFace thresholding.
+            return True, 1.0, "Passed Print/Screen Liveness Heuristics"
             
         except Exception as e:
-            return True, 1.0, f"Passed (Error during inference)"
+            return True, 1.0, f"Passed (Error during inference: {str(e)})"
 
     @classmethod
     def detect_deepfake(cls, video_frames: list) -> tuple[bool, float, str]:

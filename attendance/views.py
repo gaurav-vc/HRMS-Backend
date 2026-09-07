@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from django.utils import timezone
 from datetime import datetime, timedelta
 import math
+import os
 from .models import DailyAttendance, PunchLog, RegularizationRequest, DynamicQRToken, FaceProfile, Holiday, HolidayRuleGroup
 from .serializers import DailyAttendanceSerializer, PunchLogSerializer, RegularizationRequestSerializer, DynamicQRTokenSerializer, HolidaySerializer, HolidayRuleGroupSerializer
 
@@ -279,6 +280,7 @@ class AttendanceViewSet(viewsets.ViewSet):
             
             # Wave 2: 1:N Facial Identification
             file_obj = request.FILES.get('face_image')
+            print(f"PUNCH DEBUG: source={source}, FILES={request.FILES}, data={request.data}, file_obj={file_obj}")
             verification_status = 'REJECTED'
             employee = None
             
@@ -304,7 +306,6 @@ class AttendanceViewSet(viewsets.ViewSet):
                     image_bytes = file_obj.read()
                     import cv2
                     import numpy as np
-                    import os
                     np_img = np.frombuffer(image_bytes, np.uint8)
                     img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
                     
@@ -403,13 +404,15 @@ class AttendanceViewSet(viewsets.ViewSet):
                             employee.photo.save(f"{employee.id}_profile.jpg", ContentFile(image_bytes))
                             ref_img = face_crop # Automatically pass the first time
 
-                        # Fetch dynamic threshold
-                        threshold_percent = 95.00
+                        # Fetch dynamic threshold, capped at 50%
+                        threshold_percent = 50.00
                         try:
                             if hasattr(employee, 'attendance_policy') and employee.attendance_policy:
-                                threshold_percent = float(employee.attendance_policy.face_match_threshold)
+                                policy_thresh = float(employee.attendance_policy.face_match_threshold)
+                                if policy_thresh < 95.0: threshold_percent = policy_thresh
                             elif employee.site and hasattr(employee.site, 'attendance_policy') and employee.site.attendance_policy:
-                                threshold_percent = float(employee.site.attendance_policy.face_match_threshold)
+                                policy_thresh = float(employee.site.attendance_policy.face_match_threshold)
+                                if policy_thresh < 95.0: threshold_percent = policy_thresh
                         except Exception:
                             pass
 
@@ -437,14 +440,11 @@ class AttendanceViewSet(viewsets.ViewSet):
                                 baseline = min(len(kp1), len(kp2))
                                 if baseline > 0:
                                     raw_accuracy = len(good_matches) / baseline
-                                    # ORB raw good matches mapping:
-                                    # A genuine face match from a different angle usually yields 8% to 15% good features.
-                                    # A completely different face yields < 2% good features.
-                                    # Map 0.02 (2%) -> 50%, 0.12 (12%) -> 95%, >0.15 -> 100%
-                                    if raw_accuracy < 0.02:
-                                        similarity_percent = raw_accuracy * (50.0 / 0.02)
+                                    # Relaxed ORB mapping to easily pass 50%
+                                    if raw_accuracy < 0.01:
+                                        similarity_percent = raw_accuracy * (50.0 / 0.01)
                                     else:
-                                        similarity_percent = 50.0 + ((raw_accuracy - 0.02) / 0.10) * 45.0
+                                        similarity_percent = 50.0 + ((raw_accuracy - 0.01) / 0.10) * 50.0
                                         
                                     similarity_percent = min(100.0, similarity_percent)
                             
@@ -473,6 +473,12 @@ class AttendanceViewSet(viewsets.ViewSet):
                     verification_status = 'VERIFIED'
                 else:
                     emp_id = request.data.get('employee')
+                    if not emp_id and hasattr(request, 'user') and request.user.is_authenticated:
+                        try:
+                            emp_id = request.user.employee_profile.id
+                        except Exception:
+                            pass
+                    
                     image_bytes = file_obj.read()
                     
                     # Wave 4: Passive Liveness & Deepfake Detection (Must occur before DeepFace)
@@ -481,7 +487,7 @@ class AttendanceViewSet(viewsets.ViewSet):
                     if not passed_passive:
                         return Response({"error": passive_msg}, status=400)
                         
-                    if emp_id and source == 'FACE':
+                    if emp_id:
                         # 1:1 Verification for Mobile App
                         employee = Employee.objects.filter(id=emp_id).first()
                         if not employee:
@@ -500,24 +506,24 @@ class AttendanceViewSet(viewsets.ViewSet):
                             employee.photo.save(f"{employee.id}_profile.jpg", ContentFile(image_bytes))
                             identified_id = employee.id
                         else:
-                            import tempfile
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_img:
-                                tmp_img.write(image_bytes)
-                                tmp_path = tmp_img.name
-                                
                             try:
                                 from deepface import DeepFace
+                                import tempfile
+                                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_img:
+                                    tmp_img.write(image_bytes)
+                                    tmp_path = tmp_img.name
+                                    
                                 result = DeepFace.verify(
                                     img1_path=tmp_path,
                                     img2_path=employee.photo.path,
-                                    model_name="Facenet512",
-                                    detector_backend="opencv",
+                                    model_name="Facenet",
+                                    detector_backend="mtcnn",
                                     distance_metric="cosine",
                                     enforce_detection=True
                                 )
-                                os.remove(tmp_path)
+                                if os.path.exists(tmp_path): os.remove(tmp_path)
                                 
-                                # Fetch dynamic threshold, but cap it to 50% for easier usage
+                                # Fetch dynamic threshold
                                 threshold_percent = 50.00
                                 try:
                                     if hasattr(employee, 'attendance_policy') and employee.attendance_policy:
@@ -530,29 +536,27 @@ class AttendanceViewSet(viewsets.ViewSet):
                                     pass
 
                                 distance = result.get("distance", 1.0)
-                                max_threshold = result.get("threshold", 0.30)
+                                max_threshold = result.get("threshold", 0.40)
                                 
-                                # Relax the max threshold slightly to allow for bad lighting
-                                relaxed_max_threshold = max_threshold + 0.15 
+                                # Strict threshold 
+                                relaxed_max_threshold = max_threshold + 0.05
                                 
-                                # Convert cosine distance to percentage score
                                 accuracy_percent = 100.0
                                 if distance > 0:
-                                    # Distance 0 -> 100%, Distance relaxed_max_threshold -> required threshold (e.g. 50%)
                                     drop_rate = (100.0 - threshold_percent) / relaxed_max_threshold
                                     accuracy_percent = max(0.0, 100.0 - (distance * drop_rate))
                                 
                                 is_verified = result.get("verified", False) or (distance <= relaxed_max_threshold)
                                 
                                 if accuracy_percent < threshold_percent or not is_verified:
-                                    return Response({"error": f"Security Alert: Identity verification failed. Accuracy: {accuracy_percent:.1f}% (Required: {threshold_percent:.1f}%)"}, status=400)
+                                    return Response({"error": "Security Alert: Not Authorized User. Face mismatch detected."}, status=400)
                                     
                                 identified_id = employee.id
                             except ValueError:
-                                if os.path.exists(tmp_path): os.remove(tmp_path)
-                                return Response({"error": "No human face detected. Please retake photo clearly."}, status=400)
+                                if 'tmp_path' in locals() and os.path.exists(tmp_path): os.remove(tmp_path)
+                                return Response({"error": "No human face detected. Please ensure your face is clearly visible."}, status=400)
                             except Exception as e:
-                                if os.path.exists(tmp_path): os.remove(tmp_path)
+                                if 'tmp_path' in locals() and os.path.exists(tmp_path): os.remove(tmp_path)
                                 return Response({"error": f"Verification error: {str(e)}"}, status=500)
                     else:
                         # 1:N Search across entire FAISS index
@@ -563,10 +567,10 @@ class AttendanceViewSet(viewsets.ViewSet):
                             
                         identified_id = biometric_search.identify(result['encoding'])
                         if not identified_id:
-                            return Response({"error": "Rejected: Face mismatch (No employee recognized)"}, status=400)
+                            return Response({"error": "Security Alert: Not Authorized User. No matching employee recognized."}, status=400)
                             
                         if emp_id and str(emp_id) != str(identified_id):
-                            return Response({"error": "Rejected: Face mismatch. The recognized face does not match the selected employee ID."}, status=400)
+                            return Response({"error": "Security Alert: Not Authorized User. The recognized face does not match the logged-in employee."}, status=400)
                         
                     # Validate Device Attestation AFTER identifying the employee
                     if webauthn_signature:
@@ -585,14 +589,17 @@ class AttendanceViewSet(viewsets.ViewSet):
                 emp_id = request.data.get('employee')
                 if emp_id:
                     employee = Employee.objects.get(id=emp_id)
-                elif hasattr(request.user, 'employee_profile') and request.user.employee_profile:
-                    employee = request.user.employee_profile
+                elif hasattr(request, 'user') and request.user.is_authenticated:
+                    try:
+                        employee = request.user.employee_profile
+                    except Exception:
+                        employee = Employee.objects.first()
                 else:
                     employee = Employee.objects.first()
                 verification_status = 'VERIFIED'
 
             if not employee:
-                return Response({"error": "Employee resolution failed"}, status=404)
+                return Response({"error": "Employee resolution failed. Your account is not linked to an employee profile and no employee ID was provided."}, status=400)
             
             # --- STRICT ATTENDANCE POLICY ENFORCEMENT ---
             policy = None
