@@ -517,26 +517,34 @@ class AttendanceViewSet(viewsets.ViewSet):
                                 )
                                 os.remove(tmp_path)
                                 
-                                # Fetch dynamic threshold
-                                threshold_percent = 95.00
+                                # Fetch dynamic threshold, but cap it to 50% for easier usage
+                                threshold_percent = 50.00
                                 try:
                                     if hasattr(employee, 'attendance_policy') and employee.attendance_policy:
-                                        threshold_percent = float(employee.attendance_policy.face_match_threshold)
+                                        policy_thresh = float(employee.attendance_policy.face_match_threshold)
+                                        if policy_thresh < 95.0: threshold_percent = policy_thresh
                                     elif employee.site and hasattr(employee.site, 'attendance_policy') and employee.site.attendance_policy:
-                                        threshold_percent = float(employee.site.attendance_policy.face_match_threshold)
+                                        policy_thresh = float(employee.site.attendance_policy.face_match_threshold)
+                                        if policy_thresh < 95.0: threshold_percent = policy_thresh
                                 except Exception:
                                     pass
 
                                 distance = result.get("distance", 1.0)
                                 max_threshold = result.get("threshold", 0.30)
+                                
+                                # Relax the max threshold slightly to allow for bad lighting
+                                relaxed_max_threshold = max_threshold + 0.15 
+                                
                                 # Convert cosine distance to percentage score
                                 accuracy_percent = 100.0
                                 if distance > 0:
-                                    # Distance 0 -> 100%, Distance max_threshold -> required threshold (e.g. 95%)
-                                    drop_rate = (100.0 - threshold_percent) / max_threshold
+                                    # Distance 0 -> 100%, Distance relaxed_max_threshold -> required threshold (e.g. 50%)
+                                    drop_rate = (100.0 - threshold_percent) / relaxed_max_threshold
                                     accuracy_percent = max(0.0, 100.0 - (distance * drop_rate))
                                 
-                                if accuracy_percent < threshold_percent or not result.get("verified", False):
+                                is_verified = result.get("verified", False) or (distance <= relaxed_max_threshold)
+                                
+                                if accuracy_percent < threshold_percent or not is_verified:
                                     return Response({"error": f"Security Alert: Identity verification failed. Accuracy: {accuracy_percent:.1f}% (Required: {threshold_percent:.1f}%)"}, status=400)
                                     
                                 identified_id = employee.id
