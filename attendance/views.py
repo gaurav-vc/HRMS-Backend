@@ -9,7 +9,7 @@ import math
 import os
 from .models import DailyAttendance, PunchLog, RegularizationRequest, DynamicQRToken, FaceProfile, Holiday, HolidayRuleGroup
 from .serializers import DailyAttendanceSerializer, PunchLogSerializer, RegularizationRequestSerializer, DynamicQRTokenSerializer, HolidaySerializer, HolidayRuleGroupSerializer
-
+from .decorators import strict_liveness_precheck
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371000 # Radius of earth in meters
     phi_1 = math.radians(lat1)
@@ -269,6 +269,7 @@ class AttendanceViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['post'])
     @permission_classes([AllowAny])
+    @strict_liveness_precheck
     def punch(self, request):
         try:
             punch_type = request.data.get('punch_type', 'IN')
@@ -832,6 +833,42 @@ class AttendanceViewSet(viewsets.ViewSet):
                 absent_count += 1
                 
         return Response({"message": f"Marked {absent_count} employees as Absent for {target_date}"})
+
+    @action(detail=False, methods=['post'])
+    @permission_classes([IsAuthenticated])
+    def manual_override_punch(self, request):
+        """
+        Isolated admin-only endpoint to clear a liveness lockout.
+        """
+        if not request.user.is_superuser and getattr(request.user, 'role', '') != 'HR':
+            return Response({"error": "Admin/HR privileges required for manual override."}, status=403)
+            
+        employee_id = request.data.get('employee_id')
+        if not employee_id:
+            return Response({"error": "employee_id required"}, status=400)
+            
+        from attendance.models import LivenessLockout, ManualOverrideRequest
+        
+        try:
+            lockout = LivenessLockout.objects.get(employee_id=employee_id)
+            lockout.failed_attempts = 0
+            lockout.locked_until = None
+            lockout.save()
+        except LivenessLockout.DoesNotExist:
+            return Response({"message": "Employee is not currently locked out."})
+            
+        approver = None
+        if hasattr(request.user, 'employee_profile'):
+            approver = request.user.employee_profile
+            
+        ManualOverrideRequest.objects.create(
+            employee_id=employee_id,
+            reason=f"Liveness Lockout Override by Admin {request.user.username}",
+            approver_1=approver,
+            is_approved=True
+        )
+        
+        return Response({"message": "Lockout cleared and override logged. The employee can now punch in normally."})
 
     @action(detail=False, methods=['get'])
     def dashboard(self, request):

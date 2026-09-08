@@ -275,3 +275,46 @@ class HolidayRuleGroup(models.Model):
     
     def __str__(self):
         return f"Rule Group for {self.holiday.name}"
+
+class StrictLivenessAuditLog(models.Model):
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, null=True, blank=True, related_name='liveness_audits')
+    timestamp = models.DateTimeField(auto_now_add=True)
+    punch_type = models.CharField(max_length=10, blank=True, null=True)
+    source = models.CharField(max_length=20, blank=True, null=True)
+    is_wfh = models.BooleanField(default=False)
+    
+    # 1. Face Presence
+    face_count = models.IntegerField(default=0)
+    
+    # 2. Passive Liveness (Secondary)
+    laplacian_score = models.FloatField(null=True, blank=True)
+    moire_score = models.FloatField(null=True, blank=True)
+    specular_score = models.FloatField(null=True, blank=True)
+    
+    # 3. ONNX Model (Primary)
+    onnx_liveness_score = models.FloatField(null=True, blank=True)
+    
+    # 4. Composite
+    composite_score = models.FloatField(null=True, blank=True)
+    
+    # 5. Provenance (Informational only)
+    exif_edited_flag = models.BooleanField(default=False)
+    jpeg_double_compression = models.BooleanField(default=False)
+    
+    # 6. Integrity & Velocity
+    velocity_kmh = models.FloatField(null=True, blank=True)
+    integrity_valid = models.BooleanField(default=True)
+    
+    final_decision = models.CharField(max_length=20) # 'PASSED', 'REJECTED', 'SHADOW_MODE'
+    rejection_reason = models.CharField(max_length=255, null=True, blank=True)
+
+    def __str__(self):
+        return f"Audit {self.id}: {self.final_decision} (Score: {self.composite_score})"
+
+class LivenessLockout(models.Model):
+    employee = models.OneToOneField(Employee, on_delete=models.CASCADE, related_name='liveness_lockout')
+    failed_attempts = models.IntegerField(default=0)
+    locked_until = models.DateTimeField(null=True, blank=True)
+    
+    def __str__(self):
+        return f"Lockout for {self.employee}: {self.failed_attempts} fails"
