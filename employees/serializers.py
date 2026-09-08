@@ -16,6 +16,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
     salary_structure_name = serializers.SerializerMethodField()
     manager_name = serializers.SerializerMethodField()
     code = serializers.CharField(required=False, allow_blank=True)
+    is_wfh = serializers.SerializerMethodField()
     
     class Meta:
         model = Employee
@@ -28,6 +29,10 @@ class EmployeeSerializer(serializers.ModelSerializer):
         if obj.manager:
             return f"{obj.manager.first_name} {obj.manager.last_name}"
         return None
+
+    def get_is_wfh(self, obj):
+        from organisation.models import AttendancePolicy
+        return AttendancePolicy.objects.filter(wfh_employees=obj).exists()
 
 from .models import EmployeeDocument, EmployeeTransfer, EmployeeExit
 
