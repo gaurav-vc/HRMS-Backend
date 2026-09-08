@@ -640,14 +640,20 @@ class AttendanceViewSet(viewsets.ViewSet):
             matched_site = employee.site # Default
 
             if source == 'GPS' or (lat_str and lng_str):
-                lat, lng = float(lat_str), float(lng_str)
+                if not lat_str or not lng_str:
+                    return Response({"error": "Latitude and Longitude are required for GPS punches."}, status=400)
+                try:
+                    lat, lng = float(lat_str), float(lng_str)
+                except ValueError:
+                    return Response({"error": "Invalid GPS coordinates."}, status=400)
+                    
                 site_matched = False
                 min_distance = float('inf')
                 
                 for s in valid_sites:
-                    if s.latitude and s.longitude:
+                    if s.latitude is not None and s.longitude is not None:
                         distance = haversine(lat, lng, float(s.latitude), float(s.longitude))
-                        effective_radius = max(s.radius, 500) # Increased to 500m for testing
+                        effective_radius = s.radius
                         if distance <= effective_radius:
                             site_matched = True
                             matched_site = s
