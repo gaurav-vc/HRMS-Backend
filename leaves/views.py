@@ -63,6 +63,10 @@ def send_leave_email_async(emp_email, emp_name, status, start_date, end_date, to
     threading.Thread(target=_send).start()
 
 def calculate_working_days(start_date, end_date, site_id=None):
+    from .models import LeavePolicyConfiguration
+    config = LeavePolicyConfiguration.get_settings()
+    is_saturday_working = config.is_saturday_working
+
     # Fetch holidays between dates
     holidays_query = Holiday.objects.filter(date__gte=start_date, date__lte=end_date)
     if site_id:
@@ -75,22 +79,29 @@ def calculate_working_days(start_date, end_date, site_id=None):
     days = 0
     current_date = start_date
     while current_date <= end_date:
-        if current_date.weekday() < 5 and current_date not in holiday_dates:  # Monday to Friday and not a holiday
+        weekday = current_date.weekday()
+        is_working_day = (weekday < 5) or (weekday == 5 and is_saturday_working)
+        
+        if is_working_day and current_date not in holiday_dates:
             days += 1
         current_date += timedelta(days=1)
     return Decimal(days)
 
 class LeavePolicyConfigAPIView(APIView):
     def get(self, request):
+        import sys
         config = LeavePolicyConfiguration.get_settings()
         serializer = LeavePolicyConfigurationSerializer(config)
+        print("==== GET RESPONSE DATA ====", serializer.data, file=sys.stderr)
         return Response(serializer.data)
         
     def put(self, request):
+        import sys
         config = LeavePolicyConfiguration.get_settings()
         serializer = LeavePolicyConfigurationSerializer(config, data=request.data)
         if serializer.is_valid():
             serializer.save()
+            print("==== PUT RESPONSE DATA ====", serializer.data, file=sys.stderr)
             return Response(serializer.data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 

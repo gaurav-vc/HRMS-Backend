@@ -8,6 +8,7 @@ class LeavePolicyConfiguration(models.Model):
     standard_annual_leaves = models.DecimalField(max_digits=5, decimal_places=2, default=12.0)
     max_consecutive_leaves = models.IntegerField(default=3, help_text="Max consecutive days allowed without salary deduction")
     exception_month = models.IntegerField(default=3, help_text="Month (1-12) where all accumulated leaves can be taken at once")
+    is_saturday_working = models.BooleanField(default=False, help_text="Whether Saturday is considered a working day")
 
     class Meta:
         verbose_name = "Leave Policy Configuration"

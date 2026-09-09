@@ -5,7 +5,11 @@ from employees.models import Employee
 class LeavePolicyConfigurationSerializer(serializers.ModelSerializer):
     class Meta:
         model = LeavePolicyConfiguration
-        fields = '__all__'
+        fields = [
+            'id', 'tenured_years_threshold', 'tenured_annual_leaves', 
+            'standard_annual_leaves', 'max_consecutive_leaves', 
+            'exception_month', 'is_saturday_working'
+        ]
 
 class LeaveTypeSerializer(serializers.ModelSerializer):
     class Meta:
