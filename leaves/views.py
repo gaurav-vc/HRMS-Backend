@@ -64,6 +64,7 @@ def send_leave_email_async(emp_email, emp_name, status, start_date, end_date, to
 
 def calculate_working_days(start_date, end_date, site_id=None):
     from .models import LeavePolicyConfiguration
+    from attendance.models import Holiday
     config = LeavePolicyConfiguration.get_settings()
     is_saturday_working = config.is_saturday_working
 
