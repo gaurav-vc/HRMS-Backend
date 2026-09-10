@@ -10,6 +10,43 @@ from attendance.models import DailyAttendance
 import csv
 from django.http import HttpResponse
 
+def check_report_access(user, emp, allowed_roles=None):
+    if not allowed_roles:
+        allowed_roles = ['super_admin', 'org_admin', 'hr', 'manager', 'site_admin']
+    from authentication.permissions import _get_admin_sites
+    admin_sites = _get_admin_sites(user)
+    
+    if user.is_superuser:
+        return True
+    if emp and emp.role in allowed_roles:
+        return True
+    if admin_sites.exists():
+        return True
+    if emp and emp.dynamic_role and emp.dynamic_role.permissions.get('reports'):
+        return True
+    return False
+
+def get_report_emp_q(user, emp):
+    from django.db.models import Q
+    from authentication.permissions import _get_admin_sites
+    admin_sites = _get_admin_sites(user)
+    
+    if user.is_superuser:
+        return Q()
+        
+    if admin_sites.exists():
+        return Q(site__in=admin_sites) | Q(enrolled_sites__in=admin_sites)
+        
+    if emp:
+        if emp.role == 'super_admin':
+            return Q()
+        elif emp.role in ['org_admin', 'hr', 'manager']:
+            return Q(entity=emp.entity)
+        else:
+            return Q(id=emp.id)
+            
+    return Q(id=-1)
+
 class DashboardView(DataIsolationMixin, APIView):
     permission_classes = [IsAuthenticated]
     
@@ -91,18 +128,15 @@ class StatutoryRegisterView(APIView):
         # Ensure only HR/Admins can access this
         user = request.user
         emp = getattr(user, 'employee_profile', None)
-        if not user.is_superuser and (not emp or emp.role not in ['super_admin', 'org_admin', 'hr']):
+        if not check_report_access(user, emp, ['super_admin', 'org_admin', 'hr']):
             return Response({'error': 'Unauthorized'}, status=403)
             
         period = request.query_params.get('period')
         if not period:
             return Response({'error': 'Period is required (YYYY-MM)'}, status=400)
             
-        slip_filter = {'period': period}
-        if not user.is_superuser and emp.role != 'super_admin':
-            slip_filter['employee__entity'] = emp.entity
-            
-        slips = Payslip.objects.filter(**slip_filter).select_related('employee').prefetch_related('lines', 'lines__rule')
+        emp_q = get_report_emp_q(user, emp)
+        slips = Payslip.objects.filter(period=period, employee__in=Employee.objects.filter(emp_q)).select_related('employee').prefetch_related('lines', 'lines__rule')
         
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = f'attachment; filename="statutory_register_{period}.csv"'
@@ -142,18 +176,18 @@ class CostCenterReportView(APIView):
         """
         user = request.user
         emp = getattr(user, 'employee_profile', None)
-        if not user.is_superuser and (not emp or emp.role not in ['super_admin', 'org_admin', 'hr']):
+        if not check_report_access(user, emp, ['super_admin', 'org_admin', 'hr']):
             return Response({'error': 'Unauthorized'}, status=403)
             
         period = request.query_params.get('period')
         if not period:
             return Response({'error': 'Period is required (YYYY-MM)'}, status=400)
             
-        slip_filter = {'payslip__period': period}
-        if not user.is_superuser and emp.role != 'super_admin':
-            slip_filter['payslip__employee__entity'] = emp.entity
-            
-        snapshots = PayslipAllocationSnapshot.objects.filter(**slip_filter).select_related('cost_center', 'payslip')
+        emp_q = get_report_emp_q(user, emp)
+        snapshots = PayslipAllocationSnapshot.objects.filter(
+            payslip__period=period, 
+            payslip__employee__in=Employee.objects.filter(emp_q)
+        ).select_related('cost_center', 'payslip')
         
         # Aggregate manually to apply percentage accurately
         # OR mathematically: sum(payslip.gross * percentage / 100)
@@ -195,7 +229,7 @@ class PayrollAttendanceReportView(APIView):
         emp = getattr(user, 'employee_profile', None)
         
         # Verify permissions
-        if not user.is_superuser and (not emp or emp.role not in ['super_admin', 'org_admin', 'hr', 'manager']):
+        if not check_report_access(user, emp):
             return Response({'error': 'Unauthorized'}, status=403)
             
         today = date.today()
@@ -219,11 +253,8 @@ class PayrollAttendanceReportView(APIView):
         _, total_days = calendar.monthrange(target_year, target_month)
         
         data = []
-        employees = Employee.objects.select_related('entity', 'branch', 'site', 'department', 'designation').all()
-        
-        # Apply data isolation if needed
-        if not user.is_superuser and emp and emp.role not in ['super_admin', 'org_admin']:
-            employees = employees.filter(entity=emp.entity)
+        emp_q = get_report_emp_q(user, emp)
+        employees = Employee.objects.select_related('entity', 'branch', 'site', 'department', 'designation').filter(emp_q)
             
         for e in employees:
             attendances = DailyAttendance.objects.filter(
