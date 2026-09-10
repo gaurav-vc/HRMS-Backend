@@ -10,7 +10,7 @@ def get_authorizers(employee):
         authorizers.append(employee.manager)
     else:
         # Fallback to HR Admin or Site Admin
-        admins = Employee.objects.filter(user__role__in=['HR Admin', 'Site Admin'])
+        admins = Employee.objects.filter(dynamic_role__name__in=['HR Admin', 'Site Admin'])
         if admins.exists():
             authorizers.extend(list(admins))
         else:
@@ -21,6 +21,9 @@ def get_authorizers(employee):
 
 @receiver(post_save, sender=Loan)
 def loan_notification(sender, instance, created, **kwargs):
+    if kwargs.get('raw', False):
+        return
+        
     if created:
         authorizers = get_authorizers(instance.employee)
         for auth in authorizers:
@@ -43,6 +46,9 @@ def loan_notification(sender, instance, created, **kwargs):
 
 @receiver(post_save, sender=Reimbursement)
 def reimbursement_notification(sender, instance, created, **kwargs):
+    if kwargs.get('raw', False):
+        return
+        
     if created:
         authorizers = get_authorizers(instance.employee)
         for auth in authorizers:
