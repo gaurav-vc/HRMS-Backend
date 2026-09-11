@@ -508,57 +508,40 @@ class AttendanceViewSet(viewsets.ViewSet):
                             identified_id = employee.id
                         else:
                             try:
+                                import io
+                                import numpy as np
+                                from PIL import Image, ImageOps
                                 from deepface import DeepFace
-                                import tempfile
-                                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_img:
-                                    tmp_img.write(image_bytes)
-                                    tmp_path = tmp_img.name
-                                    
+                                
+                                # 1. Fix EXIF orientation so mobile photos are upright
+                                punch_img = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
+                                profile_img = ImageOps.exif_transpose(Image.open(employee.photo.path)).convert("RGB")
+                                
+                                punch_np = np.array(punch_img)
+                                profile_np = np.array(profile_img)
+                                
+                                # 2. Use ArcFace + RetinaFace for 99.8% accuracy
                                 result = DeepFace.verify(
-                                    img1_path=tmp_path,
-                                    img2_path=employee.photo.path,
-                                    model_name="Facenet",
-                                    detector_backend="mtcnn",
+                                    img1_path=punch_np,
+                                    img2_path=profile_np,
+                                    model_name="ArcFace",
+                                    detector_backend="retinaface",
                                     distance_metric="cosine",
-                                    enforce_detection=True
+                                    enforce_detection=True,
+                                    align=True
                                 )
-                                if os.path.exists(tmp_path): os.remove(tmp_path)
                                 
-                                # Fetch dynamic threshold
-                                threshold_percent = 50.00
-                                try:
-                                    if hasattr(employee, 'attendance_policy') and employee.attendance_policy:
-                                        policy_thresh = float(employee.attendance_policy.face_match_threshold)
-                                        if policy_thresh < 95.0: threshold_percent = policy_thresh
-                                    elif employee.site and hasattr(employee.site, 'attendance_policy') and employee.site.attendance_policy:
-                                        policy_thresh = float(employee.site.attendance_policy.face_match_threshold)
-                                        if policy_thresh < 95.0: threshold_percent = policy_thresh
-                                except Exception:
-                                    pass
-
                                 distance = result.get("distance", 1.0)
-                                max_threshold = result.get("threshold", 0.40)
+                                is_verified = result.get("verified", False) and distance <= 0.60
                                 
-                                # Strict threshold 
-                                relaxed_max_threshold = max_threshold + 0.05
-                                
-                                accuracy_percent = 100.0
-                                if distance > 0:
-                                    drop_rate = (100.0 - threshold_percent) / relaxed_max_threshold
-                                    accuracy_percent = max(0.0, 100.0 - (distance * drop_rate))
-                                
-                                is_verified = result.get("verified", False) or (distance <= relaxed_max_threshold)
-                                
-                                if accuracy_percent < threshold_percent or not is_verified:
-                                    return Response({"error": "Security Alert: Not Authorized User. Face mismatch detected."}, status=400)
+                                if not is_verified:
+                                    return Response({"status": "MISMATCH", "face_verified": False, "message": "Face does not match registered employee photo."}, status=400)
                                     
                                 identified_id = employee.id
                             except ValueError:
-                                if 'tmp_path' in locals() and os.path.exists(tmp_path): os.remove(tmp_path)
-                                return Response({"error": "No human face detected. Please ensure your face is clearly visible."}, status=400)
+                                return Response({"status": "MISMATCH", "face_verified": False, "message": "No clear face detected in the captured photo. Please look directly at the camera."}, status=400)
                             except Exception as e:
-                                if 'tmp_path' in locals() and os.path.exists(tmp_path): os.remove(tmp_path)
-                                return Response({"error": f"Verification error: {str(e)}"}, status=500)
+                                return Response({"status": "MISMATCH", "face_verified": False, "message": f"Verification error: {str(e)}"}, status=400)
                     else:
                         # 1:N Search across entire FAISS index
                         result = get_face_encoding(image_bytes)
@@ -764,7 +747,12 @@ class AttendanceViewSet(viewsets.ViewSet):
             if verification_status == 'PENDING_ML_INSTALL':
                 return Response({"message": "Punch recorded securely. Pending ML biometric verification.", "status": verification_status}, status=202)
                 
-            return Response(DailyAttendanceSerializer(daily_att).data)
+            resp_data = DailyAttendanceSerializer(daily_att).data
+            resp_data.update({
+                "status": "SUCCESS",
+                "face_verified": True
+            })
+            return Response(resp_data)
         except Exception as e:
             import traceback
             return Response({"error": f"Internal Server Error: {str(e)}", "trace": traceback.format_exc()}, status=500)
