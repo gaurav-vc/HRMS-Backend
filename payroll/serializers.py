@@ -100,6 +100,22 @@ class LoanSerializer(serializers.ModelSerializer):
         model = Loan
         fields = '__all__'
 
+    def validate(self, data):
+        employee = data.get('employee')
+        
+        # If updating an existing loan, we might not need to run these creation validations
+        # or we might need to be careful. Check if this is a creation.
+        if self.instance is None and employee:
+            active_loans = Loan.objects.filter(employee=employee).exclude(status='Closed')
+            
+            if active_loans.count() >= 3:
+                raise serializers.ValidationError("professional limit reached and 3 loans")
+                
+            if active_loans.filter(status='Pending').exists():
+                raise serializers.ValidationError("You have a pending loan request that has not been approved yet. You cannot apply for another loan until it is approved.")
+                
+        return data
+
 class ReimbursementSerializer(serializers.ModelSerializer):
     class Meta:
         model = Reimbursement
