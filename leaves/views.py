@@ -132,24 +132,61 @@ class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
         from .models import LeavePolicyConfiguration, LeaveType
         from datetime import date
         from decimal import Decimal
+        import calendar
+        from attendance.models import DailyAttendance
+        from .models import LeaveRequest
 
         user = self.request.user
+        
+        def calculate_earned_al(employee, year):
+            earned = Decimal('0.00')
+            current_month = date.today().month
+            current_year = date.today().year
+            
+            eval_months = 12 if year != current_year else current_month
+                
+            for m in range(1, eval_months + 1):
+                start_date = date(year, m, 1)
+                last_day = calendar.monthrange(year, m)[1]
+                end_date = date(year, m, last_day)
+                
+                if employee.doj and employee.doj > end_date:
+                    continue
+                
+                # Check for approved leaves (holiday taken)
+                leaves_taken = LeaveRequest.objects.filter(
+                    employee=employee,
+                    status='Approved',
+                    start_date__lte=end_date,
+                    end_date__gte=start_date
+                ).exists()
+                
+                if leaves_taken:
+                    continue
+                    
+                # Check for intentional absences
+                intentional_absences = DailyAttendance.objects.filter(
+                    employee=employee,
+                    attendance_date__range=[start_date, end_date],
+                    attendance_status='Absent'
+                ).exists()
+                
+                if intentional_absences:
+                    continue
+                    
+                earned += Decimal('1.00')
+                
+            return earned
 
-        # Auto-initialize balances for the current user if they don't exist
         if hasattr(user, 'employee_profile') and user.employee_profile:
             emp = user.employee_profile
             year = date.today().year
             if not LeaveBalance.objects.filter(employee=emp, year=year).exists():
                 leave_types = LeaveType.objects.all()
-                config = LeavePolicyConfiguration.get_settings()
                 for lt in leave_types:
                     entitlement = lt.annual_entitlement
-                    if lt.code == 'AL' and emp.doj:
-                        years = (date.today() - emp.doj).days / 365.25
-                        if years >= config.tenured_years_threshold:
-                            entitlement = config.tenured_annual_leaves
-                        else:
-                            entitlement = config.standard_annual_leaves
+                    if lt.code == 'AL':
+                        entitlement = calculate_earned_al(emp, year)
                     LeaveBalance.objects.create(
                         employee=emp,
                         leave_type=lt,
@@ -159,27 +196,19 @@ class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
                         remaining_days=entitlement
                     )
 
-        # Filter for non-admins so they only see their own balances
         if not (user.is_superuser or getattr(user, 'role', '') in ['HR Admin', 'Site Admin']):
             if hasattr(user, 'employee_profile'):
                 qs = qs.filter(employee=user.employee_profile)
 
         try:
-            config = LeavePolicyConfiguration.get_settings()
             for balance in qs:
                 needs_save = False
-                entitlement = balance.leave_type.annual_entitlement
-                if balance.leave_type.code == 'AL' and balance.employee and balance.employee.doj:
-                    years = (date.today() - balance.employee.doj).days / 365.25
-                    if years >= config.tenured_years_threshold:
-                        entitlement = config.tenured_annual_leaves
-                    else:
-                        entitlement = config.standard_annual_leaves
-                        
-                if balance.allocated_days == Decimal('20.00') and entitlement != Decimal('20.00'):
-                    balance.allocated_days = entitlement
-                    balance.remaining_days = entitlement - balance.used_days
-                    needs_save = True
+                if balance.leave_type.code == 'AL' and balance.employee:
+                    new_entitlement = calculate_earned_al(balance.employee, balance.year)
+                    if balance.allocated_days != new_entitlement:
+                        balance.allocated_days = new_entitlement
+                        balance.remaining_days = new_entitlement - balance.used_days
+                        needs_save = True
                 elif balance.leave_type.code == 'LOP' and balance.allocated_days != Decimal('0.00'):
                     balance.allocated_days = Decimal('0.00')
                     balance.remaining_days = Decimal('0.00') - balance.used_days
@@ -187,8 +216,9 @@ class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
                     
                 if needs_save:
                     balance.save()
-        except Exception:
-            pass
+        except Exception as e:
+            import traceback
+            print("Earned AL calc error:", e)
             
         return qs
 
