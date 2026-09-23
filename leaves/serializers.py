@@ -8,7 +8,7 @@ class LeavePolicyConfigurationSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'tenured_years_threshold', 'tenured_annual_leaves', 
             'standard_annual_leaves', 'max_consecutive_leaves', 
-            'exception_month', 'is_saturday_working'
+            'exception_month', 'is_saturday_working', 'require_full_attendance_for_al'
         ]
 
 class LeaveTypeSerializer(serializers.ModelSerializer):

@@ -164,15 +164,17 @@ class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
                 if leaves_taken:
                     continue
                     
-                # Check for intentional absences
-                intentional_absences = DailyAttendance.objects.filter(
-                    employee=employee,
-                    attendance_date__range=[start_date, end_date],
-                    attendance_status='Absent'
-                ).exists()
-                
-                if intentional_absences:
-                    continue
+                # Check for intentional absences if required
+                leave_config = LeavePolicyConfiguration.get_settings()
+                if leave_config.require_full_attendance_for_al:
+                    intentional_absences = DailyAttendance.objects.filter(
+                        employee=employee,
+                        attendance_date__range=[start_date, end_date],
+                        attendance_status='Absent'
+                    ).exists()
+                    
+                    if intentional_absences:
+                        continue
                     
                 earned += Decimal('1.00')
                 

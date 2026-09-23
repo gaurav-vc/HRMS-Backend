@@ -9,6 +9,7 @@ class LeavePolicyConfiguration(models.Model):
     max_consecutive_leaves = models.IntegerField(default=3, help_text="Max consecutive days allowed without salary deduction")
     exception_month = models.IntegerField(default=3, help_text="Month (1-12) where all accumulated leaves can be taken at once")
     is_saturday_working = models.BooleanField(default=False, help_text="Whether Saturday is considered a working day")
+    require_full_attendance_for_al = models.BooleanField(default=True, help_text="If False, employees earn AL even if absent.")
 
     class Meta:
         verbose_name = "Leave Policy Configuration"

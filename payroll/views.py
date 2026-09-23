@@ -145,13 +145,14 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             run = self.get_object()
             overrides = request.data.get('overrides')
             include_variable_bonus = request.data.get('include_variable_bonus', False)
+            include_leaves_encashment = request.data.get('include_leaves_encashment', False)
             
             if run.status in ['Frozen', 'Disbursed']:
                 if overrides:
                     PayrollService.file_arrears(run.id, overrides)
                 return Response({'status': 'success', 'run_status': run.status, 'msg': 'Arrears processed'})
                 
-            run = PayrollService.execute_run(run.id, overrides=overrides, include_variable_bonus=include_variable_bonus)
+            run = PayrollService.execute_run(run.id, overrides=overrides, include_variable_bonus=include_variable_bonus, include_leaves_encashment=include_leaves_encashment)
             if hasattr(request, 'user') and request.user.is_authenticated:
                 run.maker = request.user
                 run.save()
@@ -620,6 +621,8 @@ class PayrollPreviewAPIView(APIView):
         try:
             period = request.query_params.get('period')
             entity_param = request.query_params.get('entity')
+            include_leaves_encashment_str = request.query_params.get('include_leaves_encashment', 'false')
+            include_leaves_encashment = include_leaves_encashment_str.lower() == 'true'
             
             if not period:
                 return Response({'error': 'Period is required'}, status=400)
@@ -698,7 +701,7 @@ class PayrollPreviewAPIView(APIView):
                         else:
                             emp._cached_dag = []
                             
-                        gross, ded, net, line_items = PayrollService.process_employee_in_memory(emp, run, precomputed_data, is_simulation=True)
+                        gross, ded, net, line_items = PayrollService.process_employee_in_memory(emp, run, precomputed_data, is_simulation=True, include_leaves_encashment=include_leaves_encashment)
                         total_gross += gross
                         total_deductions += ded
                         total_net += net

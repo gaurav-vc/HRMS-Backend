@@ -193,7 +193,7 @@ class PayrollService:
         }
 
     @staticmethod
-    def process_employee_in_memory(employee, run, precomputed_data, is_simulation=False, include_variable_bonus=False, emp_override=None):
+    def process_employee_in_memory(employee, run, precomputed_data, is_simulation=False, include_variable_bonus=False, emp_override=None, include_leaves_encashment=False):
         rules_dag = getattr(employee, '_cached_dag', [])
         context = PayrollService._get_context_for_employee(employee, precomputed_data, emp_override=emp_override)
         
@@ -343,6 +343,54 @@ class PayrollService:
                 )
                 line_items.append({'rule': virtual_reimb_rule, 'amount': reimbursement_amt})
 
+        # ==========================================
+        # LEAVE ENCASHMENT INJECTION
+        # ==========================================
+        if include_leaves_encashment:
+            from leaves.models import LeaveBalance
+            from django.db.models import F
+            
+            try:
+                current_year = int(run.period.split('-')[0])
+                balances = LeaveBalance.objects.filter(employee=employee, year=current_year, remaining_days__gt=0)
+                
+                encashable_leaves = Decimal('0.00')
+                balances_to_reset = []
+                for bal in balances:
+                    name = (bal.leave_type.name or '').upper()
+                    if 'ANNUAL' in name or 'EARNED' in name or 'AL' in name:
+                        encashable_leaves += bal.remaining_days
+                        balances_to_reset.append(bal)
+                
+                if encashable_leaves > 0:
+                    total_days_in_month = context.get('total_days', Decimal('30.00'))
+                    if total_days_in_month <= 0:
+                        total_days_in_month = Decimal('30.00')
+                        
+                    daily_rate = context.get('basic', Decimal('0.00')) / Decimal(str(total_days_in_month))
+                    if daily_rate <= 0:
+                        daily_rate = (Decimal(str(employee.ctc or 0)) / Decimal('12.0')) / Decimal(str(total_days_in_month))
+                        
+                    encashment_amount = Decimal(str(encashable_leaves)) * daily_rate
+                    
+                    if encashment_amount > 0:
+                        total_gross += encashment_amount
+                        virtual_leave_rule, _ = ComponentRule.objects.get_or_create(
+                            name="Leave Encashment",
+                            defaults={'type': 'Earning', 'formula': '0', 'effective_from': "2020-01-01"}
+                        )
+                        line_items.append({'rule': virtual_leave_rule, 'amount': round(encashment_amount, 2)})
+                        
+                        if not is_simulation:
+                            for bal in balances_to_reset:
+                                bal.used_days = F('used_days') + bal.remaining_days
+                                bal.remaining_days = Decimal('0.00')
+                                bal.save(update_fields=['used_days', 'remaining_days'])
+            except Exception as e:
+                import traceback
+                print(f"Error processing leave encashment: {e}")
+                traceback.print_exc()
+
         net = total_gross - total_deductions
         if net < 0:
             diff = total_deductions - total_gross
@@ -358,7 +406,7 @@ class PayrollService:
         return total_gross, total_deductions, net, line_items
 
     @staticmethod
-    def _run_async_worker(run_id, is_simulation, overrides=None, include_variable_bonus=False):
+    def _run_async_worker(run_id, is_simulation, overrides=None, include_variable_bonus=False, include_leaves_encashment=False):
         # We use a raw thread here strictly because Celery is not installed in the environment.
         # In a real enterprise setup (Wave 7), this MUST be a celery @shared_task.
         import threading
@@ -416,7 +464,7 @@ class PayrollService:
                             emp_override = next((o for o in overrides if o.get('id') == emp.id), None)
                             
                         gross, ded, net, line_items = PayrollService.process_employee_in_memory(
-                            emp, run, precomputed_data, is_simulation, include_variable_bonus, emp_override=emp_override
+                            emp, run, precomputed_data, is_simulation, include_variable_bonus, emp_override=emp_override, include_leaves_encashment=include_leaves_encashment
                         )
                         
                         if emp_override:
@@ -502,14 +550,14 @@ class PayrollService:
             worker()
 
     @staticmethod
-    def execute_run(run_id, overrides=None, include_variable_bonus=False):
+    def execute_run(run_id, overrides=None, include_variable_bonus=False, include_leaves_encashment=False):
         run = PayrollRun.objects.get(id=run_id)
         if run.status in ['Frozen', 'Disbursed']:
             raise ValueError("Cannot execute a run that is Frozen or Disbursed")
         run.status = 'Processing'
         run.save()
         is_simulation = (run.run_type == 'Simulation')
-        PayrollService._run_async_worker(run_id, is_simulation, overrides=overrides, include_variable_bonus=include_variable_bonus)
+        PayrollService._run_async_worker(run_id, is_simulation, overrides=overrides, include_variable_bonus=include_variable_bonus, include_leaves_encashment=include_leaves_encashment)
         run.refresh_from_db()
         return run
 

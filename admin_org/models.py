@@ -14,6 +14,7 @@ class Organization(models.Model):
     
     # Advanced Options
     white_label_enabled = models.BooleanField(default=False)
+    require_full_attendance_for_al = models.BooleanField(default=True, help_text="If False, employees get AL even if absent.")
     sub_domain = models.CharField(max_length=100, blank=True, null=True)
     
     # Branding
