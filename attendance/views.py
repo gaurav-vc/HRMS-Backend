@@ -1026,6 +1026,44 @@ class ShiftDefinitionViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     serializer_class = ShiftDefinitionSerializer
     permission_classes = [IsAuthenticated]
 
+def is_holiday_for_employee(employee, date):
+    from attendance.models import Holiday
+    holidays = Holiday.objects.filter(date=date, status='Active')
+    for h in holidays:
+        rules = h.rule_groups.all()
+        if not rules.exists():
+            return True
+        for r in rules:
+            if r.excluded_roles.filter(id=employee.dynamic_role_id).exists() if getattr(employee, 'dynamic_role_id', None) else False:
+                continue
+            if r.excluded_departments.filter(id=employee.department_id).exists() if employee.department_id else False:
+                continue
+            role_match = not r.applicable_roles.exists() or (getattr(employee, 'dynamic_role_id', None) and r.applicable_roles.filter(id=employee.dynamic_role_id).exists())
+            dept_match = not r.applicable_departments.exists() or (employee.department_id and r.applicable_departments.filter(id=employee.department_id).exists())
+            entity_match = not r.applicable_entities.exists() or (employee.entity_id and r.applicable_entities.filter(id=employee.entity_id).exists())
+            branch_match = not r.applicable_branches.exists() or (employee.branch_id and r.applicable_branches.filter(id=employee.branch_id).exists())
+            if role_match and dept_match and entity_match and branch_match:
+                return True
+    return False
+
+def get_valid_date(employee, date):
+    from datetime import timedelta
+    site = employee.site
+    saturday_working = getattr(site, 'is_saturday_working', False) if site else False
+    
+    current_date = date
+    while True:
+        if current_date.weekday() == 6: # Sunday
+            current_date += timedelta(days=1)
+            continue
+        if current_date.weekday() == 5 and not saturday_working: # Saturday
+            current_date += timedelta(days=2) # Skip to Monday
+            continue
+        if is_holiday_for_employee(employee, current_date):
+            current_date += timedelta(days=1)
+            continue
+        return current_date
+
 class RosterViewSet(viewsets.ViewSet):
     permission_classes = [AllowAny]
 
@@ -1071,9 +1109,22 @@ class RosterViewSet(viewsets.ViewSet):
             
         try:
             shift = ShiftDefinition.objects.get(id=shift_id)
+            emp = Employee.objects.get(id=employee_id)
+            
+            # Determine the valid date (skip holidays/weekends as per rules)
+            from datetime import datetime
+            date_obj = datetime.strptime(date, "%Y-%m-%d").date()
+            valid_date_obj = get_valid_date(emp, date_obj)
+            
+            # Strict boundary: Do not allow manual assignment on non-working days
+            if date_obj != valid_date_obj:
+                return Response({"error": "Strict boundary: Cannot assign shift on a non-working day, holiday, or weekend."}, status=400)
+                
+            valid_date_str = valid_date_obj.strftime("%Y-%m-%d")
+            
             assignment, _ = ShiftAssignment.objects.update_or_create(
                 employee_id=employee_id,
-                date=date,
+                date=valid_date_str,
                 defaults={'shift': shift}
             )
             from employees.models import Notification
@@ -1092,7 +1143,7 @@ class RosterViewSet(viewsets.ViewSet):
                     shift_name=shift.name,
                     shift_start=shift.start_time.strftime('%I:%M %p'),
                     shift_end=shift.end_time.strftime('%I:%M %p'),
-                    dates_str=str(date)
+                    dates_str=valid_date_str
                 )
                 
             return Response(ShiftAssignmentSerializer(assignment).data)
@@ -1133,12 +1184,16 @@ class RosterViewSet(viewsets.ViewSet):
         delta = end_dt - start_dt
         dates = [start_dt + timedelta(days=i) for i in range(delta.days + 1)]
         
-        assignments_to_create = []
+        assignments_to_create_dict = {}
         for emp in employees:
             for d in dates:
-                assignments_to_create.append(
-                    ShiftAssignment(employee=emp, date=d, shift=shift)
-                )
+                valid_date = get_valid_date(emp, d)
+                # Strict boundary: skip assignment entirely if it's a non-working day
+                if valid_date == d:
+                    key = (emp.id, d)
+                    assignments_to_create_dict[key] = ShiftAssignment(employee=emp, date=d, shift=shift)
+                
+        assignments_to_create = list(assignments_to_create_dict.values())
                 
         if assignments_to_create:
             ShiftAssignment.objects.bulk_create(
