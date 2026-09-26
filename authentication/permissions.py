@@ -176,34 +176,43 @@ def isolate_queryset(qs, user):
         if qs.model.__name__ == 'Employee':
             return qs.filter(Q(site__in=admin_sites) | Q(enrolled_sites__in=admin_sites)).distinct()
             
-        # Restrict structural data (Orgs, Entities, Branches, Departments, Sites) to the Organization
-        org_ids = admin_sites.values_list('organization_id', flat=True).distinct()
+        org_ids = [x for x in admin_sites.values_list('organization_id', flat=True).distinct() if x is not None]
+        has_null_org = admin_sites.filter(organization__isnull=True).exists()
 
         if qs.model.__name__ == 'Site':
             return qs.filter(id__in=admin_sites.values_list('id', flat=True))
+            
+        def build_q(field_prefix=''):
+            q = Q(**{f'{field_prefix}organization_id__in': org_ids})
+            if has_null_org:
+                q |= Q(**{f'{field_prefix}organization__isnull': True})
+            return q
+
         if qs.model.__name__ == 'Organization':
-            return qs.filter(id__in=org_ids)
+            q = Q(id__in=org_ids)
+            # Cannot have organization__isnull=True on Organization itself
+            return qs.filter(q)
         if qs.model.__name__ == 'Entity':
-            return qs.filter(organization_id__in=org_ids)
+            return qs.filter(build_q())
         if qs.model.__name__ == 'Branch':
-            return qs.filter(entity__organization_id__in=org_ids)
+            return qs.filter(build_q('entity__'))
         if qs.model.__name__ == 'Department':
-            return qs.filter(entity__organization_id__in=org_ids)
+            return qs.filter(build_q('entity__'))
         if qs.model.__name__ == 'Role':
-            return qs.filter(organization_id__in=org_ids)
+            return qs.filter(build_q())
         if qs.model.__name__ == 'Designation':
-            return qs.filter(department__entity__organization_id__in=org_ids)
+            return qs.filter(build_q('department__entity__'))
             
         if hasattr(qs.model, 'organization'):
             org_field = qs.model._meta.get_field('organization')
             if org_field.is_relation and org_field.related_model.__name__ == 'Entity':
-                return qs.filter(organization__organization_id__in=org_ids)
+                return qs.filter(build_q('organization__'))
             else:
-                return qs.filter(organization_id__in=org_ids)
+                return qs.filter(build_q())
         if hasattr(qs.model, 'entity'):
-            return qs.filter(entity__organization_id__in=org_ids)
+            return qs.filter(build_q('entity__'))
         if hasattr(qs.model, 'department'):
-            return qs.filter(department__entity__organization_id__in=org_ids)
+            return qs.filter(build_q('department__entity__'))
         if hasattr(qs.model, 'structure'):
             return qs.filter(structure__site__in=admin_sites)
         if qs.model.__name__ == 'SalaryStructure':

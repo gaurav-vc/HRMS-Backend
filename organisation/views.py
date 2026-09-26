@@ -1,4 +1,7 @@
-from rest_framework import viewsets
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.permissions import AllowAny
 from .models import Entity, Branch, Site, Department, Designation, Role, AttendancePolicy
 from .serializers import (
     EntitySerializer, BranchSerializer, SiteSerializer,
@@ -183,7 +186,32 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         if self.action in ['list', 'retrieve']:
             from rest_framework.permissions import IsAuthenticated
             return [IsAuthenticated()]
+        if self.action == 'branding':
+            return [AllowAny()]
         return super().get_permissions()
+
+    @action(detail=False, methods=['get'])
+    def branding(self, request):
+        """
+        Public API for mobile apps to fetch site branding by site_code or sub_domain
+        """
+        site_code = request.query_params.get('site_code')
+        if not site_code:
+            return Response({'error': 'site_code query parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        site = Site.objects.filter(site_code=site_code).first()
+        if not site:
+            return Response({'error': 'Site not found'}, status=status.HTTP_404_NOT_FOUND)
+            
+        logo_url = None
+        if site.logo:
+            logo_url = request.build_absolute_uri(site.logo.url)
+            
+        return Response({
+            'site_name': site.name,
+            'branding_text': site.branding_text,
+            'logo_url': logo_url
+        })
 
     def perform_create(self, serializer):
         user = self.request.user
