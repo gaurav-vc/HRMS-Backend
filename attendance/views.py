@@ -1231,7 +1231,7 @@ class RosterViewSet(viewsets.ViewSet):
         return Response({"message": f"Successfully assigned shift to {employees.count()} employees for {len(dates)} days ({len(assignments_to_create)} total assignments)."})
 
 class HolidayViewSet(DataIsolationMixin, viewsets.ModelViewSet):
-    rbac_module = 'Holidays'
+    rbac_module = 'Holiday Planner'
     queryset = Holiday.objects.all().order_by('date')
     serializer_class = HolidaySerializer
     permission_classes = [IsAuthenticated]

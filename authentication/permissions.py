@@ -169,7 +169,9 @@ def isolate_queryset(qs, user):
     admin_sites = _get_admin_sites(user)
     if admin_sites.exists():
         from django.db.models import Q
-        if hasattr(qs.model, 'site') and qs.model.__name__ not in ['Site', 'Employee']:
+        if hasattr(qs.model, 'site') and qs.model.__name__ not in ['Site', 'Employee', 'SalaryStructure']:
+            return qs.filter(Q(site__in=admin_sites) | Q(site__isnull=True)).distinct()
+        if qs.model.__name__ == 'SalaryStructure':
             return qs.filter(site__in=admin_sites)
         if hasattr(qs.model, 'employee'):
             return qs.filter(Q(employee__site__in=admin_sites) | Q(employee__enrolled_sites__in=admin_sites)).distinct()
@@ -254,12 +256,15 @@ def isolate_queryset(qs, user):
 
     # ── DYNAMIC ROLE SCOPING ─────────────────────────────────────────────────
     has_org_access = False
+    is_location_scope = False
     custom_allowed = []
     if dynamic_role:
         if dynamic_role.access_scope in ['Corporate', 'Region', 'Custom'] or dynamic_role.cross_department_access:
             has_org_access = True
             if dynamic_role.access_scope == 'Custom':
                 custom_allowed = dynamic_role.permissions.get('allowed_entities', [])
+        elif dynamic_role.access_scope == 'Location':
+            is_location_scope = True
 
     if dynamic_role:
         if has_org_access:
@@ -280,6 +285,9 @@ def isolate_queryset(qs, user):
                 if qs.model.__name__ == 'Employee':
                     return qs.filter(entity_id__in=custom_allowed)
 
+            if qs.model.__name__ == 'AttendancePolicy':
+                from django.db.models import Q
+                return qs.filter(Q(organization=employee.organization) | Q(site__organization=employee.organization) | Q(employee__entity=employee.entity) | Q(employee__isnull=True, site__isnull=True, organization__isnull=True))
             if hasattr(qs.model, 'entity'):
                 return qs.filter(entity=employee.entity) if employee.entity else qs
             if hasattr(qs.model, 'department'):
@@ -292,6 +300,28 @@ def isolate_queryset(qs, user):
                 return qs.filter(site__organization=employee.organization) if employee.organization else qs
             if qs.model.__name__ == 'Employee':
                 return qs.filter(entity=employee.entity)
+        elif is_location_scope:
+            from django.db.models import Q
+            site_filter = Q(site=employee.site) if employee.site else Q(id=0)
+            if employee.enrolled_sites.exists():
+                site_filter |= Q(site__in=employee.enrolled_sites.all())
+                
+            if qs.model.__name__ == 'AttendancePolicy':
+                return qs.filter(Q(site__in=employee.enrolled_sites.all()) | Q(site=employee.site) | Q(employee__site=employee.site) | Q(employee__enrolled_sites=employee.site) | Q(employee__isnull=True, site__isnull=True, organization__isnull=True)).distinct()
+            if hasattr(qs.model, 'site') and qs.model.__name__ not in ['Site', 'Employee', 'SalaryStructure']:
+                return qs.filter(site_filter | Q(site__isnull=True)).distinct()
+            if qs.model.__name__ == 'SalaryStructure':
+                return qs.filter(site_filter)
+            if hasattr(qs.model, 'employee'):
+                return qs.filter(Q(employee__site=employee.site) | Q(employee__enrolled_sites=employee.site)).distinct()
+            if qs.model.__name__ == 'Employee':
+                return qs.filter(Q(site=employee.site) | Q(enrolled_sites=employee.site)).distinct()
+            if qs.model.__name__ == 'Site':
+                return qs.model.objects.filter(Q(id=employee.site_id) | Q(id__in=employee.enrolled_sites.all())).distinct()
+            if hasattr(qs.model, 'entity'):
+                return qs.filter(entity=employee.entity) if employee.entity else qs
+            if hasattr(qs.model, 'department'):
+                return qs.filter(department__entity=employee.entity) if employee.entity else qs
         else:
             # Scoped to individual employee only
             if hasattr(qs.model, 'employee'):

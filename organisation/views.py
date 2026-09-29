@@ -35,9 +35,33 @@ class EntityViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         return super().get_permissions()
 
 class AttendancePolicyViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Attendance'
     queryset = AttendancePolicy.objects.all()
     serializer_class = AttendancePolicySerializer
     filterset_fields = ['site', 'organization', 'employee']
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        is_global = self.request.query_params.get('is_global')
+        if is_global == 'true':
+            qs = qs.filter(employee__isnull=True, site__isnull=True, organization__isnull=True)
+        return qs
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        instance = serializer.save()
+        
+        # If policy is created as global but user is site-scoped, auto-assign their site
+        if not instance.site and not instance.organization and not instance.employee:
+            emp = getattr(user, 'employee_profile', None)
+            if emp:
+                if emp.role == 'site_admin' or (emp.dynamic_role and emp.dynamic_role.access_scope == 'Location'):
+                    instance.site = emp.site
+                    instance.save(update_fields=['site'])
+                elif emp.dynamic_role and emp.dynamic_role.access_scope in ['Corporate', 'Region']:
+                    instance.organization = emp.organization
+                    instance.save(update_fields=['organization'])
+
 
 
 class BranchViewSet(DataIsolationMixin, viewsets.ModelViewSet):

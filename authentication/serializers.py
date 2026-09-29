@@ -44,10 +44,12 @@ class UserProfileSerializer(serializers.ModelSerializer):
     org_name = serializers.SerializerMethodField()
     photo_url = serializers.SerializerMethodField()
     is_wfh = serializers.SerializerMethodField()
+    branding_text = serializers.SerializerMethodField()
+    logo_url = serializers.SerializerMethodField()
     
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'role', 'employee_id', 'first_name', 'last_name', 'permissions', 'role_name', 'dashboard_type', 'site_name', 'org_name', 'photo_url', 'is_wfh')
+        fields = ('id', 'username', 'email', 'role', 'employee_id', 'first_name', 'last_name', 'permissions', 'role_name', 'dashboard_type', 'site_name', 'org_name', 'photo_url', 'is_wfh', 'branding_text', 'logo_url')
 
     def get_employee_id(self, obj):
         return obj.employee_profile.code if hasattr(obj, 'employee_profile') and obj.employee_profile else None
@@ -140,3 +142,24 @@ class UserProfileSerializer(serializers.ModelSerializer):
             from organisation.models import AttendancePolicy
             return AttendancePolicy.objects.filter(wfh_employees=obj.employee_profile).exists()
         return False
+
+    def get_branding_text(self, obj):
+        from organisation.models import Site
+        site = Site.objects.filter(contact_email=obj.email).first()
+        if not site and hasattr(obj, 'employee_profile') and obj.employee_profile and obj.employee_profile.site:
+            site = obj.employee_profile.site
+        if site:
+            return site.branding_text
+        return None
+
+    def get_logo_url(self, obj):
+        from organisation.models import Site
+        site = Site.objects.filter(contact_email=obj.email).first()
+        if not site and hasattr(obj, 'employee_profile') and obj.employee_profile and obj.employee_profile.site:
+            site = obj.employee_profile.site
+        if site and site.logo:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(site.logo.url)
+            return site.logo.url
+        return None
