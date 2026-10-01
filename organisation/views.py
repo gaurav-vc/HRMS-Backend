@@ -239,11 +239,11 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         user = self.request.user
-        org = None
-        if hasattr(user, 'employee_profile') and user.employee_profile and user.employee_profile.organization:
-            org = user.employee_profile.organization
-            
-        site = serializer.save(organization=org)
+        
+        if hasattr(user, 'employee_profile') and user.employee_profile and user.employee_profile.role != 'super_admin' and user.employee_profile.organization:
+            site = serializer.save(organization=user.employee_profile.organization)
+        else:
+            site = serializer.save()
         
         # Auto-enroll the creator into the new site so it shows up in their dashboard immediately
         # Skip this for super_admin and org_admin to prevent them from showing up in the site's employee list
