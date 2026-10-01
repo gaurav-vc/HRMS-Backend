@@ -1,7 +1,7 @@
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from authentication.permissions import IsSuperAdmin
+from authentication.permissions import IsSuperAdmin, DataIsolationMixin
 from .models import Organization, Invoice
 from .serializers import OrganizationSerializer, InvoiceSerializer
 from django.core.mail import send_mail
