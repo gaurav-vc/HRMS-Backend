@@ -246,9 +246,11 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         site = serializer.save(organization=org)
         
         # Auto-enroll the creator into the new site so it shows up in their dashboard immediately
+        # Skip this for super_admin and org_admin to prevent them from showing up in the site's employee list
         if hasattr(user, 'employee_profile') and user.employee_profile:
-            if site not in user.employee_profile.enrolled_sites.all():
-                user.employee_profile.enrolled_sites.add(site)
+            emp = user.employee_profile
+            if emp.role not in ['super_admin', 'org_admin'] and site not in emp.enrolled_sites.all():
+                emp.enrolled_sites.add(site)
                 
         origin = self.request.headers.get('Origin')
         provision_contact_person(site, origin=origin)

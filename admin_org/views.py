@@ -85,7 +85,7 @@ def provision_organization_admin(org):
         threading.Thread(target=send_mail_sync, args=(subject, message, [email])).start()
 
 
-class OrganizationViewSet(viewsets.ModelViewSet):
+class OrganizationViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     permission_classes = [IsSuperAdmin]
     queryset = Organization.objects.all()
     serializer_class = OrganizationSerializer
@@ -103,7 +103,7 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({"error": str(e)}, status=500)
 
-class InvoiceViewSet(viewsets.ModelViewSet):
+class InvoiceViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     permission_classes = [IsSuperAdmin]
     queryset = Invoice.objects.all()
     serializer_class = InvoiceSerializer

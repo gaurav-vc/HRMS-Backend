@@ -106,7 +106,7 @@ class LeavePolicyConfigAPIView(APIView):
             return Response(serializer.data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-class LeaveTypeViewSet(viewsets.ReadOnlyModelViewSet):
+class LeaveTypeViewSet(DataIsolationMixin, viewsets.ReadOnlyModelViewSet):
     queryset = LeaveType.objects.all()
     serializer_class = LeaveTypeSerializer
 
@@ -124,7 +124,7 @@ class LeaveTypeViewSet(viewsets.ReadOnlyModelViewSet):
             print("LeaveType Query Error:", traceback.format_exc())
             return super().get_queryset()
 
-class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
+class LeaveBalanceViewSet(DataIsolationMixin, viewsets.ReadOnlyModelViewSet):
     serializer_class = LeaveBalanceSerializer
 
     def get_queryset(self):
@@ -422,6 +422,6 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             "rejected": rejected
         })
 
-class HolidayViewSet(viewsets.ModelViewSet):
+class HolidayViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = Holiday.objects.all()
     serializer_class = HolidaySerializer

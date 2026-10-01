@@ -6,11 +6,11 @@ from .models import OrganizationNodeType, OrganizationNode, OrganizationAuditLog
 from .serializers import OrganizationNodeTypeSerializer, OrganizationNodeSerializer, OrganizationAuditLogSerializer
 from .engine import HierarchyEngine
 
-class OrganizationNodeTypeViewSet(viewsets.ModelViewSet):
+class OrganizationNodeTypeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = OrganizationNodeType.objects.all().order_by('level_order')
     serializer_class = OrganizationNodeTypeSerializer
 
-class OrganizationNodeViewSet(viewsets.ModelViewSet):
+class OrganizationNodeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = OrganizationNode.objects.all()
     serializer_class = OrganizationNodeSerializer
 
@@ -269,6 +269,6 @@ class OrganizationNodeViewSet(viewsets.ModelViewSet):
                 
         return Response(results)
 
-class OrganizationAuditLogViewSet(viewsets.ReadOnlyModelViewSet):
+class OrganizationAuditLogViewSet(DataIsolationMixin, viewsets.ReadOnlyModelViewSet):
     queryset = OrganizationAuditLog.objects.all().order_by('-timestamp')
     serializer_class = OrganizationAuditLogSerializer

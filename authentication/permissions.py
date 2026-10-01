@@ -174,55 +174,96 @@ def isolate_queryset(qs, user):
     if admin_sites.exists():
         from django.db.models import Q
         if hasattr(qs.model, 'site') and qs.model.__name__ not in ['Site', 'Employee', 'SalaryStructure']:
-            return qs.filter(Q(site__in=admin_sites) | Q(site__isnull=True)).distinct()
+            if qs.model.__name__ in ['AttendancePolicy']:
+                return qs.filter(Q(site__in=admin_sites) | Q(site__isnull=True, organization__isnull=True)).distinct()
+            return qs.filter(site__in=admin_sites).distinct()
+            
         if qs.model.__name__ == 'SalaryStructure':
             return qs.filter(site__in=admin_sites)
         if hasattr(qs.model, 'employee'):
-            return qs.filter(Q(employee__site__in=admin_sites) | Q(employee__enrolled_sites__in=admin_sites)).distinct()
+            return qs.filter(Q(employee__site__in=admin_sites) | Q(employee__enrolled_sites__in=admin_sites)).exclude(employee__role='super_admin').distinct()
         if qs.model.__name__ == 'Employee':
-            return qs.filter(Q(site__in=admin_sites) | Q(enrolled_sites__in=admin_sites)).distinct()
+            return qs.filter(Q(site__in=admin_sites) | Q(enrolled_sites__in=admin_sites)).exclude(role='super_admin').distinct()
             
         org_ids = [x for x in admin_sites.values_list('organization_id', flat=True).distinct() if x is not None]
-        has_null_org = admin_sites.filter(organization__isnull=True).exists()
+        
+        # Determine the entities that these sites belong to, so we can isolate Departments, Designations, etc.
+        entity_ids = []
+        for s in admin_sites.select_related('branch__entity'):
+            if s.branch and s.branch.entity_id:
+                entity_ids.append(s.branch.entity_id)
+        entity_ids = list(set(entity_ids))
 
         if qs.model.__name__ == 'Site':
             return qs.filter(id__in=admin_sites.values_list('id', flat=True))
             
         def build_q(field_prefix=''):
-            q = Q(**{f'{field_prefix}organization_id__in': org_ids})
-            if has_null_org:
-                q |= Q(**{f'{field_prefix}organization__isnull': True})
+            q = Q(id__in=[])
+            if org_ids:
+                q |= Q(**{f'{field_prefix}organization_id__in': org_ids})
             return q
 
         if qs.model.__name__ == 'Organization':
-            q = Q(id__in=org_ids)
-            # Cannot have organization__isnull=True on Organization itself
-            return qs.filter(q)
+            if org_ids:
+                return qs.filter(id__in=org_ids)
+            return qs.none()
+            
         if qs.model.__name__ == 'Entity':
-            return qs.filter(build_q())
+            q = build_q()
+            if entity_ids:
+                q |= Q(id__in=entity_ids)
+            return qs.filter(q)
+            
         if qs.model.__name__ == 'Branch':
-            return qs.filter(build_q('entity__'))
+            q = build_q('entity__')
+            if entity_ids:
+                q |= Q(entity_id__in=entity_ids)
+            return qs.filter(q)
+            
         if qs.model.__name__ == 'Department':
-            return qs.filter(build_q('entity__'))
+            q = build_q('entity__')
+            if entity_ids:
+                q |= Q(entity_id__in=entity_ids)
+            return qs.filter(q)
+            
         if qs.model.__name__ == 'Role':
-            return qs.filter(build_q())
+            q = build_q()
+            # Allow seeing global roles (no org, no dept)
+            q |= Q(organization__isnull=True, department__isnull=True)
+            if entity_ids:
+                q |= Q(department__entity_id__in=entity_ids)
+            return qs.filter(q)
+            
         if qs.model.__name__ == 'Designation':
-            return qs.filter(build_q('department__entity__'))
+            q = build_q('department__entity__')
+            if entity_ids:
+                q |= Q(department__entity_id__in=entity_ids)
+            return qs.filter(q)
             
         if hasattr(qs.model, 'organization'):
             org_field = qs.model._meta.get_field('organization')
             if org_field.is_relation and org_field.related_model.__name__ == 'Entity':
-                return qs.filter(build_q('organization__'))
+                q = build_q('organization__')
+                if entity_ids:
+                    q |= Q(organization_id__in=entity_ids)
+                return qs.filter(q)
             else:
                 return qs.filter(build_q())
+                
         if hasattr(qs.model, 'entity'):
-            return qs.filter(build_q('entity__'))
+            q = build_q('entity__')
+            if entity_ids:
+                q |= Q(entity_id__in=entity_ids)
+            return qs.filter(q)
+            
         if hasattr(qs.model, 'department'):
-            return qs.filter(build_q('department__entity__'))
+            q = build_q('department__entity__')
+            if entity_ids:
+                q |= Q(department__entity_id__in=entity_ids)
+            return qs.filter(q)
+            
         if hasattr(qs.model, 'structure'):
             return qs.filter(structure__site__in=admin_sites)
-        if qs.model.__name__ == 'SalaryStructure':
-            return qs.filter(site__in=admin_sites)
 
         return qs.none()
 
@@ -313,13 +354,15 @@ def isolate_queryset(qs, user):
             if qs.model.__name__ == 'AttendancePolicy':
                 return qs.filter(Q(site__in=employee.enrolled_sites.all()) | Q(site=employee.site) | Q(employee__site=employee.site) | Q(employee__enrolled_sites=employee.site) | Q(employee__isnull=True, site__isnull=True, organization__isnull=True)).distinct()
             if hasattr(qs.model, 'site') and qs.model.__name__ not in ['Site', 'Employee', 'SalaryStructure']:
-                return qs.filter(site_filter | Q(site__isnull=True)).distinct()
+                if qs.model.__name__ in ['AttendancePolicy']:
+                    return qs.filter(site_filter | Q(site__isnull=True, organization__isnull=True)).distinct()
+                return qs.filter(site_filter).distinct()
             if qs.model.__name__ == 'SalaryStructure':
                 return qs.filter(site_filter)
             if hasattr(qs.model, 'employee'):
                 return qs.filter(Q(employee__site=employee.site) | Q(employee__enrolled_sites=employee.site)).distinct()
             if qs.model.__name__ == 'Employee':
-                return qs.filter(Q(site=employee.site) | Q(enrolled_sites=employee.site)).distinct()
+                return qs.filter(Q(site=employee.site) | Q(enrolled_sites=employee.site)).exclude(role='super_admin').distinct()
             if qs.model.__name__ == 'Site':
                 return qs.model.objects.filter(Q(id=employee.site_id) | Q(id__in=employee.enrolled_sites.all())).distinct()
             if hasattr(qs.model, 'entity'):
@@ -349,7 +392,7 @@ def isolate_queryset(qs, user):
         if hasattr(qs.model, 'employee'):
             return qs.filter(Q(employee__site=employee.site) | Q(employee__enrolled_sites=employee.site)).distinct()
         if qs.model.__name__ == 'Employee':
-            return qs.filter(Q(site=employee.site) | Q(enrolled_sites=employee.site)).distinct()
+            return qs.filter(Q(site=employee.site) | Q(enrolled_sites=employee.site)).exclude(role='super_admin').distinct()
 
     if role in ('hr', 'manager'):
         from django.db.models import Q
@@ -381,7 +424,7 @@ def isolate_queryset(qs, user):
         if hasattr(qs.model, 'employee'):
             return qs.filter(employee__organization_id=manager_org, employee__site_id=manager_site)
         if qs.model.__name__ == 'Employee':
-            return qs.filter(organization_id=manager_org, site_id=manager_site)
+            return qs.filter(organization_id=manager_org, site_id=manager_site).exclude(role='super_admin')
 
     # ── DEFAULT: employee sees only their own records (and their site's structural data) ────────────────────────
     if hasattr(qs.model, 'employee'):
@@ -394,7 +437,7 @@ def isolate_queryset(qs, user):
         site_filter = Q(site=employee.site) if employee.site else Q(id=employee.id)
         if employee.enrolled_sites.exists():
             site_filter |= Q(site__in=employee.enrolled_sites.all())
-        return qs.filter(site_filter).distinct()
+        return qs.filter(site_filter).exclude(role='super_admin').distinct()
         
     if qs.model.__name__ == 'Site':
         from django.db.models import Q
@@ -423,7 +466,8 @@ def isolate_queryset(qs, user):
             elif hasattr(qs.model, 'entity'):
                 site_filter |= Q(site__isnull=True, entity=entity)
             else:
-                site_filter |= Q(site__isnull=True)
+                if qs.model.__name__ in ['AttendancePolicy']:
+                    site_filter |= Q(site__isnull=True)
                 
             return qs.filter(site_filter).distinct()
             

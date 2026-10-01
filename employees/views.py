@@ -631,7 +631,7 @@ class OfferTemplateViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
-class OfferLetterViewSet(viewsets.ModelViewSet):
+class OfferLetterViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Offer Letters'
     queryset = OfferLetter.objects.all().order_by('-created_at')
     serializer_class = OfferLetterSerializer

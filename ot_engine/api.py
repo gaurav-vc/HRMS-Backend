@@ -19,12 +19,12 @@ class CompOffBalanceSerializer(serializers.ModelSerializer):
         model = CompOffBalance
         fields = '__all__'
 
-class OTPolicyViewSet(viewsets.ModelViewSet):
+class OTPolicyViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = OTPolicy.objects.all()
     serializer_class = OTPolicySerializer
     permission_classes = [permissions.IsAuthenticated]
 
-class OTRequestViewSet(viewsets.ModelViewSet):
+class OTRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = OTRequest.objects.all()
     serializer_class = OTRequestSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -37,7 +37,7 @@ class OTRequestViewSet(viewsets.ModelViewSet):
         ot_req.save()
         return Response({"status": "Approved"})
 
-class CompOffViewSet(viewsets.ReadOnlyModelViewSet):
+class CompOffViewSet(DataIsolationMixin, viewsets.ReadOnlyModelViewSet):
     queryset = CompOffBalance.objects.all()
     serializer_class = CompOffBalanceSerializer
     permission_classes = [permissions.IsAuthenticated]
