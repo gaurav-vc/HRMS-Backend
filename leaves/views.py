@@ -11,6 +11,7 @@ from django.db.models import Q
 import threading
 from django.core.mail import EmailMultiAlternatives
 from django.utils.html import strip_tags
+from authentication.permissions import DataIsolationMixin
 
 def send_leave_email_async(emp_email, emp_name, status, start_date, end_date, total_days, reason, manager_comments):
     if not emp_email:
@@ -224,7 +225,7 @@ class LeaveBalanceViewSet(DataIsolationMixin, viewsets.ReadOnlyModelViewSet):
             
         return qs
 
-from authentication.permissions import DataIsolationMixin
+
 
 class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Leave Requests'
