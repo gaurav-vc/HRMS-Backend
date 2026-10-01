@@ -125,11 +125,15 @@ def isolate_queryset(qs, user):
         return qs.none()
 
     if user.is_superuser:
+        if qs.model.__name__ == 'Site':
+            return qs.filter(is_sub_site=False)
         return qs
 
     employee = getattr(user, 'employee_profile', None)
 
     if employee and employee.role == 'super_admin':
+        if qs.model.__name__ == 'Site':
+            return qs.filter(is_sub_site=False)
         return qs
 
     if qs.model.__name__ == 'Holiday':

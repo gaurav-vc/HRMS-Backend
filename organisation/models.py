@@ -59,6 +59,7 @@ class Site(models.Model):
     qr_enabled = models.BooleanField(default=True)
     face_enabled = models.BooleanField(default=True)
     is_saturday_working = models.BooleanField(default=False)
+    is_sub_site = models.BooleanField(default=False)
     
     # Branding for Site
     logo = models.ImageField(upload_to='site_logos/', null=True, blank=True)

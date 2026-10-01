@@ -238,10 +238,12 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             status='Pending Approval'
         )
 
-        # 5. Dispatch Welcome Email
-        login_url = "https://hrms.vibecopilot.ai/"
-        subject = "Welcome to HRMS - Your Login Credentials"
-        message = f"""Hello {first_name},
+        # 5. Dispatch Welcome Email (Skipped by default unless send_email is True)
+        send_email_flag = raw_data.get('send_email', False)
+        if str(send_email_flag).lower() == 'true':
+            login_url = "https://hrms.vibecopilot.ai/"
+            subject = "Welcome to HRMS - Your Login Credentials"
+            message = f"""Hello {first_name},
 
 Welcome to the HRMS portal! Your account has been successfully created.
 
@@ -254,17 +256,19 @@ Please log in and change your password immediately.
 Regards,
 HRMS Admin
 """
-        try:
-            import threading
-            # Send email in background to prevent slow saving
-            threading.Thread(target=send_mail, args=(
-                subject,
-                message,
-                settings.DEFAULT_FROM_EMAIL,
-                [email]
-            ), kwargs={'fail_silently': True}).start()
-        except Exception as e:
-            print(f"Failed to send email to {email}: {e}")
+            try:
+                import threading
+                from django.core.mail import send_mail
+                from django.conf import settings
+                # Send email in background to prevent slow saving
+                threading.Thread(target=send_mail, args=(
+                    subject,
+                    message,
+                    settings.DEFAULT_FROM_EMAIL,
+                    [email]
+                ), kwargs={'fail_silently': True}).start()
+            except Exception as e:
+                print(f"Failed to send email to {email}: {e}")
 
         # 6. Sync with Organization Engine
         try:
@@ -466,6 +470,56 @@ HRMS Admin
         except Exception as e:
             print(f"Failed to sync org engine graph deletion: {e}")
         instance.delete()
+
+    @action(detail=False, methods=['POST'], url_path='trigger_onboarding_emails')
+    def trigger_onboarding_emails(self, request):
+        employee_ids = request.data.get('employee_ids', [])
+        if not employee_ids:
+            return Response({"error": "No employees selected."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        employees = isolate_queryset(Employee.objects.all(), request.user).filter(id__in=employee_ids)
+        sent_count = 0
+        import secrets
+        import string
+        from django.core.mail import send_mail
+        from django.conf import settings
+        import threading
+        
+        alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+        
+        for emp in employees:
+            if emp.user and emp.email:
+                new_password = ''.join(secrets.choice(alphabet) for _ in range(10))
+                emp.user.set_password(new_password)
+                emp.user.save()
+                
+                login_url = "https://hrms.vibecopilot.ai/"
+                subject = "Welcome to HRMS - Your Login Credentials"
+                message = f"""Hello {emp.first_name},
+
+Welcome to the HRMS portal! Your account is ready.
+
+Website: {login_url}
+Login ID: {emp.email}
+Password: {new_password}
+
+Please log in and change your password immediately.
+
+Regards,
+HRMS Admin
+"""
+                try:
+                    threading.Thread(target=send_mail, args=(
+                        subject,
+                        message,
+                        settings.DEFAULT_FROM_EMAIL,
+                        [emp.email]
+                    ), kwargs={'fail_silently': True}).start()
+                    sent_count += 1
+                except Exception as e:
+                    print(f"Failed to send email to {emp.email}: {e}")
+
+        return Response({"success": True, "sent_count": sent_count})
 
     @action(detail=True, methods=['get'])
     def audit_logs(self, request, pk=None):

@@ -125,7 +125,7 @@ class DashboardStatsAPIView(APIView):
             # Stats for super admin
             super_admin_stats = {
                 "totalRevenue": total_revenue,
-                "activeSites": Site.objects.filter(status='Active').count(),
+                "activeSites": Site.objects.filter(status='Active', is_sub_site=False).count(),
                 "totalUsers": Employee.objects.count(),
                 "totalCompany": Organization.objects.count(),
                 "moduleWiseRevenue": []
@@ -152,14 +152,14 @@ class DashboardStatsAPIView(APIView):
                     data_point = {"name": month_name}
                     for org in top_orgs:
                         # safe filtering by date if created_at exists
-                        count = Site.objects.filter(organization=org, created_at__date__lte=date(m.year, m.month, 28)).count()
+                        count = Site.objects.filter(organization=org, created_at__date__lte=date(m.year, m.month, 28), is_sub_site=False).count()
                         data_point[org.name] = count
                     company_wise_data.append(data_point)
                 
                 module_wise_data = []
                 for m in months:
                     month_name = m.strftime('%b')
-                    count = Site.objects.filter(created_at__date__lte=date(m.year, m.month, 28)).count()
+                    count = Site.objects.filter(created_at__date__lte=date(m.year, m.month, 28), is_sub_site=False).count()
                     module_wise_data.append({"name": month_name, "site": count})
                     
                 super_admin_stats["companyWiseSite"] = company_wise_data
