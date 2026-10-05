@@ -228,10 +228,20 @@ def isolate_queryset(qs, user):
             
         if qs.model.__name__ == 'Role':
             q = build_q()
-            # Allow seeing global roles (no org, no dept)
-            q |= Q(organization__isnull=True, department__isnull=True)
-            if entity_ids:
-                q |= Q(department__entity_id__in=entity_ids)
+            if hasattr(qs.model, 'site'):
+                q = Q(site__in=admin_sites)
+                # Global roles (no org)
+                q |= Q(organization__isnull=True, department__isnull=True, site__isnull=True)
+                # Org-wide roles with Corporate scope
+                q |= Q(organization_id__in=org_ids, site__isnull=True, access_scope='Corporate')
+                # Roles tied to departments of the site's entities (legacy fallback)
+                if entity_ids:
+                    q |= Q(department__entity_id__in=entity_ids, site__isnull=True)
+            else:
+                # Fallback if migration not run yet
+                q |= Q(organization__isnull=True, department__isnull=True)
+                if entity_ids:
+                    q |= Q(department__entity_id__in=entity_ids)
             return qs.filter(q)
             
         if qs.model.__name__ == 'Designation':
@@ -354,8 +364,8 @@ def isolate_queryset(qs, user):
             if qs.model.__name__ == 'AttendancePolicy':
                 return qs.filter(Q(site__in=employee.enrolled_sites.all()) | Q(site=employee.site) | Q(employee__site=employee.site) | Q(employee__enrolled_sites=employee.site) | Q(employee__isnull=True, site__isnull=True, organization__isnull=True)).distinct()
             if hasattr(qs.model, 'site') and qs.model.__name__ not in ['Site', 'Employee', 'SalaryStructure']:
-                if qs.model.__name__ in ['AttendancePolicy']:
-                    return qs.filter(site_filter | Q(site__isnull=True, organization__isnull=True)).distinct()
+                if qs.model.__name__ in ['Role']:
+                    return qs.filter(site_filter | Q(site__isnull=True, organization_id=employee.organization_id) | Q(site__isnull=True, organization__isnull=True)).distinct()
                 return qs.filter(site_filter).distinct()
             if qs.model.__name__ == 'SalaryStructure':
                 return qs.filter(site_filter)
@@ -417,6 +427,12 @@ def isolate_queryset(qs, user):
                 return qs.filter(entity=employee.entity)
                 
         # Filter by org and site
+        if qs.model.__name__ in ['AttendancePolicy', 'Role']:
+            q = Q(organization_id=manager_org, site_id=manager_site)
+            q |= Q(organization_id=manager_org, site__isnull=True)
+            q |= Q(organization__isnull=True, site__isnull=True)
+            return qs.filter(q).distinct()
+            
         if hasattr(qs.model, 'site') and hasattr(qs.model, 'organization'):
             return qs.filter(organization_id=manager_org, site_id=manager_site)
         if hasattr(qs.model, 'site'):
