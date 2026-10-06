@@ -640,7 +640,8 @@ class OfferLetterViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def dashboard_metrics(self, request):
         from django.db.models import Count
-        metrics = self.queryset.values('status').annotate(count=Count('status'))
+        # Use get_queryset() to enforce DataIsolationMixin RBAC instead of unfiltered self.queryset
+        metrics = self.get_queryset().values('status').annotate(count=Count('status'))
         metrics_dict = {m['status']: m['count'] for m in metrics}
         
         # Default all statuses to 0
@@ -650,7 +651,7 @@ class OfferLetterViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         from datetime import date
         from django.db.models.functions import Coalesce
         today = date.today()
-        upcoming_qs = self.queryset.annotate(
+        upcoming_qs = self.get_queryset().annotate(
             effective_joining_date=Coalesce('joining_date', 'employee__doj')
         ).filter(
             status__in=['Pending Approval', 'Awaiting Acceptance', 'Accepted'],
@@ -659,7 +660,7 @@ class OfferLetterViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         
         upcoming = OfferLetterSerializer(upcoming_qs, many=True).data
         
-        recent_qs = self.queryset.all().order_by('-created_at')[:5]
+        recent_qs = self.get_queryset().order_by('-created_at')[:5]
         recent = OfferLetterSerializer(recent_qs, many=True).data
         
         return Response({
@@ -1046,7 +1047,8 @@ class OfferLetterViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             return Response({"error": "employee_id and template_id are required"}, status=400)
             
         try:
-            employee = Employee.objects.get(id=employee_id)
+            from authentication.permissions import isolate_queryset
+            employee = isolate_queryset(Employee.objects.all(), request.user).get(id=employee_id)
             html, _ = self._render_offer_html(employee, template_id, request.user)
             return Response({"html": html})
         except Employee.DoesNotExist:
@@ -1102,7 +1104,8 @@ class OfferLetterViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             return Response({"error": "employee_id, template_id, and html_content are required"}, status=400)
             
         try:
-            employee = Employee.objects.get(id=employee_id)
+            from authentication.permissions import isolate_queryset
+            employee = isolate_queryset(Employee.objects.all(), request.user).get(id=employee_id)
             
             from .models import OfferLetter
             import uuid
