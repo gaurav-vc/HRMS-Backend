@@ -771,6 +771,136 @@ class AttendanceViewSet(viewsets.ViewSet):
         return Response(DailyAttendanceSerializer(queryset, many=True).data)
 
     @action(detail=False, methods=['post'])
+    def upload_csv(self, request):
+        import csv
+        import io
+        from django.utils.dateparse import parse_date, parse_datetime
+        from django.utils import timezone
+        
+        file_obj = request.FILES.get('file')
+        if not file_obj:
+            return Response({"error": "No file provided"}, status=400)
+            
+        try:
+            csv_file = io.StringIO(file_obj.read().decode('utf-8'))
+            reader = csv.DictReader(csv_file)
+            
+            success_count = 0
+            error_count = 0
+            errors = []
+            
+            for i, row in enumerate(reader):
+                try:
+                    emp_code = row.get('employee_code') or row.get('emp_id') or row.get('Employee Code')
+                    date_str = row.get('date') or row.get('Date')
+                    check_in_str = row.get('check_in') or row.get('in_time') or row.get('In Time')
+                    check_out_str = row.get('check_out') or row.get('out_time') or row.get('Out Time')
+                    status = row.get('status') or row.get('Status') or 'Present'
+                    
+                    if not emp_code or not date_str:
+                        error_count += 1
+                        errors.append(f"Row {i+1}: Missing employee code or date")
+                        continue
+                        
+                    try:
+                        allowed_emps = isolate_queryset(Employee.objects.all(), request.user)
+                        employee = allowed_emps.get(code=emp_code)
+                    except Employee.DoesNotExist:
+                        error_count += 1
+                        errors.append(f"Row {i+1}: Employee with code {emp_code} not found or access denied")
+                        continue
+                        
+                    att_date = parse_date(date_str)
+                    if not att_date:
+                        try:
+                            import datetime
+                            att_date = datetime.datetime.strptime(date_str, "%d-%m-%Y").date()
+                        except:
+                            try:
+                                att_date = datetime.datetime.strptime(date_str, "%Y/%m/%d").date()
+                            except:
+                                error_count += 1
+                                errors.append(f"Row {i+1}: Invalid date format {date_str}")
+                                continue
+                        
+                    check_in = None
+                    if check_in_str and check_in_str.strip() not in ['—', '-', '']:
+                        if len(check_in_str) <= 8:
+                            check_in_str = f"{att_date.strftime('%Y-%m-%d')} {check_in_str}"
+                        check_in = parse_datetime(check_in_str)
+                        if not check_in:
+                            import datetime
+                            try:
+                                check_in = datetime.datetime.strptime(check_in_str, "%Y-%m-%d %H:%M:%S")
+                            except:
+                                pass
+                        if check_in and timezone.is_naive(check_in):
+                            check_in = timezone.make_aware(check_in)
+                            
+                    check_out = None
+                    if check_out_str and check_out_str.strip() not in ['—', '-', '']:
+                        if len(check_out_str) <= 8:
+                            check_out_str = f"{att_date.strftime('%Y-%m-%d')} {check_out_str}"
+                        check_out = parse_datetime(check_out_str)
+                        if not check_out:
+                            import datetime
+                            try:
+                                check_out = datetime.datetime.strptime(check_out_str, "%Y-%m-%d %H:%M:%S")
+                            except:
+                                pass
+                        if check_out and timezone.is_naive(check_out):
+                            check_out = timezone.make_aware(check_out)
+                            
+                    daily_att, created = DailyAttendance.objects.get_or_create(
+                        employee=employee,
+                        attendance_date=att_date,
+                        defaults={
+                            'site': employee.site,
+                            'organization': employee.entity,
+                            'first_check_in': check_in,
+                            'last_check_out': check_out,
+                            'attendance_status': status
+                        }
+                    )
+                    
+                    if not created:
+                        if check_in: daily_att.first_check_in = check_in
+                        if check_out: daily_att.last_check_out = check_out
+                        if status: daily_att.attendance_status = status
+                        daily_att.save()
+                        
+                    if check_in:
+                        PunchLog.objects.get_or_create(
+                            employee=employee,
+                            daily_attendance=daily_att,
+                            punch_time=check_in,
+                            punch_type='IN',
+                            defaults={'source': 'CSV_IMPORT', 'verification_status': 'VERIFIED'}
+                        )
+                    if check_out:
+                        PunchLog.objects.get_or_create(
+                            employee=employee,
+                            daily_attendance=daily_att,
+                            punch_time=check_out,
+                            punch_type='OUT',
+                            defaults={'source': 'CSV_IMPORT', 'verification_status': 'VERIFIED'}
+                        )
+                        
+                    success_count += 1
+                except Exception as e:
+                    error_count += 1
+                    errors.append(f"Row {i+1}: {str(e)}")
+                    
+            return Response({
+                "message": f"Processed {success_count + error_count} rows.",
+                "success": success_count,
+                "error": error_count,
+                "errors": errors
+            })
+        except Exception as e:
+            return Response({"error": str(e)}, status=500)
+
+    @action(detail=False, methods=['post'])
     def mark_absentees(self, request):
         target_date = request.data.get('date', timezone.now().date().isoformat())
         active_emps = Employee.objects.filter(status='Active')
