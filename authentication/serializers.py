@@ -49,7 +49,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'role', 'employee_id', 'first_name', 'last_name', 'permissions', 'role_name', 'dashboard_type', 'site_name', 'org_name', 'photo_url', 'is_wfh', 'branding_text', 'logo_url')
+        fields = ('id', 'username', 'email', 'role', 'employee_id', 'first_name', 'last_name', 'permissions', 'role_name', 'dashboard_type', 'site_name', 'org_name', 'photo_url', 'is_wfh', 'branding_text', 'logo_url', 'is_superuser')
 
     def get_employee_id(self, obj):
         return obj.employee_profile.code if hasattr(obj, 'employee_profile') and obj.employee_profile else None
