@@ -700,11 +700,24 @@ class AttendanceViewSet(viewsets.ViewSet):
                 if punch_type == 'IN':
                     if not daily_att.first_check_in:
                         daily_att.first_check_in = now
-                        shift_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
-                        if now > shift_start:
-                            daily_att.attendance_status = 'Late'
+                        from .models import ShiftAssignment
+                        import datetime
+                        shift_assignment = ShiftAssignment.objects.filter(employee=employee, date=today).first()
+                        if shift_assignment and shift_assignment.shift:
+                            shift = shift_assignment.shift
+                            cutoff_dt = datetime.datetime.combine(today, shift.start_time) + datetime.timedelta(minutes=shift.grace_minutes)
+                            if timezone.is_naive(cutoff_dt):
+                                cutoff_dt = timezone.make_aware(cutoff_dt)
+                            if now > cutoff_dt:
+                                daily_att.attendance_status = 'Late'
+                            else:
+                                daily_att.attendance_status = 'Present'
                         else:
-                            daily_att.attendance_status = 'Present'
+                            shift_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                            if now > shift_start:
+                                daily_att.attendance_status = 'Late'
+                            else:
+                                daily_att.attendance_status = 'Present'
                 else:
                     daily_att.last_check_out = now
                     
@@ -714,8 +727,7 @@ class AttendanceViewSet(viewsets.ViewSet):
                     daily_att.total_work_hours = round(hours, 2)
                     if hours > 8:
                         raw_ot = round(hours - 8, 2)
-                        # Overtime is only paid if it exceeds 2 hours
-                        daily_att.overtime_hours = raw_ot if raw_ot > 2.0 else 0.0
+                        daily_att.overtime_hours = raw_ot
                         if daily_att.attendance_status not in ['Late']:
                             daily_att.attendance_status = 'Present'
                     elif hours >= 4:
@@ -791,11 +803,47 @@ class AttendanceViewSet(viewsets.ViewSet):
             
             for i, row in enumerate(reader):
                 try:
-                    emp_code = row.get('employee_code') or row.get('emp_id') or row.get('Employee Code')
-                    date_str = row.get('date') or row.get('Date')
-                    check_in_str = row.get('check_in') or row.get('in_time') or row.get('In Time')
-                    check_out_str = row.get('check_out') or row.get('out_time') or row.get('Out Time')
-                    status = row.get('status') or row.get('Status') or 'Present'
+                    # Key normalization for robust header matching
+                    norm_row = {str(k).strip().lower(): v for k, v in row.items() if k is not None}
+                    
+                    emp_code = (
+                        row.get('employee_code') or row.get('emp_id') or row.get('Employee Code') or
+                        norm_row.get('employee_code') or norm_row.get('emp_id') or norm_row.get('code') or
+                        norm_row.get('emp code') or norm_row.get('empcode')
+                    )
+                    date_str = (
+                        row.get('date') or row.get('Date') or
+                        norm_row.get('date') or norm_row.get('attendance_date')
+                    )
+                    check_in_str = (
+                        row.get('check_in') or row.get('in_time') or row.get('In Time') or
+                        norm_row.get('check_in') or norm_row.get('in_time') or norm_row.get('checkin')
+                    )
+                    check_out_str = (
+                        row.get('check_out') or row.get('out_time') or row.get('Out Time') or
+                        norm_row.get('check_out') or norm_row.get('out_time') or norm_row.get('checkout')
+                    )
+                    status = (
+                        row.get('status') or row.get('Status') or
+                        norm_row.get('status') or 'Present'
+                    )
+
+                    # Dynamic OT - Hours detection: supports "OT - Hours", "OT Hours", "Overtime", "ot_hours", etc.
+                    ot_raw = (
+                        row.get('OT - Hours') or row.get('OT-Hours') or row.get('OT Hours') or
+                        row.get('Overtime') or row.get('Overtime Hours') or row.get('OT') or
+                        norm_row.get('ot - hours') or norm_row.get('ot-hours') or norm_row.get('ot hours') or
+                        norm_row.get('overtime') or norm_row.get('overtime hours') or norm_row.get('ot') or
+                        norm_row.get('ot_hours') or norm_row.get('overtime_hours')
+                    )
+                    parsed_ot = None
+                    if ot_raw is not None and str(ot_raw).strip() not in ['', '—', '-']:
+                        try:
+                            from decimal import Decimal
+                            val = float(str(ot_raw).strip())
+                            parsed_ot = Decimal(str(round(max(0.0, val), 2)))
+                        except (ValueError, TypeError):
+                            parsed_ot = None
                     
                     if not emp_code or not date_str:
                         error_count += 1
@@ -851,22 +899,44 @@ class AttendanceViewSet(viewsets.ViewSet):
                         if check_out and timezone.is_naive(check_out):
                             check_out = timezone.make_aware(check_out)
                             
+                    if (not status or status.strip().lower() == 'present') and check_in:
+                        from .models import ShiftAssignment
+                        import datetime
+                        shift_assignment = ShiftAssignment.objects.filter(employee=employee, date=att_date).first()
+                        if shift_assignment and shift_assignment.shift:
+                            shift = shift_assignment.shift
+                            cutoff_dt = datetime.datetime.combine(att_date, shift.start_time) + datetime.timedelta(minutes=shift.grace_minutes)
+                            if timezone.is_naive(cutoff_dt):
+                                cutoff_dt = timezone.make_aware(cutoff_dt)
+                            if check_in > cutoff_dt:
+                                status = 'Late'
+                        else:
+                            shift_start = check_in.replace(hour=9, minute=30, second=0, microsecond=0)
+                            if check_in > shift_start:
+                                status = 'Late'
+
+                    defaults_dict = {
+                        'site': employee.site,
+                        'organization': employee.entity,
+                        'first_check_in': check_in,
+                        'last_check_out': check_out,
+                        'attendance_status': status
+                    }
+                    if parsed_ot is not None:
+                        defaults_dict['overtime_hours'] = parsed_ot
+
                     daily_att, created = DailyAttendance.objects.get_or_create(
                         employee=employee,
                         attendance_date=att_date,
-                        defaults={
-                            'site': employee.site,
-                            'organization': employee.entity,
-                            'first_check_in': check_in,
-                            'last_check_out': check_out,
-                            'attendance_status': status
-                        }
+                        defaults=defaults_dict
                     )
                     
                     if not created:
                         if check_in: daily_att.first_check_in = check_in
                         if check_out: daily_att.last_check_out = check_out
                         if status: daily_att.attendance_status = status
+                        if parsed_ot is not None:
+                            daily_att.overtime_hours = parsed_ot
                         daily_att.save()
                         
                     if check_in:
@@ -899,6 +969,49 @@ class AttendanceViewSet(viewsets.ViewSet):
             })
         except Exception as e:
             return Response({"error": str(e)}, status=500)
+
+    @action(detail=False, methods=['post', 'delete'])
+    def clear_records(self, request):
+        month = request.data.get('month')
+        employee_code = request.data.get('employee_code')
+        entity_id = request.data.get('entity_id')
+        start_date = request.data.get('start_date')
+        end_date = request.data.get('end_date')
+        
+        qs = isolate_queryset(DailyAttendance.objects.all(), request.user)
+        if month:
+            parts = str(month).strip().split('-')
+            if len(parts) == 2:
+                try:
+                    qs = qs.filter(attendance_date__year=int(parts[0]), attendance_date__month=int(parts[1]))
+                except ValueError:
+                    pass
+        elif start_date and end_date:
+            qs = qs.filter(attendance_date__range=[start_date, end_date])
+            
+        if employee_code:
+            qs = qs.filter(employee__code=employee_code)
+        if entity_id:
+            qs = qs.filter(employee__entity_id=entity_id)
+            
+        count = qs.count()
+        PunchLog.objects.filter(daily_attendance__in=qs).delete()
+        qs.delete()
+        return Response({"message": f"Successfully deleted {count} attendance records.", "deleted_count": count})
+
+    @action(detail=False, methods=['delete'])
+    def delete_single(self, request):
+        record_id = request.data.get('id') or request.query_params.get('id')
+        if not record_id:
+            return Response({"error": "Record ID is required"}, status=400)
+        try:
+            qs = isolate_queryset(DailyAttendance.objects.all(), request.user)
+            record = qs.get(id=record_id)
+            PunchLog.objects.filter(daily_attendance=record).delete()
+            record.delete()
+            return Response({"message": "Attendance record deleted successfully."})
+        except DailyAttendance.DoesNotExist:
+            return Response({"error": "Record not found"}, status=404)
 
     @action(detail=False, methods=['post'])
     def mark_absentees(self, request):

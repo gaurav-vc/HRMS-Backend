@@ -1,4 +1,5 @@
-from decimal import Decimal
+import decimal
+from decimal import Decimal, ROUND_HALF_UP
 from django.db import transaction
 from django.utils import timezone
 from employees.models import Employee
@@ -149,7 +150,10 @@ class PayrollService:
             if 'late_penalties' in emp_override: late_penalty_days = float(emp_override['late_penalties'])
             elif 'latePenalties' in emp_override: late_penalty_days = float(emp_override['latePenalties'])
             
-            if 'ot' in emp_override: overtime_hours = Decimal(str(emp_override['ot']))
+            if 'ot' in emp_override: overtime_hours = Decimal(str(emp_override['ot'] or 0))
+            elif 'ot_hours' in emp_override: overtime_hours = Decimal(str(emp_override['ot_hours'] or 0))
+            elif 'overtimeHours' in emp_override: overtime_hours = Decimal(str(emp_override['overtimeHours'] or 0))
+            elif 'overtime' in emp_override: overtime_hours = Decimal(str(emp_override['overtime'] or 0))
         
         worked_days = float(present_count) + (float(half_day_count) * 0.5)
         
@@ -179,6 +183,7 @@ class PayrollService:
             'actual_present_days': Decimal(str(worked_days)),
             'total_days': Decimal(str(total_days)),
             'overtime_hours': Decimal(str(overtime_hours)),
+            'ot_hours': Decimal(str(overtime_hours)),
             'absent_days': Decimal(str(absent_count)),
             'lop_days': Decimal(str(lop_days)),
             'half_day_count': Decimal(str(half_day_count)),
@@ -208,8 +213,12 @@ class PayrollService:
         
         # Inject Enterprise OT Engine Parameters
         context['ot_hours'] = context.get('overtime_hours', Decimal('0.00')) 
-        # For now, default multiplier is 1.5. A more advanced engine would fetch this from ShiftDefinition.
-        context['ot_multiplier'] = Decimal('1.50') 
+        try:
+            from ot_engine.models import OTPolicy
+            active_ot_policy = OTPolicy.objects.order_by('-effective_from').first()
+            context['ot_multiplier'] = active_ot_policy.multiplier if active_ot_policy else Decimal('1.50')
+        except Exception:
+            context['ot_multiplier'] = Decimal('1.50') 
         
         for rule in rules_dag:
             # PF Applicability Filter
@@ -342,6 +351,48 @@ class PayrollService:
                     defaults={'type': 'Earning', 'formula': 'reimbursement', 'is_statutory': False, 'effective_from': timezone.now().date()}
                 )
                 line_items.append({'rule': virtual_reimb_rule, 'amount': reimbursement_amt})
+
+        # ==========================================
+        # OVERTIME (OT) PAY INJECTION
+        # ==========================================
+        ot_hours = context.get('ot_hours', Decimal('0.00')) or Decimal('0.00')
+        if ot_hours > 0:
+            # Check if an existing component rule already handled Overtime
+            already_handled = any(
+                ('OVERTIME' in getattr(item['rule'], 'name', '').upper() or
+                 getattr(item['rule'], 'variable_code', '') in ['OT', 'OVERTIME', 'OT_PAY'] or
+                 'ot_hours' in (getattr(item['rule'], 'formula', '') or ''))
+                for item in line_items
+            )
+            if not already_handled:
+                total_days = context.get('total_days', Decimal('30.00'))
+                if total_days <= 0:
+                    total_days = Decimal('30.00')
+                basic_amt = context.get('basic', Decimal('0.00'))
+                if basic_amt <= 0:
+                    emp_ctc = Decimal(str(employee.ctc or 0))
+                    # Standard labor fallback: 50% of monthly CTC as basic wage if separate basic component not defined
+                    basic_amt = (emp_ctc / Decimal('12.0')) * Decimal('0.50') if emp_ctc > 0 else Decimal('0.00')
+                
+                # Standard hourly rate calculation: (basic_wage / total_days / 8.0)
+                hourly_rate = basic_amt / total_days / Decimal('8.00')
+                multiplier = context.get('ot_multiplier', Decimal('1.50'))
+                ot_pay = (hourly_rate * multiplier * ot_hours).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+                
+                if ot_pay > 0:
+                    total_gross += ot_pay
+                    virtual_ot_rule, _ = ComponentRule.objects.get_or_create(
+                        name="Overtime Allowance",
+                        defaults={
+                            'type': 'Earning',
+                            'formula': 'ot_hours * (basic / total_days / 8) * 1.5',
+                            'is_statutory': False,
+                            'effective_from': timezone.now().date()
+                        }
+                    )
+                    line_items.append({'rule': virtual_ot_rule, 'amount': ot_pay})
+                    context['Overtime Allowance'] = ot_pay
+                    context['ot_pay'] = ot_pay
 
         # ==========================================
         # LEAVE ENCASHMENT INJECTION
@@ -484,6 +535,9 @@ class PayrollService:
                                     item['amount'] = Decimal(str(emp_override['reimbursement']))
                                 elif ('INCENTIVE' in rule_name or 'BONUS' in rule_name) and 'incentive' in emp_override:
                                     item['amount'] = Decimal(str(emp_override['incentive']))
+                                elif ('OVERTIME' in rule_name or 'OT' in rule_name) and ('overtimePay' in emp_override or 'otAmount' in emp_override):
+                                    ot_override_amt = emp_override.get('overtimePay') or emp_override.get('otAmount')
+                                    item['amount'] = Decimal(str(ot_override_amt))
                         
                         if is_simulation:
                             slip = SimulatedPayslip(employee=emp, run=run, period=run.period, gross=gross, deductions=ded, net=net)

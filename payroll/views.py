@@ -272,11 +272,16 @@ class SalarySlipAPIView(APIView):
                     if perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1']:
                         can_view_confidential = True
             
-            # If period was missing, check if last_slip exists in isolated scope
+            # Determine all periods where payroll has been run or payslips exist
+            from payroll.models import PayrollRun
+            run_periods = set(filter(None, isolate_queryset(PayrollRun.objects.all(), user).values_list('period', flat=True)))
+            slip_periods = set(filter(None, isolate_queryset(Payslip.objects.all(), user).values_list('period', flat=True)))
+            all_available_periods = sorted(list(run_periods | slip_periods), reverse=True)
+            
+            # If period was missing, check if latest run/slip exists in isolated scope
             if not request.query_params.get('period'):
-                last_slip = isolate_queryset(Payslip.objects.all(), user).order_by('-id').first()
-                if last_slip:
-                    period = last_slip.period
+                if all_available_periods:
+                    period = all_available_periods[0]
                 else:
                     from django.utils import timezone
                     period = timezone.now().strftime('%Y-%m')
@@ -386,6 +391,14 @@ class SalarySlipAPIView(APIView):
                         attendance_date__lte=calc_end,
                         attendance_status='Absent'
                     ).count()
+
+                    late_count = DailyAttendance.objects.filter(
+                        employee=emp,
+                        attendance_date__gte=calc_start,
+                        attendance_date__lte=calc_end,
+                        attendance_status='Late'
+                    ).count()
+                    late_penalty_days = (late_count // 3) * 0.5
                     
                     from django.db.models import Sum
                     ot_agg = DailyAttendance.objects.filter(
@@ -407,7 +420,7 @@ class SalarySlipAPIView(APIView):
                         days_absent = calc_days
                     else:
                         days_present = min(worked_days, calc_days)
-                        days_paid = max(0.0, min(worked_days + float(days_off) + float(paid_leave_days) - float(absent_count) - float(lop_days), float(calc_days)))
+                        days_paid = max(0.0, min(worked_days + float(days_off) + float(paid_leave_days) - float(absent_count) - float(lop_days) - float(late_penalty_days), float(calc_days)))
                         days_absent = max(0.0, calc_days - days_paid)
                 
                 # Use the exact DB snapshot values without applying a secondary proration
@@ -463,7 +476,13 @@ class SalarySlipAPIView(APIView):
                     'daysOff': days_off,
                     'paidLeaves': float(paid_leave_days),
                     'daysAbsent': days_absent,
+                    'lopDays': float(lop_days),
+                    'lateMarks': int(late_count),
+                    'latePenalties': float(late_penalty_days),
+                    'halfDays': float(half_day_count),
+                    'ot': float(total_ot_hours) if 'total_ot_hours' in locals() else 0.0,
                     'overtimeHours': float(total_ot_hours) if 'total_ot_hours' in locals() else 0.0,
+                    'overtimePay': 0 if hide_money else float(components.get('Overtime Allowance', 0) or components.get('Overtime Pay', 0) or components.get('Overtime', 0)),
                     'error': getattr(slip, 'engine_error', None),
                     'leaveBalances': [
                         {
@@ -483,8 +502,9 @@ class SalarySlipAPIView(APIView):
                 'payroll_runs': list(PayrollRun.objects.values('id', 'period', 'entity_id', 'status')),
                 'exceptions': list(PayrollException.objects.values('error_trace').order_by('-id')[:20])
             }
-                
-            return Response({ 'period': period, 'slips': slips, 'diagnostics': diagnostics })
+            if period and period not in all_available_periods:
+                all_available_periods.insert(0, period)
+            return Response({ 'period': period, 'slips': slips, 'availablePeriods': all_available_periods, 'diagnostics': diagnostics })
         except Exception as e:
             import traceback
             print("Payroll Process Error:", traceback.format_exc())
@@ -520,6 +540,35 @@ class PayslipPDFView(APIView):
             p.drawString(50, height - 80, f"Employee Name: {slip.employee.first_name} {slip.employee.last_name}")
             p.drawString(50, height - 100, f"Employee Code: {slip.employee.code}")
             p.drawString(50, height - 120, f"Department: {slip.employee.department.name if slip.employee.department else 'N/A'}")
+            
+            # Show Overtime Hours if recorded for this period
+            try:
+                import calendar
+                from datetime import date
+                from django.db.models import Sum
+                from attendance.models import DailyAttendance
+                p_yr, p_mo = map(int, slip.period.split('-'))
+                _, t_days = calendar.monthrange(p_yr, p_mo)
+                m_start = date(p_yr, p_mo, 1)
+                m_end = date(p_yr, p_mo, t_days)
+                ot_sum = DailyAttendance.objects.filter(
+                    employee=slip.employee,
+                    attendance_date__gte=m_start,
+                    attendance_date__lte=m_end
+                ).aggregate(total_ot=Sum('overtime_hours'))['total_ot'] or 0.0
+                if ot_sum > 0:
+                    p.drawString(320, height - 100, f"Overtime Hours: {ot_sum} hrs")
+                
+                late_count = DailyAttendance.objects.filter(
+                    employee=slip.employee,
+                    attendance_date__gte=m_start,
+                    attendance_date__lte=m_end,
+                    attendance_status='Late'
+                ).count()
+                if late_count > 0:
+                    p.drawString(320, height - 120, f"Late Marks: {late_count} marks")
+            except Exception:
+                pass
             
             p.drawString(50, height - 160, "Earnings & Deductions")
             
@@ -714,6 +763,7 @@ class PayrollPreviewAPIView(APIView):
                         reimbursement = 0
                         incentive = 0
                         arrears = 0
+                        ot_pay = 0
                         
                         try:
                             pf_amount = sum(item['amount'] for item in line_items if getattr(item['rule'], 'name', None) and 'PF' in str(item['rule'].name).upper())
@@ -721,6 +771,7 @@ class PayrollPreviewAPIView(APIView):
                             reimbursement = sum(item['amount'] for item in line_items if getattr(item['rule'], 'name', None) and 'REIMBURSEMENT' in str(item['rule'].name).upper())
                             incentive = sum(item['amount'] for item in line_items if getattr(item['rule'], 'name', None) and ('INCENTIVE' in str(item['rule'].name).upper() or 'BONUS' in str(item['rule'].name).upper()))
                             arrears = sum(item['amount'] for item in line_items if getattr(item['rule'], 'name', None) and 'ARREAR' in str(item['rule'].name).upper())
+                            ot_pay = sum(item['amount'] for item in line_items if getattr(item['rule'], 'name', None) and ('OVERTIME' in str(item['rule'].name).upper() or 'OT' in str(item['rule'].name).upper()))
                         except Exception as e:
                             print(f"Error summing items: {e}")
                         
@@ -763,6 +814,8 @@ class PayrollPreviewAPIView(APIView):
                             'leaves': sfloat(context.get('absent_days', 0)),
                             'lopDays': sfloat(context.get('lop_days', 0)),
                             'ot': sfloat(context.get('ot_hours', context.get('overtime_hours', 0))),
+                            'overtimeHours': sfloat(context.get('ot_hours', context.get('overtime_hours', 0))),
+                            'overtimePay': 0 if hide_money else sfloat(ot_pay),
                             'halfDays': sfloat(context.get('half_day_count', 0)),
                             'latePenalties': sfloat(context.get('late_penalty_days', 0)),
                             'daysPaid': sfloat(context.get('paid_days', 0)),

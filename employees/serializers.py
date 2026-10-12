@@ -16,11 +16,22 @@ class EmployeeSerializer(serializers.ModelSerializer):
     salary_structure_name = serializers.SerializerMethodField()
     manager_name = serializers.SerializerMethodField()
     code = serializers.CharField(required=False, allow_blank=True)
+    email = serializers.EmailField(required=False, allow_blank=True, allow_null=True)
+    phone = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     is_wfh = serializers.SerializerMethodField()
     
     class Meta:
         model = Employee
         fields = '__all__'
+
+    def validate(self, attrs):
+        email = attrs.get('email')
+        phone = attrs.get('phone')
+        # On creation, at least email OR phone must be present
+        if not self.instance:
+            if not email and not phone:
+                raise serializers.ValidationError({"non_field_errors": ["Either an Email or a Phone number is required to register an employee."]})
+        return attrs
         
     def get_salary_structure_name(self, obj):
         return obj.salary_structure.name if obj.salary_structure else None

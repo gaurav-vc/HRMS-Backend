@@ -97,7 +97,11 @@ DATABASES = {
 
 
 # Password validation
-# https://docs.djangoproject.com/en/5.2/ref/settings/#auth-password-validators
+# Authentication backends (supports Phone, Email, Username login)
+AUTHENTICATION_BACKENDS = [
+    'authentication.backends.PhoneOrEmailBackend',
+    'django.contrib.auth.backends.ModelBackend',
+]
 
 AUTH_PASSWORD_VALIDATORS = [
     {

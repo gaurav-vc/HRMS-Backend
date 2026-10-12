@@ -237,6 +237,26 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             'logo_url': logo_url
         })
 
+    @action(detail=True, methods=['POST'])
+    def generate_kiosk_token(self, request, pk=None):
+        """
+        Generates or regenerates a cryptographically secure terminal token for this site's tablet kiosk.
+        Strictly isolated to Site Admins authorized for this site.
+        """
+        site = self.get_object()
+        import secrets
+        site.kiosk_token = secrets.token_hex(24)
+        if not site.kiosk_pin:
+            site.kiosk_pin = '1234'
+        site.save(update_fields=['kiosk_token', 'kiosk_pin'])
+        return Response({
+            'kiosk_token': site.kiosk_token,
+            'kiosk_pin': site.kiosk_pin,
+            'kiosk_enabled': site.kiosk_enabled,
+            'site_id': site.id,
+            'site_name': site.name
+        }, status=status.HTTP_200_OK)
+
     def perform_create(self, serializer):
         user = self.request.user
         

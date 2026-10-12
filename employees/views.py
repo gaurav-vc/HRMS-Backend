@@ -2,7 +2,7 @@ import csv
 import io
 from rest_framework import viewsets, exceptions, status
 from rest_framework.decorators import action
-from rest_framework.parsers import MultiPartParser
+from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.response import Response
 from django.contrib.auth.models import User
 from django.core.mail import send_mail
@@ -43,12 +43,13 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 gender = row.get('Gender', 'Male').strip()
                 address = row.get('Address', '').strip()
                 
-                if not email or not code:
-                    errors.append(f"Row {reader.line_num}: Email and Employee Code are required")
+                if not code or (not email and not phone):
+                    errors.append(f"Row {reader.line_num}: Employee Code and at least Email or Phone are required")
                     continue
                     
-                if User.objects.filter(username=email).exists() or User.objects.filter(email=email).exists():
-                    errors.append(f"Row {reader.line_num}: User with email {email} already exists")
+                username = email if email else phone.replace(' ', '').replace('-', '').replace('\t', '')
+                if User.objects.filter(username=username).exists() or (email and User.objects.filter(email=email).exists()):
+                    errors.append(f"Row {reader.line_num}: User {username} already exists")
                     continue
                 
                 # Fetch related models
@@ -94,8 +95,8 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
 
                 # 1. Create User
                 user = User.objects.create_user(
-                    username=email,
-                    email=email,
+                    username=username,
+                    email=email or '',
                     password="Password123!",
                     first_name=first_name,
                     last_name=last_name
@@ -106,7 +107,7 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                     user=user,
                     first_name=first_name,
                     last_name=last_name,
-                    email=email,
+                    email=email or None,
                     code=code,
                     phone=phone,
                     gender=gender,
@@ -154,6 +155,72 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+    @action(detail=True, methods=['POST'], parser_classes=[MultiPartParser, FormParser])
+    def update_photo(self, request, pk=None):
+        """
+        Updates an employee's profile photo with strict site-level data isolation.
+        Automatically syncs and extracts facial embeddings into FaceProfile for tablet kiosk attendance.
+        """
+        employee = self.get_object()  # DataIsolationMixin ensures employee belongs to the isolated scope
+        req_user = request.user
+
+        # Strict Multi-Tenant Site Isolation Validation
+        if not req_user.is_superuser:
+            from authentication.permissions import _get_admin_sites
+            admin_sites = _get_admin_sites(req_user)
+            if admin_sites.exists():
+                is_authorized = (
+                    (employee.site and employee.site in admin_sites) or
+                    employee.enrolled_sites.filter(id__in=admin_sites).exists()
+                )
+                if not is_authorized:
+                    raise exceptions.PermissionDenied("Data Isolation Violation: You can only update photos for employees in your assigned site.")
+            if employee.role in ['super_admin', 'org_admin']:
+                raise exceptions.PermissionDenied("Access Denied: You cannot modify photos of corporate administrators.")
+
+        photo_file = request.FILES.get('photo')
+        if not photo_file:
+            return Response({"error": "No photo file provided."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Save photo
+        employee.photo = photo_file
+        employee.save(update_fields=['photo'])
+
+        # Auto-extract biometric encoding for tablet kiosk matching
+        biometric_enrolled = False
+        try:
+            from attendance.utils import get_face_encoding
+            from attendance.models import FaceProfile
+            from attendance.crypto_utils import CryptoService
+
+            photo_file.seek(0)
+            img_bytes = photo_file.read()
+            encoding_res = get_face_encoding(img_bytes)
+
+            if encoding_res.get('success'):
+                encoding = encoding_res.get('encoding')
+                face_profile, _ = FaceProfile.objects.get_or_create(employee=employee)
+                payload = {"encodings": [encoding]}
+                enc_data, enc_dek = CryptoService.encrypt_json(payload)
+                face_profile.encrypted_face_encodings = enc_data
+                face_profile.encrypted_dek = enc_dek
+                face_profile.is_active = True
+                face_profile.save()
+                biometric_enrolled = True
+
+                try:
+                    from attendance.faiss_service import biometric_search
+                    biometric_search.add_employee_vectors(employee.id, [encoding])
+                except Exception as fe:
+                    print(f"FAISS vector sync notice: {fe}")
+        except Exception as be:
+            print(f"Biometric sync notice: {be}")
+
+        serializer = self.get_serializer(employee)
+        data = dict(serializer.data)
+        data['biometric_enrolled'] = biometric_enrolled
+        return Response(data, status=status.HTTP_200_OK)
+
 
 
     def perform_create(self, serializer):
@@ -195,20 +262,30 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
         password = raw_data.get('password') or ''.join(secrets.choice(alphabet) for _ in range(10))
 
-        if not email:
-            raise exceptions.ValidationError({"email": "Email is required to create a user account."})
+        phone = validated_data.get('phone')
 
-        # Check if user already exists
-        if User.objects.filter(username=email).exists() or User.objects.filter(email=email).exists():
-            raise exceptions.ValidationError({"email": "A user with this email already exists."})
+        # Determine username and account identifier (Phone-first for blue-collar or Email)
+        if email:
+            username = email.strip()
+            if User.objects.filter(username=username).exists() or User.objects.filter(email=username).exists():
+                raise exceptions.ValidationError({"email": "A user with this email already exists."})
+        elif phone:
+            clean_phone = ''.join(c for c in phone if c.isdigit() or c == '+')
+            username = clean_phone or validated_data.get('code')
+            if User.objects.filter(username=username).exists():
+                raise exceptions.ValidationError({"phone": "A user account with this phone number already exists."})
+        else:
+            raise exceptions.ValidationError({"non_field_errors": ["Either an Email or a Phone number is required to create a user account."]})
 
         # 3. Create Django User
+        is_active = (status_val == 'Active')
         user = User.objects.create_user(
-            username=email,
-            email=email,
+            username=username,
+            email=email or '',
             password=password,
             first_name=first_name,
-            last_name=last_name
+            last_name=last_name,
+            is_active=is_active
         )
 
         # 4. Save Employee with linked user
@@ -238,37 +315,22 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             status='Pending Approval'
         )
 
-        # 5. Dispatch Welcome Email (Skipped by default unless send_email is True)
+        # 5. Dispatch Welcome Credentials (SMS for phone-only, Email, or Both)
         send_email_flag = raw_data.get('send_email', False)
-        if str(send_email_flag).lower() == 'true':
-            login_url = "https://hrms.vibecopilot.ai/"
-            subject = "Welcome to HRMS - Your Login Credentials"
-            message = f"""Hello {first_name},
+        send_sms_flag = raw_data.get('send_sms', False)
+        send_credentials_flag = raw_data.get('send_credentials', False)
+        delivery_method = raw_data.get('delivery_method', 'auto')
 
-Welcome to the HRMS portal! Your account has been successfully created.
-
-Website: {login_url}
-Login ID: {email}
-Password: {password}
-
-Please log in and change your password immediately.
-
-Regards,
-HRMS Admin
-"""
-            try:
-                import threading
-                from django.core.mail import send_mail
-                from django.conf import settings
-                # Send email in background to prevent slow saving
-                threading.Thread(target=send_mail, args=(
-                    subject,
-                    message,
-                    settings.DEFAULT_FROM_EMAIL,
-                    [email]
-                ), kwargs={'fail_silently': True}).start()
-            except Exception as e:
-                print(f"Failed to send email to {email}: {e}")
+        should_dispatch = any(
+            str(x).lower() in ['true', '1'] for x in [send_email_flag, send_sms_flag, send_credentials_flag]
+        )
+        if should_dispatch:
+            from core.notifications import NotificationService
+            if str(send_sms_flag).lower() in ['true', '1'] and str(send_email_flag).lower() not in ['true', '1']:
+                delivery_method = 'sms'
+            elif str(send_email_flag).lower() in ['true', '1'] and str(send_sms_flag).lower() not in ['true', '1']:
+                delivery_method = 'email'
+            NotificationService.send_credentials(employee, password, delivery_method=delivery_method)
 
         # 6. Sync with Organization Engine
         try:
@@ -359,6 +421,11 @@ HRMS Admin
                 changes[attr] = {'old': str(old_val), 'new': str(new_val)}
                 
         emp = serializer.save()
+        if emp.user:
+            is_active = (emp.status == 'Active')
+            if emp.user.is_active != is_active:
+                emp.user.is_active = is_active
+                emp.user.save(update_fields=['is_active'])
         
         if changes:
             try:

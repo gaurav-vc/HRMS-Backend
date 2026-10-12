@@ -58,11 +58,12 @@ class DailyAttendance(models.Model):
             
             raw_ot = max(0.0, duration - standard_hours)
             
-            # Rule: if overtime > threshold, they get the combined OT. Otherwise, OT pay will not add (0).
-            if raw_ot > ot_threshold:
-                self.overtime_hours = round(raw_ot, 2)
-            else:
-                self.overtime_hours = 0.00
+            # Rule: only auto-calculate overtime if not explicitly provided (e.g. via CSV upload or manual override)
+            if not self.overtime_hours or self.overtime_hours == 0:
+                if raw_ot > 0:
+                    self.overtime_hours = round(raw_ot, 2)
+                else:
+                    self.overtime_hours = 0.00
                 
         super().save(*args, **kwargs)
 

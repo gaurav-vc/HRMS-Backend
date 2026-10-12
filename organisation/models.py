@@ -61,6 +61,14 @@ class Site(models.Model):
     is_saturday_working = models.BooleanField(default=False)
     is_sub_site = models.BooleanField(default=False)
     
+    # Tablet Attendance Kiosk Configuration (Dynamic Per-Site)
+    kiosk_enabled = models.BooleanField(default=False)
+    kiosk_similarity_threshold = models.FloatField(default=0.45, help_text="Facial similarity threshold (0.40 - 0.70)")
+    kiosk_cooldown_seconds = models.IntegerField(default=30, help_text="Debounce seconds to prevent duplicate punches")
+    kiosk_auto_punch = models.BooleanField(default=True, help_text="Auto-detect IN vs OUT based on previous punch")
+    kiosk_token = models.CharField(max_length=64, blank=True, null=True, unique=True, help_text="Secure terminal key for physical tablet")
+    kiosk_pin = models.CharField(max_length=10, default='1234', help_text="4-digit PIN to exit kiosk mode on tablet")
+    
     # Branding for Site
     logo = models.ImageField(upload_to='site_logos/', null=True, blank=True)
     branding_text = models.CharField(max_length=100, default='PeoplePulse HRMS', blank=True, null=True)
