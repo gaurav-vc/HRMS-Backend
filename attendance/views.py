@@ -1371,6 +1371,13 @@ def get_valid_date(employee, date):
     from datetime import timedelta
     site = employee.site
     saturday_working = getattr(site, 'is_saturday_working', False) if site else False
+    if not saturday_working:
+        try:
+            from leaves.models import LeavePolicyConfiguration
+            config = LeavePolicyConfiguration.get_settings()
+            saturday_working = getattr(config, 'is_saturday_working', False)
+        except Exception:
+            pass
     
     current_date = date
     while True:
