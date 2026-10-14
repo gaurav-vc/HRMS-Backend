@@ -12,20 +12,72 @@ from .engine import build_dag_and_sort, evaluate_component, calculate_tds
 
 class LockService:
     @staticmethod
+    def get_employee_entity(employee):
+        if not employee:
+            return None
+        if getattr(employee, 'entity', None):
+            return employee.entity
+        if getattr(employee, 'site', None) and getattr(employee.site, 'branch', None) and getattr(employee.site.branch, 'entity', None):
+            return employee.site.branch.entity
+        if getattr(employee, 'department', None) and getattr(employee.department, 'entity', None):
+            return getattr(employee.department, 'entity', None)
+        return None
+
+    @staticmethod
     def is_locked(employee, date):
         """
         Central lock authority.
         Returns True if the date falls within or before a locked PayrollRun's cutoff
-        for this employee's entity/cost center.
+        for this employee's entity/cost center, or within a finalized payroll period.
         """
-        # A simple implementation: find any PayrollRun for the employee's entity
-        # that has a lock_date >= the target date, and status NOT in Draft/Processing
-        runs = PayrollRun.objects.filter(
-            entity=employee.department.entity, # Assuming Employee -> Department -> Entity
-            lock_date__gte=date
-        ).exclude(status__in=['Draft', 'Processing'])
-        
-        return runs.exists()
+        if not employee or not date:
+            return False
+
+        import datetime
+        target_date = date.date() if isinstance(date, datetime.datetime) else date
+
+        emp_entity = LockService.get_employee_entity(employee)
+        if not emp_entity:
+            return False
+
+        # Runs that are locked or finalized (not Draft or Processing) strictly for this employee's entity
+        runs = PayrollRun.objects.filter(entity=emp_entity).exclude(status__in=['Draft', 'Processing'])
+
+        # 1. Lock check by lock_date cutoff
+        if runs.filter(lock_date__isnull=False, lock_date__gte=target_date).exists():
+            return True
+
+        # 2. Lock check by payroll period (YYYY-MM)
+        period_str = target_date.strftime('%Y-%m')
+        if runs.filter(period=period_str).exists():
+            return True
+
+        return False
+
+    @staticmethod
+    def is_attendance_locked(attendance):
+        """
+        Returns True if the daily attendance record is locked:
+        1. Either the employee & attendance_date fall in a locked/finalized payroll run,
+        2. Or it is linked to an Overtime Request that was already finalized/disbursed in payroll.
+        """
+        if not attendance or not attendance.employee or not attendance.attendance_date:
+            return False
+
+        if LockService.is_locked(attendance.employee, attendance.attendance_date):
+            return True
+
+        # Check if attendance is linked to an OT entry processed in a finalized payroll run
+        try:
+            from ot_engine.models import OTPayrollEntry
+            if OTPayrollEntry.objects.filter(
+                ot_entry__request__attendance=attendance
+            ).exclude(payroll_run__status__in=['Draft', 'Processing']).exists():
+                return True
+        except Exception:
+            pass
+
+        return False
 
 class PayrollService:
     @staticmethod

@@ -1200,6 +1200,84 @@ class DailyAttendanceViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     serializer_class = DailyAttendanceSerializer
     permission_classes = [IsAuthenticated]
 
+    def destroy(self, request, *args, **kwargs):
+        from payroll.service import LockService
+        from django.db import transaction
+        instance = self.get_object()
+        if LockService.is_attendance_locked(instance):
+            return Response(
+                {
+                    "error": f"Attendance record for {instance.employee} on {instance.attendance_date} is locked by payroll and cannot be deleted."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        with transaction.atomic():
+            self.perform_destroy(instance)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=False, methods=['post', 'delete'], url_path='bulk-delete')
+    def bulk_delete(self, request):
+        """
+        Bulk delete attendance records with tenant data isolation and payroll lock protection.
+        Accepts:
+            { "ids": [1, 2, 3] }
+            OR
+            { "employee_id": 12, "start_date": "2026-11-01", "end_date": "2026-11-30" }
+        """
+        from payroll.service import LockService
+        from django.db import transaction
+
+        ids = request.data.get('ids', [])
+        employee_id = request.data.get('employee_id')
+        start_date = request.data.get('start_date')
+        end_date = request.data.get('end_date')
+
+        qs = self.get_queryset()  # Enforces DataIsolationMixin automatically
+
+        if ids:
+            qs = qs.filter(id__in=ids)
+        elif employee_id:
+            qs = qs.filter(employee_id=employee_id)
+            if start_date and end_date:
+                qs = qs.filter(attendance_date__range=[start_date, end_date])
+            elif start_date:
+                qs = qs.filter(attendance_date__gte=start_date)
+            elif end_date:
+                qs = qs.filter(attendance_date__lte=end_date)
+        else:
+            return Response(
+                {"error": "Please provide an 'ids' array or 'employee_id' (with optional date range) to delete."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        unlocked_ids = []
+        locked_records = []
+
+        for att in qs:
+            if LockService.is_attendance_locked(att):
+                locked_records.append({
+                    "id": att.id,
+                    "employee": f"{att.employee.first_name} {att.employee.last_name}",
+                    "date": str(att.attendance_date),
+                    "reason": "Payroll is locked/finalized for this period."
+                })
+            else:
+                unlocked_ids.append(att.id)
+
+        deleted_count = 0
+        if unlocked_ids:
+            with transaction.atomic():
+                deleted_count, _ = DailyAttendance.objects.filter(id__in=unlocked_ids).delete()
+
+        return Response({
+            "success": True,
+            "deleted_count": deleted_count,
+            "locked_count": len(locked_records),
+            "deleted_ids": unlocked_ids,
+            "locked_records": locked_records,
+            "message": f"Successfully deleted {deleted_count} record(s). Protected {len(locked_records)} locked record(s)."
+        }, status=status.HTTP_200_OK)
+
 class RegularizationViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Regularization'
     queryset = RegularizationRequest.objects.all().order_by('-created_at', '-id')

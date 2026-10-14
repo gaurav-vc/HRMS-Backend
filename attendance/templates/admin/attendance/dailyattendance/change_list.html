@@ -1,0 +1,48 @@
+{% extends "admin/change_list.html" %}
+
+{% block extrahead %}
+{{ block.super }}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    var goBtn = document.querySelector('button[name="index"]');
+    if (goBtn && !document.getElementById('custom-delete-btn')) {
+        var deleteBtn = document.createElement('button');
+        deleteBtn.id = 'custom-delete-btn';
+        deleteBtn.type = 'button';
+        deleteBtn.innerHTML = '🗑️ Delete Selected';
+        deleteBtn.className = 'button';
+        deleteBtn.style.cssText = 'background: #dc2626 !important; color: white !important; font-weight: 600; margin-left: 10px; border: none; padding: 4px 14px; border-radius: 4px; cursor: pointer; transition: opacity 0.2s;';
+        
+        deleteBtn.onmouseover = function() { deleteBtn.style.opacity = '0.9'; };
+        deleteBtn.onmouseout = function() { deleteBtn.style.opacity = '1.0'; };
+
+        deleteBtn.onclick = function() {
+            var actionSelect = document.querySelector('select[name="action"]');
+            var checkboxes = document.querySelectorAll('input[name="_selected_action"]:checked, input.action-select:checked');
+            var selectAcross = document.querySelector('input[name="select_across"]');
+            var isSelectAcross = selectAcross && selectAcross.value === "1";
+
+            if ((!checkboxes || checkboxes.length === 0) && !isSelectAcross) {
+                alert('Please select at least one attendance record using the checkboxes on the left.');
+                return;
+            }
+
+            var count = isSelectAcross ? "ALL matched" : checkboxes.length;
+            if (confirm('Are you sure you want to delete ' + count + ' selected attendance record(s)?\n\n(Payroll-locked records will be safely preserved and skipped).')) {
+                if (actionSelect) {
+                    for (var i = 0; i < actionSelect.options.length; i++) {
+                        if (actionSelect.options[i].value === 'delete_selected_attendance' || actionSelect.options[i].value === 'delete_selected') {
+                            actionSelect.selectedIndex = i;
+                            break;
+                        }
+                    }
+                }
+                // Trigger the native Go button submission
+                goBtn.click();
+            }
+        };
+        goBtn.parentNode.insertBefore(deleteBtn, goBtn.nextSibling);
+    }
+});
+</script>
+{% endblock %}
