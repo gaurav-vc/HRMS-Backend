@@ -41,29 +41,6 @@ class UserProfileView(APIView):
     parser_classes = (MultiPartParser, FormParser, JSONParser)
     
     def get(self, request):
-        # Auto-create employee profile for superadmin if missing
-        if request.user.is_superuser and not hasattr(request.user, 'employee_profile'):
-            try:
-                from employees.models import Employee
-                from organisation.models import Role
-                
-                super_role = Role.objects.filter(name='Super Admin').first()
-                Employee.objects.create(
-                    user=request.user,
-                    first_name=request.user.first_name or request.user.username,
-                    last_name=request.user.last_name or '',
-                    email=request.user.email or request.user.username,
-                    code=f"EMP-{request.user.id:04d}",
-                    role='super_admin',
-                    dynamic_role=super_role,
-                    status='Active',
-                    doj=timezone.now().date()
-                )
-                # Refresh user object to ensure attribute is loaded
-                request.user.refresh_from_db()
-            except Exception as e:
-                print(f"Failed to auto-create employee profile: {e}")
-
         serializer = UserProfileSerializer(request.user, context={'request': request})
         return Response(serializer.data)
 

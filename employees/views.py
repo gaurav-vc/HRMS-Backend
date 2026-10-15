@@ -357,7 +357,7 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
 
         # 7. CTC Notification Workflow
         creator_profile = getattr(req_user, 'employee_profile', None)
-        creator_has_ctc = req_user.is_superuser or (creator_profile and creator_profile.dynamic_role and creator_profile.dynamic_role.permissions.get('can_add_ctc'))
+        creator_has_ctc = req_user.is_superuser or (creator_profile and creator_profile.dynamic_role and creator_profile.dynamic_role.permissions and creator_profile.dynamic_role.permissions.get('can_add_ctc') in [True, 'true', 'True', 1, '1'])
         
         if (not employee.ctc or employee.ctc == 0) and not creator_has_ctc:
             from .models import Notification
@@ -374,7 +374,7 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             
             # Find roles with can_add_ctc
             from organisation.models import Role
-            ctc_roles = [r for r in Role.objects.all() if r.permissions.get('can_add_ctc')]
+            ctc_roles = [r for r in Role.objects.all() if r.permissions and r.permissions.get('can_add_ctc') in [True, 'true', 'True', 1, '1']]
             ctc_employees = Employee.objects.filter(dynamic_role__in=ctc_roles)
             for ctc_emp in ctc_employees:
                 Notification.objects.create(
@@ -421,6 +421,22 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 changes[attr] = {'old': str(old_val), 'new': str(new_val)}
                 
         emp = serializer.save()
+        if not emp.user and emp.email:
+            matched_user = User.objects.filter(email__iexact=emp.email).first() or User.objects.filter(username__iexact=emp.email).first()
+            if matched_user:
+                emp.user = matched_user
+                emp.save(update_fields=['user'])
+        elif not emp.user and emp.code:
+            matched_user = User.objects.filter(username__iexact=emp.code).first()
+            if matched_user:
+                emp.user = matched_user
+                emp.save(update_fields=['user'])
+
+        # Strict security boundary: only a user with is_superuser can ever have role 'super_admin'
+        if emp.role == 'super_admin' and not (emp.user and emp.user.is_superuser):
+            emp.role = 'employee'
+            emp.save(update_fields=['role'])
+
         if emp.user:
             is_active = (emp.status == 'Active')
             if emp.user.is_active != is_active:
@@ -555,14 +571,25 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
         
         for emp in employees:
-            if emp.user and emp.email:
+            if emp.user:
                 new_password = ''.join(secrets.choice(alphabet) for _ in range(10))
                 emp.user.set_password(new_password)
                 emp.user.save()
                 
-                login_url = "https://hrms.vibecopilot.ai/"
-                subject = "Welcome to HRMS - Your Login Credentials"
-                message = f"""Hello {emp.first_name},
+                dispatched = False
+                try:
+                    from core.notifications import NotificationService
+                    res = NotificationService.send_credentials(emp, new_password, delivery_method='auto')
+                    if res.get('email_sent') or res.get('sms_sent'):
+                        sent_count += 1
+                        dispatched = True
+                except Exception as e:
+                    print(f"NotificationService failed for {emp.id}: {e}")
+
+                if not dispatched and emp.email:
+                    login_url = getattr(settings, 'HRMS_PORTAL_URL', "https://hrms.vibecopilot.ai/")
+                    subject = "Welcome to HRMS - Your Login Credentials"
+                    message = f"""Hello {emp.first_name},
 
 Welcome to the HRMS portal! Your account is ready.
 
@@ -575,16 +602,16 @@ Please log in and change your password immediately.
 Regards,
 HRMS Admin
 """
-                try:
-                    threading.Thread(target=send_mail, args=(
-                        subject,
-                        message,
-                        settings.DEFAULT_FROM_EMAIL,
-                        [emp.email]
-                    ), kwargs={'fail_silently': True}).start()
-                    sent_count += 1
-                except Exception as e:
-                    print(f"Failed to send email to {emp.email}: {e}")
+                    try:
+                        threading.Thread(target=send_mail, args=(
+                            subject,
+                            message,
+                            settings.DEFAULT_FROM_EMAIL,
+                            [emp.email]
+                        ), kwargs={'fail_silently': True}).start()
+                        sent_count += 1
+                    except Exception as e:
+                        print(f"Failed to send email to {emp.email}: {e}")
 
         return Response({"success": True, "sent_count": sent_count})
 
@@ -607,6 +634,7 @@ from .models import EmployeeDocument, EmployeeTransfer, EmployeeExit
 from .serializers import EmployeeDocumentSerializer, EmployeeTransferSerializer, EmployeeExitSerializer
 
 class EmployeeDocumentViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Documents'
     queryset = EmployeeDocument.objects.all()
     serializer_class = EmployeeDocumentSerializer
     parser_classes = [MultiPartParser]
@@ -619,6 +647,7 @@ class EmployeeDocumentViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         return queryset
 
 class EmployeeTransferViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Employees'
     queryset = EmployeeTransfer.objects.all()
     serializer_class = EmployeeTransferSerializer
     
@@ -634,9 +663,47 @@ class EmployeeTransferViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             emp.save()
 
 class EmployeeExitViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Manage Exits'
     queryset = EmployeeExit.objects.all()
     serializer_class = EmployeeExitSerializer
-    
+
+    def create(self, request, *args, **kwargs):
+        emp_id = request.data.get('employee')
+        if emp_id:
+            existing = EmployeeExit.objects.filter(employee_id=emp_id).first()
+            if existing:
+                serializer = self.get_serializer(existing, data=request.data, partial=True)
+                serializer.is_valid(raise_exception=True)
+                self.perform_create(serializer)
+                return Response(serializer.data, status=status.HTTP_200_OK)
+        return super().create(request, *args, **kwargs)
+
+    def perform_create(self, serializer):
+        exit_process = serializer.save()
+        emp = exit_process.employee
+
+        # Link selected reporting person / manager if provided
+        reporting_person_id = self.request.data.get('reporting_person') or self.request.data.get('manager')
+        if reporting_person_id:
+            try:
+                reporting_emp = Employee.objects.get(id=reporting_person_id)
+                if emp.manager != reporting_emp:
+                    emp.manager = reporting_emp
+                    emp.save(update_fields=['manager'])
+            except Exception:
+                pass
+
+        # Send notification to the designated reporting manager
+        target_manager = emp.manager
+        if target_manager:
+            from .models import Notification
+            Notification.objects.create(
+                recipient=target_manager,
+                title="Separation Request Received",
+                message=f"{emp.first_name} {emp.last_name} ({emp.code}) has submitted a separation request. LWD: {exit_process.last_working_day}.",
+                related_employee_id=emp.id
+            )
+
     def perform_update(self, serializer):
         exit_process = serializer.save()
         if exit_process.status == 'Completed':
@@ -657,7 +724,7 @@ class NotificationViewSet(viewsets.ViewSet):
     
     def list(self, request):
         user = request.user
-        if not hasattr(user, 'employee_profile'):
+        if user.is_superuser or not hasattr(user, 'employee_profile'):
             return Response([])
             
         from .models import Notification
@@ -1354,7 +1421,35 @@ class GlobalSearchAPIView(APIView):
 
         results = []
 
-        # Search Employees
+        if request.user.is_superuser:
+            from admin_org.models import Organization
+            org_qs = Organization.objects.filter(
+                Q(name__icontains=q) | Q(company_name__icontains=q)
+            )[:5]
+            for org in org_qs:
+                results.append({
+                    'id': org.id,
+                    'type': 'organization',
+                    'title': org.name,
+                    'subtitle': org.company_name or 'Organization',
+                    'url': f"/organizations/{org.id}"
+                })
+
+            from organisation.models import Site
+            site_qs = Site.objects.filter(name__icontains=q, is_sub_site=False)[:5]
+            for site in site_qs:
+                city = site.branch.city if site.branch and hasattr(site.branch, 'city') else 'No City'
+                code = site.site_code if site.site_code else ''
+                results.append({
+                    'id': site.id,
+                    'type': 'site',
+                    'title': site.name,
+                    'subtitle': f"{city} • {code}",
+                    'url': f"/superadmin-sites"
+                })
+            return Response(results)
+
+        # Search Employees (non-superuser only)
         emp_qs = Employee.objects.filter(
             Q(first_name__icontains=q) | 
             Q(last_name__icontains=q) | 

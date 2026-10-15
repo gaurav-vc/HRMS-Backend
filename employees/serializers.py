@@ -24,6 +24,16 @@ class EmployeeSerializer(serializers.ModelSerializer):
         model = Employee
         fields = '__all__'
 
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, 'copy') else dict(data)
+        if 'salaryStructure' in data:
+            data['salary_structure'] = data.pop('salaryStructure')
+        if 'taxRegime' in data:
+            data['tax_regime'] = data.pop('taxRegime')
+        if 'taxSavingDeductions' in data:
+            data['tax_saving_deductions'] = data.pop('taxSavingDeductions')
+        return super().to_internal_value(data)
+
     def validate(self, attrs):
         email = attrs.get('email')
         phone = attrs.get('phone')

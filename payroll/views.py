@@ -119,6 +119,25 @@ from rest_framework.decorators import action
 from .service import PayrollService
 from authentication.permissions import DataIsolationMixin
 
+def resolve_employee_salary_structure(emp, default_struct=None):
+    if emp.salary_structure and emp.salary_structure.components.exists():
+        return emp.salary_structure
+    from payroll.models import SalaryStructure
+    if getattr(emp, 'site', None):
+        site_struct = SalaryStructure.objects.filter(site=emp.site, status='Active').first()
+        if site_struct and site_struct.components.exists():
+            return site_struct
+    emp_entity = getattr(emp, 'entity', None)
+    if not emp_entity and getattr(emp, 'site', None) and getattr(emp.site, 'branch', None):
+        emp_entity = getattr(emp.site.branch, 'entity', None)
+    if emp_entity:
+        entity_struct = SalaryStructure.objects.filter(site__branch__entity=emp_entity, status='Active').first()
+        if entity_struct and entity_struct.components.exists():
+            return entity_struct
+    if default_struct and default_struct.components.exists():
+        return default_struct
+    return SalaryStructure.objects.filter(status='Active').first()
+
 class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Run Payroll'
     queryset = PayrollRun.objects.all().order_by('-period')
@@ -141,6 +160,24 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def execute(self, request, pk=None):
+        user = request.user
+        if user.is_superuser:
+            return Response({'error': 'Super admin does not have permission to run site payroll.'}, status=403)
+        emp = getattr(user, 'employee_profile', None)
+        can_run = False
+        if emp and emp.role in ['admin', 'org_admin']:
+            can_run = True
+        from organisation.models import Site
+        if Site.objects.filter(contact_email=user.email).exists():
+            can_run = True
+        elif emp and emp.dynamic_role and emp.dynamic_role.permissions:
+            perms = emp.dynamic_role.permissions
+            if (perms.get('can_run_payroll') in [True, 'true', 'True', 1, '1'] or
+                perms.get('Run Payroll', {}).get('create') in [True, 'true', 'True', 1, '1']):
+                can_run = True
+        if not can_run:
+            return Response({'error': 'Permission denied. You do not have permission to run payroll.'}, status=403)
+
         try:
             run = self.get_object()
             overrides = request.data.get('overrides')
@@ -151,6 +188,23 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 if overrides:
                     PayrollService.file_arrears(run.id, overrides)
                 return Response({'status': 'success', 'run_status': run.status, 'msg': 'Arrears processed'})
+
+            # Dynamic resolution of active salary structure for any unassigned employees
+            from employees.models import Employee
+            from payroll.models import SalaryStructure
+            from django.db.models import Q
+            active_employees = Employee.objects.filter(
+                Q(entity=run.entity) | Q(branch__entity=run.entity) | Q(site__branch__entity=run.entity),
+                status='Active'
+            ).select_related('salary_structure', 'department', 'designation', 'site', 'entity').prefetch_related('salary_structure__components')
+
+            default_structure = SalaryStructure.objects.filter(status='Active').first()
+            for e in active_employees:
+                if not e.salary_structure or e.salary_structure.components.count() == 0:
+                    struct = resolve_employee_salary_structure(e, default_structure)
+                    if struct:
+                        e.salary_structure = struct
+                        e.save(update_fields=['salary_structure'])
                 
             run = PayrollService.execute_run(run.id, overrides=overrides, include_variable_bonus=include_variable_bonus, include_leaves_encashment=include_leaves_encashment)
             if hasattr(request, 'user') and request.user.is_authenticated:
@@ -163,8 +217,70 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             tb = traceback.format_exc()
             return Response({'status': 'error', 'message': f"CRASH: {str(e)} | Trace: {tb}"}, status=400)
 
+    @action(detail=False, methods=['post', 'get'])
+    def validate_prerequisites(self, request):
+        """Pre-flight validation check before initiating payroll run"""
+        from employees.models import Employee
+        from organisation.models import Entity
+        from django.db.models import Q
+        
+        entity_ids = request.data.get('entity_ids') or request.query_params.get('entity_ids')
+        if not entity_ids:
+            entity_id = request.data.get('entity') or request.query_params.get('entity')
+            if entity_id:
+                entity_ids = [entity_id]
+        
+        if entity_ids:
+            if isinstance(entity_ids, str):
+                entity_ids = [int(x.strip()) for x in entity_ids.split(',') if x.strip().isdigit()]
+            entities = Entity.objects.filter(id__in=entity_ids)
+        else:
+            entities = Entity.objects.all()
+            
+        from payroll.models import SalaryStructure
+        default_structure = SalaryStructure.objects.filter(status='Active').first()
+        missing_employees = []
+        for entity in entities:
+            emps = Employee.objects.filter(
+                Q(entity=entity) | Q(branch__entity=entity) | Q(site__branch__entity=entity),
+                status='Active'
+            ).select_related('salary_structure', 'department', 'designation', 'site', 'entity').prefetch_related('salary_structure__components')
+            
+            for emp_record in emps:
+                missing_fields = []
+                struct = resolve_employee_salary_structure(emp_record, default_structure)
+                if not struct or struct.components.count() == 0:
+                    missing_fields.append("Salary Structure")
+                if not emp_record.ctc or emp_record.ctc <= 0:
+                    missing_fields.append("CTC")
+                
+                if missing_fields:
+                    missing_employees.append({
+                        'id': emp_record.id,
+                        'code': emp_record.code or f"EMP{emp_record.id}",
+                        'name': f"{emp_record.first_name} {emp_record.last_name}".strip() or "Unnamed",
+                        'department': emp_record.department.name if emp_record.department else 'N/A',
+                        'designation': emp_record.designation.title if emp_record.designation else 'N/A',
+                        'entity': entity.name,
+                        'entity_id': entity.id,
+                        'missing': missing_fields,
+                        'missing_salary_structure': "Salary Structure" in missing_fields,
+                        'missing_ctc': "CTC" in missing_fields,
+                    })
+        
+        return Response({
+            'status': 'success',
+            'can_run': len(missing_employees) == 0,
+            'missing_employees': missing_employees
+        })
+
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
+        user = request.user
+        from authentication.permissions import user_can_approve
+        if not user_can_approve(user, module='Run Payroll'):
+            return Response({'error': 'Permission denied. You do not have permission to approve payroll.'}, status=403)
+
         run = self.get_object()
         if run.status != 'Maker-Submitted':
             return Response({'error': 'Can only approve Maker-Submitted runs'}, status=400)
@@ -188,7 +304,7 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         
         from employees.models import Notification
         for emp in Employee.objects.filter(status='Active'):
-            if emp.dynamic_role and emp.dynamic_role.permissions and emp.dynamic_role.permissions.get('can_release_salary'):
+            if emp.dynamic_role and emp.dynamic_role.permissions and emp.dynamic_role.permissions.get('can_release_salary') in [True, 'true', 'True', 1, '1']:
                 Notification.objects.create(
                     recipient=emp,
                     title="Payroll Approved",
@@ -196,18 +312,23 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                     related_run_id=run.id
                 )
                 
-        if run.maker and hasattr(run.maker, 'employee_profile'):
-            Notification.objects.create(
-                recipient=run.maker.employee_profile,
-                title="Payroll Approved",
-                message=f"Your payroll run for {run.period} was approved and forwarded to Finance.",
-                related_run_id=run.id
-            )
+            if run.maker and hasattr(run.maker, 'employee_profile'):
+                Notification.objects.create(
+                    recipient=run.maker.employee_profile,
+                    title="Payroll Approved",
+                    message=f"Your payroll run for {run.period} was approved and forwarded to Finance.",
+                    related_run_id=run.id
+                )
                 
         return Response({'status': 'success', 'run_status': run.status})
 
     @action(detail=True, methods=['post'])
     def reject(self, request, pk=None):
+        user = request.user
+        from authentication.permissions import user_can_approve
+        if not user_can_approve(user, module='Run Payroll'):
+            return Response({'error': 'Permission denied. You do not have permission to reject payroll.'}, status=403)
+
         run = self.get_object()
         if run.status != 'Maker-Submitted':
             return Response({'error': 'Can only reject Maker-Submitted runs'}, status=400)
@@ -254,6 +375,8 @@ class SalarySlipAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        if request.user.is_superuser:
+            return Response({'error': 'Super admin does not have employee payslips'}, status=403)
         try:
             period = request.query_params.get('period')
             from .models import Payslip
@@ -261,16 +384,13 @@ class SalarySlipAPIView(APIView):
             from authentication.permissions import isolate_queryset
             
             can_view_confidential = False
-            if user.is_superuser:
-                can_view_confidential = True
-            elif hasattr(user, 'employee_profile') and user.employee_profile:
-                emp_profile = user.employee_profile
-                if getattr(emp_profile, 'is_hr', False) or getattr(emp_profile, 'is_admin', False) or getattr(emp_profile, 'is_superadmin', False):
+            emp_profile = getattr(user, 'employee_profile', None)
+            if emp_profile:
+                if emp_profile.dynamic_role and emp_profile.dynamic_role.permissions:
+                    perms = emp_profile.dynamic_role.permissions
+                    can_view_confidential = perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1'] or perms.get('can_view_confidential') in [True, 'true', 'True', 1, '1']
+                elif emp_profile.role in ['admin', 'org_admin'] or getattr(emp_profile, 'is_admin', False):
                     can_view_confidential = True
-                elif getattr(emp_profile, 'dynamic_role', None):
-                    perms = emp_profile.dynamic_role.permissions or {}
-                    if perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1']:
-                        can_view_confidential = True
             
             # Determine all periods where payroll has been run or payslips exist
             from payroll.models import PayrollRun
@@ -442,6 +562,73 @@ class SalarySlipAPIView(APIView):
                 is_own_slip = (getattr(user, 'employee_profile', None) and user.employee_profile.id == emp.id)
                 hide_money = not can_view_confidential and not is_own_slip
 
+                actual_components = {}
+                actual_gross = 0.0
+                if getattr(emp, 'salary_structure', None) and emp.salary_structure.components.exists():
+                    try:
+                        struct_rules = list(emp.salary_structure.components.all())
+                        from payroll.engine import build_dag_and_sort, evaluate_component
+                        sorted_rules = build_dag_and_sort(struct_rules)
+                        base_ctx = {
+                            'ctc': Decimal(str(emp.ctc or 0)),
+                            'monthly_ctc': Decimal(str(emp.ctc or 0)) / Decimal(12),
+                            'present_days': Decimal(str(calc_days)),
+                            'total_days': Decimal(str(calc_days)),
+                            'paid_days': Decimal(str(calc_days)),
+                            'overtime_hours': Decimal('0.00'),
+                            'ot_hours': Decimal('0.00'),
+                            'absent_days': Decimal('0.00'),
+                            'lop_days': Decimal('0.00'),
+                            'half_day_count': Decimal('0.00'),
+                            'late_penalty_days': Decimal('0.00'),
+                            'paid_leave_days': Decimal('0.00'),
+                            'basic': Decimal('0.00'),
+                            'hra': Decimal('0.00'),
+                            'non_balancing_gross': Decimal('0.00'),
+                        }
+                        for r in sorted_rules:
+                            base_ctx['non_balancing_gross'] = sum(base_ctx.get(other.name, Decimal('0')) for other in sorted_rules if other.type == 'Earning' and other.calc != 'Balancing')
+                            actual_val = evaluate_component(r, base_ctx)
+                            base_ctx[r.name] = actual_val
+                            if r.type == 'Earning':
+                                actual_components[r.name.strip()] = float(actual_val)
+                                actual_gross += float(actual_val)
+                    except Exception:
+                        pass
+
+                for k, v in components.items():
+                    if k not in actual_components:
+                        if days_paid > 0 and days_paid < calc_days:
+                            act_val = round((float(v) / float(days_paid)) * float(calc_days), 2)
+                        else:
+                            act_val = float(v)
+                        actual_components[k] = act_val
+                        actual_gross += act_val
+
+                if actual_gross == 0:
+                    actual_gross = float(emp.ctc or 0) / 12.0 if emp.ctc else slip_gross
+
+                entity_obj = None
+                if getattr(emp, 'entity', None):
+                    entity_obj = emp.entity
+                elif getattr(slip, 'run', None) and getattr(slip.run, 'entity', None):
+                    entity_obj = slip.run.entity
+                elif getattr(emp, 'department', None) and getattr(emp.department, 'entity', None):
+                    entity_obj = emp.department.entity
+                elif getattr(emp, 'branch', None) and getattr(emp.branch, 'entity', None):
+                    entity_obj = emp.branch.entity
+                elif getattr(emp, 'site', None) and getattr(emp.site, 'branch', None) and getattr(emp.site.branch, 'entity', None):
+                    entity_obj = emp.site.branch.entity
+                elif getattr(emp, 'organization', None):
+                    entity_obj = emp.organization
+
+                entity_name = entity_obj.name if entity_obj else ''
+                if not entity_name:
+                    from authentication.permissions import isolate_queryset
+                    first_ent = isolate_queryset(Entity.objects.all(), user).first()
+                    if first_ent:
+                        entity_name = first_ent.name
+
                 slips.append({
                     'id': slip.id,
                     'empId': emp.id,
@@ -449,11 +636,15 @@ class SalarySlipAPIView(APIView):
                     'lastName': emp.last_name,
                     'code': emp.code,
                     'email': emp.email,
-                    'entityName': emp.entity.name if emp.entity else (emp.site.branch.entity.name if emp.site and emp.site.branch and emp.site.branch.entity else ''),
+                    'entityName': entity_name,
+                    'designation': emp.designation.title if getattr(emp, 'designation', None) else 'N/A',
+                    'location': emp.site.name if getattr(emp, 'site', None) else (emp.entity.name if getattr(emp, 'entity', None) else 'Bangalore'),
                     'isConfidential': hide_money,
                     'ctc': 0 if hide_money else emp.ctc,
                     'gross': 0 if hide_money else slip_gross,
+                    'actual_gross': 0 if hide_money else actual_gross,
                     'components': {} if hide_money else components,
+                    'actual_components': {} if hide_money else actual_components,
                     'basic': 0 if hide_money else components.get('basic', 0),
                     'hra': 0 if hide_money else components.get('hra', 0),
                     'special': 0 if hide_money else components.get('special', 0),
@@ -474,9 +665,11 @@ class SalarySlipAPIView(APIView):
                     'daysPaid': days_paid,
                     'daysPresent': days_present,
                     'daysOff': days_off,
+                    'holidays': float(days_off),
                     'paidLeaves': float(paid_leave_days),
                     'daysAbsent': days_absent,
                     'lopDays': float(lop_days),
+                    'extraDays': float(round(float(total_ot_hours) / 8.0, 2)) if 'total_ot_hours' in locals() else 0.0,
                     'lateMarks': int(late_count),
                     'latePenalties': float(late_penalty_days),
                     'halfDays': float(half_day_count),
@@ -675,8 +868,7 @@ class PayrollPreviewAPIView(APIView):
             
             if not period:
                 return Response({'error': 'Period is required'}, status=400)
-                
-            # Direct check for can_view_confidential without empty serializer context
+                           # Direct check for can_view_confidential without empty serializer context
             user = request.user
             can_view_confidential = False
             if user and user.is_authenticated:
@@ -685,12 +877,13 @@ class PayrollPreviewAPIView(APIView):
                 else:
                     emp = getattr(user, 'employee_profile', None)
                     if emp:
-                        if getattr(emp, 'is_hr', False) or getattr(emp, 'is_admin', False) or getattr(emp, 'is_superadmin', False) or emp.role == 'super_admin':
+                        if emp.role == 'super_admin':
                             can_view_confidential = True
-                        elif emp.dynamic_role:
-                            perms = emp.dynamic_role.permissions or {}
-                            if perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1'] or perms.get('can_view_confidential') in [True, 'true', 'True', 1, '1']:
-                                can_view_confidential = True
+                        elif emp.dynamic_role and emp.dynamic_role.permissions:
+                            perms = emp.dynamic_role.permissions
+                            can_view_confidential = perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1'] or perms.get('can_view_confidential') in [True, 'true', 'True', 1, '1']
+                        elif emp.role in ['admin', 'org_admin'] or getattr(emp, 'is_admin', False):
+                            can_view_confidential = True
             
             from organisation.models import Entity
             from payroll.models import PayrollRun
@@ -705,20 +898,6 @@ class PayrollPreviewAPIView(APIView):
             else:
                 entities = Entity.objects.all()
 
-            user = request.user
-            can_view_confidential = False
-            if user and user.is_authenticated:
-                if user.is_superuser:
-                    can_view_confidential = True
-                else:
-                    emp = getattr(user, 'employee_profile', None)
-                    if emp:
-                        if getattr(emp, 'is_hr', False) or getattr(emp, 'is_admin', False) or getattr(emp, 'is_superadmin', False) or emp.role == 'super_admin':
-                            can_view_confidential = True
-                        elif emp.dynamic_role:
-                            perms = emp.dynamic_role.permissions or {}
-                            if perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1'] or perms.get('can_view_confidential') in [True, 'true', 'True', 1, '1']:
-                                can_view_confidential = True
             results = []
 
             for entity in entities:
@@ -740,13 +919,42 @@ class PayrollPreviewAPIView(APIView):
                 dag_cache = {}
                 errors = []
                 employee_details = []
+                missing_in_entity = []
+                from payroll.models import SalaryStructure
+                default_structure = SalaryStructure.objects.filter(status='Active').first()
                 for emp in employees:
                     try:
-                        if emp.salary_structure:
-                            if emp.salary_structure.id not in dag_cache:
-                                emp_rules = list(emp.salary_structure.components.all())
-                                dag_cache[emp.salary_structure.id] = build_dag_and_sort(emp_rules) if emp_rules else []
-                            emp._cached_dag = dag_cache[emp.salary_structure.id]
+                        struct = resolve_employee_salary_structure(emp, default_structure)
+                        missing_fields = []
+                        if not struct or struct.components.count() == 0:
+                            missing_fields.append("Salary Structure")
+                        if not emp.ctc or emp.ctc <= 0:
+                            missing_fields.append("CTC")
+                        
+                        safe_name = f"{getattr(emp, 'first_name', '')} {getattr(emp, 'last_name', '')}".strip()
+                        safe_dept = emp.department.name if getattr(emp, 'department', None) else ''
+                        
+                        if missing_fields:
+                            missing_in_entity.append({
+                                'id': emp.id,
+                                'code': emp.code or f"EMP{emp.id}",
+                                'name': safe_name or f"{emp.first_name} {emp.last_name}".strip(),
+                                'department': safe_dept or 'N/A',
+                                'designation': emp.designation.title if getattr(emp, 'designation', None) else 'N/A',
+                                'entity': entity.name,
+                                'entity_id': entity.id,
+                                'missing': missing_fields,
+                                'missing_salary_structure': "Salary Structure" in missing_fields,
+                                'missing_ctc': "CTC" in missing_fields,
+                            })
+
+                        assigned_struct = emp.salary_structure or struct
+                        if assigned_struct:
+                            emp.salary_structure = assigned_struct
+                            if assigned_struct.id not in dag_cache:
+                                emp_rules = list(assigned_struct.components.all())
+                                dag_cache[assigned_struct.id] = build_dag_and_sort(emp_rules) if emp_rules else []
+                            emp._cached_dag = dag_cache[assigned_struct.id]
                         else:
                             emp._cached_dag = []
                             
@@ -778,7 +986,6 @@ class PayrollPreviewAPIView(APIView):
                         hide_money = not can_view_confidential
                         
                         # SAFE EXTRACT
-                        safe_name = f"{getattr(emp, 'first_name', '')} {getattr(emp, 'last_name', '')}".strip()
                         safe_email = getattr(emp, 'email', '')
                         safe_phone = getattr(emp, 'phone', '')
                         safe_site = emp.site.name if getattr(emp, 'site', None) else ''
@@ -786,7 +993,6 @@ class PayrollPreviewAPIView(APIView):
                         elif getattr(emp, 'branch', None) and getattr(emp.branch, 'entity', None): safe_entity = emp.branch.entity.name
                         elif getattr(emp, 'site', None) and getattr(emp.site, 'branch', None) and getattr(emp.site.branch, 'entity', None): safe_entity = emp.site.branch.entity.name
                         else: safe_entity = ''
-                        safe_dept = emp.department.name if getattr(emp, 'department', None) else ''
                         safe_bank = getattr(emp, 'bank_name', '')
                         safe_ac = getattr(emp, 'bank_account', '')
                         safe_ifsc = getattr(emp, 'ifsc', '')
@@ -800,6 +1006,7 @@ class PayrollPreviewAPIView(APIView):
                         employee_details.append({
                             'id': emp.id,
                             'name': safe_name,
+                            'code': emp.code or f"EMP{emp.id}",
                             'email': safe_email,
                             'number': safe_phone or '',
                             'workFrom': safe_site,
@@ -811,7 +1018,8 @@ class PayrollPreviewAPIView(APIView):
                             'currentSalary': 0 if hide_money else sfloat(getattr(emp, 'ctc', 0)),
                             'totalDays': sfloat(context.get('total_days', 0)),
                             'presentDays': sfloat(context.get('actual_present_days', context.get('present_days', 0))),
-                            'leaves': sfloat(context.get('absent_days', 0)),
+                            'leaves': sfloat(context.get('annual_leaves', context.get('paid_leave_days', 0))),
+                            'absentDays': sfloat(context.get('absent_days', 0)),
                             'lopDays': sfloat(context.get('lop_days', 0)),
                             'ot': sfloat(context.get('ot_hours', context.get('overtime_hours', 0))),
                             'overtimeHours': sfloat(context.get('ot_hours', context.get('overtime_hours', 0))),
@@ -827,7 +1035,13 @@ class PayrollPreviewAPIView(APIView):
                             'reimbursement': 0 if hide_money else sfloat(reimbursement),
                             'incentive': 0 if hide_money else sfloat(incentive),
                             'payableSalary': 0 if hide_money else sfloat(net),
-                            'isConfidential': hide_money
+                            'isConfidential': hide_money,
+                            'salaryStructure': assigned_struct.id if assigned_struct else None,
+                            'salary_structure': assigned_struct.id if assigned_struct else None,
+                            'missingFields': missing_fields,
+                            'hasSalaryStructure': "Salary Structure" not in missing_fields,
+                            'hasCtc': "CTC" not in missing_fields,
+                            'isValidForRun': len(missing_fields) == 0,
                         })
                     except Exception as e:
                         import traceback
@@ -840,7 +1054,11 @@ class PayrollPreviewAPIView(APIView):
                             'workFrom': '', 'entity': '', 'department': '', 'bankName': '', 'acNo': '',
                             'ifscCode': '', 'currentSalary': 0, 'totalDays': 0, 'presentDays': 0,
                             'totalAmount': 0, 'deduction': 0, 'pf': 0, 'pt': 0, 'reimbursement': 0,
-                            'incentive': 0, 'payableSalary': 0, 'isConfidential': False
+                            'incentive': 0, 'payableSalary': 0, 'isConfidential': False,
+                            'missingFields': ['Configuration error'],
+                            'hasSalaryStructure': False,
+                            'hasCtc': False,
+                            'isValidForRun': False
                         })
                         emp_count += 1
                 
@@ -859,10 +1077,18 @@ class PayrollPreviewAPIView(APIView):
                     'isConfidential': not can_view_confidential,
                     'errors': errors[:5],  # send first 5 errors for debugging
                     'employee_details': employee_details,
-                    'employeeDetails': employee_details # Failsafe for OneClickPanel
+                    'employeeDetails': employee_details, # Failsafe for OneClickPanel
+                    'missing_employees': missing_in_entity,
+                    'can_run': len(missing_in_entity) == 0
                 })
                     
-            return Response({'status': 'success', 'data': results})
+            all_missing = [m for r in results for m in r.get('missing_employees', [])]
+            return Response({
+                'status': 'success',
+                'data': results,
+                'can_run': len(all_missing) == 0,
+                'missing_employees': all_missing
+            })
         except Exception as e:
             import traceback
             tb = traceback.format_exc()
@@ -899,8 +1125,11 @@ class Form16DocumentViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         user = self.request.user
         emp = getattr(user, 'employee_profile', None)
         
-        # Super admins and HR can see all
-        if user.is_superuser or user.is_staff or (emp and emp.role in ['super_admin', 'org_admin']):
+        # Super admin cannot view site employee Form 16s
+        if user.is_superuser:
+            return qs.none()
+            
+        if emp and emp.role in ['org_admin', 'admin']:
             return qs
             
         # Regular employees can only see their own
@@ -962,11 +1191,13 @@ from rest_framework.parsers import MultiPartParser
 from django.http import HttpResponse
 
 class CTCImportHistoryViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Import CTC'
     permission_classes = [IsAuthenticated, IsHR]
     queryset = CTCImportHistory.objects.all().order_by('-import_date')
     serializer_class = CTCImportHistorySerializer
 
 class ImportCTCTemplateView(APIView):
+    rbac_module = 'Import CTC'
     permission_classes = [IsAuthenticated, IsHR]
     
     def get(self, request):
@@ -988,6 +1219,7 @@ class ImportCTCTemplateView(APIView):
         return response
 
 class ImportCTCAPIView(APIView):
+    rbac_module = 'Import CTC'
     permission_classes = [IsAuthenticated, IsHR]
     parser_classes = [MultiPartParser]
 

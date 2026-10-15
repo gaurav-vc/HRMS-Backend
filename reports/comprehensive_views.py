@@ -17,11 +17,12 @@ class ComprehensiveReportView(APIView):
         from authentication.permissions import _get_admin_sites
         admin_sites = _get_admin_sites(user)
         
+        if user.is_superuser:
+            return Response({'error': 'Super admin does not have access to site operational reports'}, status=403)
+        
         # Determine dynamic role access
         has_report_access = False
-        if user.is_superuser:
-            has_report_access = True
-        elif emp and emp.role in ['super_admin', 'org_admin', 'hr', 'manager', 'site_admin']:
+        if emp and emp.role in ['org_admin', 'hr', 'manager', 'site_admin']:
             has_report_access = True
         elif admin_sites.exists():
             has_report_access = True

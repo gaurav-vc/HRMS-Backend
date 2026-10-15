@@ -58,5 +58,5 @@ def setup_lotus_roles():
             
     print("Successfully completed role generation and admin provisioning!")
 
-# Execute immediately when loaded in shell
-setup_lotus_roles()
+if __name__ == '__main__':
+    setup_lotus_roles()

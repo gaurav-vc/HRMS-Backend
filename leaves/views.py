@@ -90,6 +90,7 @@ def calculate_working_days(start_date, end_date, site_id=None):
     return Decimal(days)
 
 class LeavePolicyConfigAPIView(APIView):
+    rbac_module = 'Leave Policies'
     def get(self, request):
         import sys
         config = LeavePolicyConfiguration.get_settings()
@@ -108,6 +109,7 @@ class LeavePolicyConfigAPIView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 class LeaveTypeViewSet(DataIsolationMixin, viewsets.ReadOnlyModelViewSet):
+    rbac_module = 'Leave Policies'
     queryset = LeaveType.objects.all()
     serializer_class = LeaveTypeSerializer
 
@@ -126,6 +128,7 @@ class LeaveTypeViewSet(DataIsolationMixin, viewsets.ReadOnlyModelViewSet):
             return super().get_queryset()
 
 class LeaveBalanceViewSet(DataIsolationMixin, viewsets.ReadOnlyModelViewSet):
+    rbac_module = 'Leave Balances'
     serializer_class = LeaveBalanceSerializer
 
     def get_queryset(self):
@@ -346,6 +349,10 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=['patch'])
     def approve(self, request, pk=None):
+        from authentication.permissions import user_can_approve
+        if not user_can_approve(request.user, module='Leave Requests'):
+            return Response({"detail": "Permission denied. You do not have permission to approve leave requests."}, status=status.HTTP_403_FORBIDDEN)
+
         leave_req = self.get_object()
         if leave_req.status != 'Pending':
             return Response({"detail": "Only pending requests can be approved."}, status=status.HTTP_400_BAD_REQUEST)
@@ -389,6 +396,10 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=['patch'])
     def reject(self, request, pk=None):
+        from authentication.permissions import user_can_approve
+        if not user_can_approve(request.user, module='Leave Requests'):
+            return Response({"detail": "Permission denied. You do not have permission to reject leave requests."}, status=status.HTTP_403_FORBIDDEN)
+
         leave_req = self.get_object()
         if leave_req.status != 'Pending':
             return Response({"detail": "Only pending requests can be rejected."}, status=status.HTTP_400_BAD_REQUEST)

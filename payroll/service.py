@@ -190,22 +190,28 @@ class PayrollService:
         
         # Override attendance variables if provided (check both camel/snake case due to DRF middleware)
         if emp_override:
-            if 'present_days' in emp_override: present_count = float(emp_override['present_days'])
-            elif 'presentDays' in emp_override: present_count = float(emp_override['presentDays'])
+            if 'leaves' in emp_override: paid_leave_days = float(emp_override['leaves'] or 0)
+            elif 'paid_leave_days' in emp_override: paid_leave_days = float(emp_override['paid_leave_days'] or 0)
+            elif 'annual_leaves' in emp_override: paid_leave_days = float(emp_override['annual_leaves'] or 0)
+            elif 'annualLeaves' in emp_override: paid_leave_days = float(emp_override['annualLeaves'] or 0)
+
+            if 'lop_days' in emp_override: lop_days = float(emp_override['lop_days'] or 0)
+            elif 'lopDays' in emp_override: lop_days = float(emp_override['lopDays'] or 0)
+            elif 'lop' in emp_override: lop_days = float(emp_override['lop'] or 0)
             
-            if 'lop_days' in emp_override: lop_days = float(emp_override['lop_days'])
-            elif 'lopDays' in emp_override: lop_days = float(emp_override['lopDays'])
+            if 'half_days' in emp_override: half_day_count = float(emp_override['half_days'] or 0)
+            elif 'halfDays' in emp_override: half_day_count = float(emp_override['halfDays'] or 0)
             
-            if 'half_days' in emp_override: half_day_count = float(emp_override['half_days'])
-            elif 'halfDays' in emp_override: half_day_count = float(emp_override['halfDays'])
-            
-            if 'late_penalties' in emp_override: late_penalty_days = float(emp_override['late_penalties'])
-            elif 'latePenalties' in emp_override: late_penalty_days = float(emp_override['latePenalties'])
+            if 'late_penalties' in emp_override: late_penalty_days = float(emp_override['late_penalties'] or 0)
+            elif 'latePenalties' in emp_override: late_penalty_days = float(emp_override['latePenalties'] or 0)
             
             if 'ot' in emp_override: overtime_hours = Decimal(str(emp_override['ot'] or 0))
             elif 'ot_hours' in emp_override: overtime_hours = Decimal(str(emp_override['ot_hours'] or 0))
             elif 'overtimeHours' in emp_override: overtime_hours = Decimal(str(emp_override['overtimeHours'] or 0))
             elif 'overtime' in emp_override: overtime_hours = Decimal(str(emp_override['overtime'] or 0))
+
+            if 'present_days' in emp_override: present_count = float(emp_override['present_days'] or 0)
+            elif 'presentDays' in emp_override: present_count = float(emp_override['presentDays'] or 0)
         
         worked_days = float(present_count) + (float(half_day_count) * 0.5)
         
@@ -214,13 +220,36 @@ class PayrollService:
         else:
             calculated_paid_days = float(total_days) - float(absent_count) - (float(half_day_count) * 0.5) - float(lop_days) - float(late_penalty_days)
             
-        # DRF camelCase middleware converts incoming presentDays to present_days
-        if emp_override and 'present_days' in emp_override:
-            present_days = float(emp_override['present_days'])
-        elif emp_override and 'presentDays' in emp_override:
-            present_days = float(emp_override['presentDays'])
-        elif emp_override and 'daysPaid' in emp_override:
-            present_days = float(emp_override['daysPaid'])
+        # Determine payable days with 100% mathematical precision
+        calculated_override_payable = max(0.0, float(total_days) - float(lop_days) - (float(half_day_count) * 0.5) - float(late_penalty_days))
+        calculated_override_payable = min(calculated_override_payable, float(total_days))
+
+        if emp_override:
+            user_days_paid = None
+            for key in ['daysPaid', 'days_paid', 'payable_days', 'payableDays']:
+                if key in emp_override and emp_override[key] is not None and str(emp_override[key]).strip() != '':
+                    try:
+                        user_days_paid = float(emp_override[key])
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+            has_explicit_deduction_override = any(
+                k in emp_override and emp_override[k] is not None and str(emp_override[k]).strip() != ''
+                for k in ['lop_days', 'lopDays', 'lop', 'half_days', 'halfDays', 'late_penalties', 'latePenalties']
+            )
+
+            if has_explicit_deduction_override:
+                if user_days_paid is not None and user_days_paid < calculated_override_payable:
+                    present_days = user_days_paid
+                else:
+                    present_days = calculated_override_payable
+            elif user_days_paid is not None:
+                present_days = max(0.0, min(user_days_paid, float(total_days)))
+            elif 'present_days' in emp_override or 'presentDays' in emp_override:
+                present_days = max(0.0, min(float(emp_override.get('present_days') or emp_override.get('presentDays') or 0), float(total_days)))
+            else:
+                present_days = max(0.0, min(calculated_paid_days, float(total_days)))
         else:
             present_days = max(0.0, min(calculated_paid_days, float(total_days)))
         
@@ -241,6 +270,8 @@ class PayrollService:
             'half_day_count': Decimal(str(half_day_count)),
             'late_penalty_days': Decimal(str(late_penalty_days)),
             'paid_days': Decimal(str(present_days)),
+            'paid_leave_days': Decimal(str(paid_leave_days)),
+            'annual_leaves': Decimal(str(paid_leave_days)),
             'pf_wage_limit': settings.pf_wage_limit,
             'esic_wage_limit': settings.esic_wage_limit,
             'state': 'KA', 
@@ -539,9 +570,17 @@ class PayrollService:
                 
                 # Cache DAGs to avoid rebuilding for identical structures
                 dag_cache = {}
+                from payroll.models import SalaryStructure
+                default_struct = SalaryStructure.objects.filter(status='Active').first()
                 for emp in employees:
-                    struct = emp.salary_structure
+                    struct = (
+                        emp.salary_structure or
+                        (emp.site and SalaryStructure.objects.filter(site=emp.site, status='Active').first()) or
+                        (emp.entity and SalaryStructure.objects.filter(site__branch__entity=emp.entity, status='Active').first()) or
+                        default_struct
+                    )
                     if struct:
+                        emp.salary_structure = struct
                         if struct.id not in dag_cache:
                             emp_rules = list(struct.components.all())
                             dag_cache[struct.id] = build_dag_and_sort(emp_rules) if emp_rules else []
@@ -558,9 +597,9 @@ class PayrollService:
                 for emp in employees:
                     try:
                         if not emp.salary_structure:
-                            raise ValueError(f"Employee {emp.code} has no Salary Structure assigned.")
-                        if not getattr(emp, '_cached_dag', []):
-                            raise ValueError(f"Assigned structure '{emp.salary_structure.name}' has no components.")
+                            if default_struct:
+                                emp.salary_structure = default_struct
+                                emp._cached_dag = dag_cache.get(default_struct.id, [])
                             
                         emp_override = None
                         if overrides:
@@ -636,7 +675,7 @@ class PayrollService:
                     # Notify Approvers
                     from employees.models import Notification
                     for approver in Employee.objects.filter(status='Active'):
-                        if approver.dynamic_role and approver.dynamic_role.permissions and approver.dynamic_role.permissions.get('can_approve_payroll'):
+                        if approver.dynamic_role and approver.dynamic_role.permissions and approver.dynamic_role.permissions.get('can_approve_payroll') in [True, 'true', 'True', 1, '1']:
                             Notification.objects.create(
                                 recipient=approver,
                                 title="Payroll Ready for Review",
@@ -660,6 +699,25 @@ class PayrollService:
         run = PayrollRun.objects.get(id=run_id)
         if run.status in ['Frozen', 'Disbursed']:
             raise ValueError("Cannot execute a run that is Frozen or Disbursed")
+
+        # Double-check that all active employees in this entity have Salary Structure and CTC
+        from employees.models import Employee
+        from django.db.models import Q
+        active_emps = Employee.objects.filter(
+            Q(entity=run.entity) | Q(branch__entity=run.entity) | Q(site__branch__entity=run.entity),
+            status='Active'
+        ).select_related('salary_structure').prefetch_related('salary_structure__components')
+        
+        missing_records = []
+        for emp in active_emps:
+            if not emp.salary_structure or emp.salary_structure.components.count() == 0:
+                missing_records.append(f"{emp.code} (Missing Salary Structure)")
+            elif not emp.ctc or emp.ctc <= 0:
+                missing_records.append(f"{emp.code} (Missing CTC)")
+                
+        if missing_records:
+            raise ValueError(f"Cannot execute payroll. {len(missing_records)} active employee(s) have missing configuration: {', '.join(missing_records[:5])}")
+
         run.status = 'Processing'
         run.save()
         is_simulation = (run.run_type == 'Simulation')

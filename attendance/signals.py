@@ -14,9 +14,10 @@ def get_authorizers(employee):
         if admins.exists():
             authorizers.extend(list(admins))
         else:
-            # Fallback to superusers
-            superusers = Employee.objects.filter(user__is_superuser=True)
-            authorizers.extend(list(superusers))
+            # Fallback to Org Admin or Site Admin
+            admins = Employee.objects.filter(role__in=['admin', 'org_admin', 'site_admin'])
+            if admins.exists():
+                authorizers.extend(list(admins))
     return list(set(authorizers))  # Unique authorized employees
 
 @receiver(post_save, sender=RegularizationRequest)

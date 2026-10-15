@@ -55,10 +55,15 @@ class PayrollRunSerializer(serializers.ModelSerializer):
         if user.is_superuser:
             return True
         emp = getattr(user, 'employee_profile', None)
-        if emp and emp.role == 'super_admin':
+        if emp and emp.role in ['super_admin', 'org_admin', 'admin']:
             return True
-        if emp and emp.dynamic_role and emp.dynamic_role.permissions and emp.dynamic_role.permissions.get('can_view_confidential_payroll'):
+        from organisation.models import Site
+        if Site.objects.filter(contact_email=user.email).exists():
             return True
+        if emp and emp.dynamic_role and emp.dynamic_role.permissions:
+            perms = emp.dynamic_role.permissions
+            if perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1'] or perms.get('can_view_confidential') in [True, 'true', 'True', 1, '1']:
+                return True
         return False
         
     def get_gross(self, obj):

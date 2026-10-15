@@ -56,6 +56,8 @@ class DashboardView(DataIsolationMixin, APIView):
 
     def get(self, request):
         user = request.user
+        if user.is_superuser:
+            return Response({"error": "Super admin does not have access to site operational reports"}, status=403)
         emp = getattr(user, 'employee_profile', None)
         
         from django.db.models import Q

@@ -4,30 +4,90 @@ from django.utils import timezone
 from datetime import timedelta
 from employees.models import Employee
 from organisation.models import Entity, Site
-from admin_org.models import Organization
-from leaves.models import LeaveRequest
+from admin_org.models import Organization, Invoice
+from leaves.models import LeaveRequest, LeaveBalance
 from attendance.models import DailyAttendance, PunchLog, RegularizationRequest
 from payroll.models import PayrollRun, Loan, Reimbursement
 from decimal import Decimal
 from django.db.models import Count, Sum
 from datetime import date
-from leaves.models import LeaveRequest, LeaveBalance
 
 class DashboardStatsAPIView(APIView):
     def get(self, request):
-        today = timezone.localdate()
         user = request.user
+        
+        # Strict security boundary: Superuser only sees super admin data, NO site data
+        if user.is_superuser:
+            total_revenue_query = Invoice.objects.aggregate(Sum('amount'))['amount__sum']
+            total_revenue = float(total_revenue_query) if total_revenue_query else 0.0
+
+            super_admin_stats = {
+                "totalRevenue": total_revenue,
+                "activeSites": Site.objects.filter(status='Active', is_sub_site=False).count(),
+                "totalCompany": Organization.objects.count(),
+                "moduleWiseRevenue": []
+            }
+            try:
+                top_orgs = list(Organization.objects.annotate(site_count=Count('sites')).order_by('-site_count')[:3])
+                top_org_names = [org.name for org in top_orgs]
+                
+                today_date = timezone.now().date()
+                months = []
+                for i in range(6, -1, -1):
+                    m = today_date.month - i
+                    y = today_date.year
+                    while m <= 0:
+                        m += 12
+                        y -= 1
+                    months.append(date(y, m, 1))
+                
+                company_wise_data = []
+                for m in months:
+                    month_name = m.strftime('%b')
+                    data_point = {"name": month_name}
+                    for org in top_orgs:
+                        count = Site.objects.filter(organization=org, created_at__date__lte=date(m.year, m.month, 28), is_sub_site=False).count()
+                        data_point[org.name] = count
+                    company_wise_data.append(data_point)
+                
+                module_wise_data = []
+                for m in months:
+                    month_name = m.strftime('%b')
+                    count = Site.objects.filter(created_at__date__lte=date(m.year, m.month, 28), is_sub_site=False).count()
+                    module_wise_data.append({"name": month_name, "site": count})
+                    
+                super_admin_stats["companyWiseSite"] = company_wise_data
+                super_admin_stats["moduleWiseSite"] = module_wise_data
+                super_admin_stats["topOrgs"] = top_org_names
+            except Exception as e:
+                super_admin_stats["companyWiseSite"] = []
+                super_admin_stats["moduleWiseSite"] = []
+                super_admin_stats["topOrgs"] = []
+
+            return Response({
+                "super_admin": super_admin_stats
+            })
+
+        today = timezone.localdate()
         can_view_confidential = False
-        is_super_admin = user.is_superuser
         emp = getattr(user, 'employee_profile', None)
-        if emp and emp.role == 'super_admin':
-            is_super_admin = True
-        if is_super_admin:
-            can_view_confidential = True
-        elif emp and emp.dynamic_role and emp.dynamic_role.permissions and emp.dynamic_role.permissions.get('can_view_confidential_payroll'):
+        if emp and emp.dynamic_role and emp.dynamic_role.permissions and emp.dynamic_role.permissions.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1']:
             can_view_confidential = True
         
         from authentication.permissions import isolate_queryset
+
+        # Self-heal unassigned site/entity for employees in the user's organization
+        # Resolves orphan records where an employee was created without a site assignment
+        if emp and emp.organization_id:
+            unassigned_emps = Employee.objects.filter(organization_id=emp.organization_id, site__isnull=True)
+            if unassigned_emps.exists():
+                primary_site = emp.site or Site.objects.filter(organization_id=emp.organization_id).first()
+                if primary_site:
+                    unassigned_emps.update(site=primary_site)
+            # Inherit missing entity from primary site's branch entity
+            site_to_use = emp.site or Site.objects.filter(organization_id=emp.organization_id).first()
+            if site_to_use and site_to_use.branch and site_to_use.branch.entity_id:
+                Employee.objects.filter(organization_id=emp.organization_id, entity__isnull=True).update(entity=site_to_use.branch.entity)
         
         # 1. Headcount & Entities
         employees = isolate_queryset(Employee.objects.all(), user)
@@ -38,7 +98,7 @@ class DashboardStatsAPIView(APIView):
         headcount_by_entity = []
         for e in entities:
             headcount_by_entity.append({
-                "name": e.code,
+                "name": e.code or e.name,
                 "value": employees.filter(entity=e, status='Active').count()
             })
             
@@ -100,7 +160,7 @@ class DashboardStatsAPIView(APIView):
             exceptions.append({
                 "kind": "Regularization",
                 "who": f"{r.employee.first_name} {r.employee.last_name}",
-                "detail": f"Awaiting review",
+                "detail": "Awaiting review",
                 "tone": "info"
             })
             
@@ -115,62 +175,28 @@ class DashboardStatsAPIView(APIView):
                 "status": l.status
             })
             
-        super_admin_stats = {}
-        if is_super_admin:
-            from admin_org.models import Invoice
-            
-            total_revenue_query = Invoice.objects.aggregate(Sum('amount'))['amount__sum']
-            total_revenue = float(total_revenue_query) if total_revenue_query else 0.0
-
-            # Stats for super admin
-            super_admin_stats = {
-                "totalRevenue": total_revenue,
-                "activeSites": Site.objects.filter(status='Active', is_sub_site=False).count(),
-                "totalUsers": Employee.objects.count(),
-                "totalCompany": Organization.objects.count(),
-                "moduleWiseRevenue": []
-            }
-            
+        # Dynamic deltas and cycle periods
+        payroll_cycle_month = today.strftime('%B')
+        if recent_runs and recent_runs[0].get('period'):
             try:
-                # Real dynamic data for charts
-                top_orgs = list(Organization.objects.annotate(site_count=Count('sites')).order_by('-site_count')[:3])
-                top_org_names = [org.name for org in top_orgs]
+                parts = recent_runs[0]['period'].split('-')
+                if len(parts) >= 2:
+                    payroll_cycle_month = date(int(parts[0]), int(parts[1]), 1).strftime('%B')
+            except Exception:
+                pass
                 
-                today = timezone.now().date()
-                months = []
-                for i in range(6, -1, -1):
-                    m = today.month - i
-                    y = today.year
-                    while m <= 0:
-                        m += 12
-                        y -= 1
-                    months.append(date(y, m, 1))
-                
-                company_wise_data = []
-                for m in months:
-                    month_name = m.strftime('%b')
-                    data_point = {"name": month_name}
-                    for org in top_orgs:
-                        # safe filtering by date if created_at exists
-                        count = Site.objects.filter(organization=org, created_at__date__lte=date(m.year, m.month, 28), is_sub_site=False).count()
-                        data_point[org.name] = count
-                    company_wise_data.append(data_point)
-                
-                module_wise_data = []
-                for m in months:
-                    month_name = m.strftime('%b')
-                    count = Site.objects.filter(created_at__date__lte=date(m.year, m.month, 28), is_sub_site=False).count()
-                    module_wise_data.append({"name": month_name, "site": count})
-                    
-                super_admin_stats["companyWiseSite"] = company_wise_data
-                super_admin_stats["moduleWiseSite"] = module_wise_data
-                super_admin_stats["topOrgs"] = top_org_names
-            except Exception as e:
-                import traceback
-                print("DASHBOARD STATS ERROR:", traceback.format_exc())
-                super_admin_stats["companyWiseSite"] = [{"name": "Error", "Error": 0}]
-                super_admin_stats["moduleWiseSite"] = [{"name": "Error", "site": 0}]
-                super_admin_stats["topOrgs"] = ["Error: " + str(e)[:30]]
+        payroll_growth = "+0.0%"
+        if len(recent_runs) >= 2 and recent_runs[1].get('net', 0) > 0:
+            diff = ((recent_runs[0]['net'] - recent_runs[1]['net']) / recent_runs[1]['net']) * 100
+            payroll_growth = f"{'+' if diff >= 0 else ''}{diff:.1f}%"
+            
+        new_hires_count = employees.filter(status='Active', doj__gte=today - timedelta(days=30)).count()
+        headcount_delta = f"+{new_hires_count} new this month" if new_hires_count > 0 else "Stable vs last period"
+        attendance_rate = round((present_today / total_headcount) * 100, 1) if total_headcount > 0 else 0
+        attendance_delta = f"{attendance_rate}% turnout"
+        approvals_delta = f"{pending_leaves.count()} leaves, {pending_regs.count()} reg"
+
+        super_admin_stats = {}
 
         payload = {
             "super_admin": super_admin_stats,
@@ -178,6 +204,8 @@ class DashboardStatsAPIView(APIView):
                 "totalHeadcount": total_headcount,
                 "presentToday": present_today,
                 "pendingLeaves": pending_leaves.count(),
+                "pendingRegs": pending_regs.count(),
+                "totalPendingApprovals": pending_leaves.count() + pending_regs.count(),
                 "lastRunNet": last_run_net,
                 "entitiesCount": entities.count(),
                 "payrollTrend": monthly_trend,
@@ -185,7 +213,12 @@ class DashboardStatsAPIView(APIView):
                 "pendingLeaveList": pending_leave_list,
                 "recentRuns": recent_runs,
                 "attendanceModes": { "qr": qr_count, "face": face_count, "gps": gps_count },
-                "exceptionAlerts": exceptions
+                "exceptionAlerts": exceptions,
+                "payrollCycleMonth": payroll_cycle_month,
+                "payrollGrowth": payroll_growth,
+                "headcountDelta": headcount_delta,
+                "attendanceDelta": attendance_delta,
+                "approvalsDelta": approvals_delta,
             },
             "payroll": {
                 "activeCycle": recent_runs[0]['period'] if recent_runs else today.strftime("%Y-%m"),

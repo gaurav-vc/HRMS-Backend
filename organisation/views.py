@@ -146,40 +146,41 @@ def provision_contact_person(site, origin=None):
             if changed:
                 role_obj.save(update_fields=['permissions'])
 
-        emp = getattr(user, 'employee_profile', None)
-        
-        branch = site.branch if hasattr(site, 'branch') else None
-        entity = branch.entity if branch else None
-        
-        if not emp:
-            name_parts = (site.contact_name or email.split('@')[0]).split(' ', 1)
-            f_name = name_parts[0]
-            l_name = name_parts[1] if len(name_parts) > 1 else ''
+        if not user.is_superuser:
+            emp = getattr(user, 'employee_profile', None)
             
-            emp = Employee.objects.create(
-                user=user,
-                first_name=f_name,
-                last_name=l_name,
-                email=email,
-                code=f"EMP-{user.id:04d}",
-                role='site_admin',
-                dynamic_role=role_obj,
-                site=site,
-                branch=branch,
-                entity=entity,
-                organization=site.organization if hasattr(site, 'organization') else None,
-                status='Active'
-            )
-        else:
-            if not emp.site:
-                emp.site = site
-            if emp.role == 'employee':
-                emp.role = 'site_admin'
-                emp.dynamic_role = role_obj
-            emp.save()
+            branch = site.branch if hasattr(site, 'branch') else None
+            entity = branch.entity if branch else None
             
-        if site not in emp.enrolled_sites.all():
-            emp.enrolled_sites.add(site)
+            if not emp:
+                name_parts = (site.contact_name or email.split('@')[0]).split(' ', 1)
+                f_name = name_parts[0]
+                l_name = name_parts[1] if len(name_parts) > 1 else ''
+                
+                emp = Employee.objects.create(
+                    user=user,
+                    first_name=f_name,
+                    last_name=l_name,
+                    email=email,
+                    code=f"EMP-{user.id:04d}",
+                    role='site_admin',
+                    dynamic_role=role_obj,
+                    site=site,
+                    branch=branch,
+                    entity=entity,
+                    organization=site.organization if hasattr(site, 'organization') else None,
+                    status='Active'
+                )
+            else:
+                if not emp.site:
+                    emp.site = site
+                if emp.role == 'employee':
+                    emp.role = 'site_admin'
+                    emp.dynamic_role = role_obj
+                emp.save()
+                
+            if site not in emp.enrolled_sites.all():
+                emp.enrolled_sites.add(site)
             
     except Exception as e:
         print(f"Failed to create/update employee profile: {e}")
@@ -259,11 +260,23 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         user = self.request.user
+        from authentication.permissions import _get_tenant_site
         
-        if hasattr(user, 'employee_profile') and user.employee_profile and user.employee_profile.role != 'super_admin' and user.employee_profile.organization:
-            site = serializer.save(organization=user.employee_profile.organization)
-        else:
-            site = serializer.save()
+        save_kwargs = {}
+        if not user.is_superuser:
+            tenant_site = _get_tenant_site(user)
+            if tenant_site:
+                save_kwargs['is_sub_site'] = True
+                if tenant_site.organization:
+                    save_kwargs['organization'] = tenant_site.organization
+                if tenant_site.branch and 'branch' not in serializer.validated_data:
+                    save_kwargs['branch'] = tenant_site.branch
+                if not serializer.validated_data.get('contact_email') and tenant_site.contact_email:
+                    save_kwargs['contact_email'] = tenant_site.contact_email
+        elif hasattr(user, 'employee_profile') and user.employee_profile and user.employee_profile.organization:
+            save_kwargs['organization'] = user.employee_profile.organization
+            
+        site = serializer.save(**save_kwargs)
         
         # Auto-enroll the creator into the new site so it shows up in their dashboard immediately
         # Skip this for super_admin and org_admin to prevent them from showing up in the site's employee list
@@ -313,7 +326,15 @@ class RoleViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     serializer_class = RoleSerializer
 
     def perform_create(self, serializer):
-        role = serializer.save()
+        user = self.request.user
+        from authentication.permissions import _get_tenant_site
+        tenant_site = _get_tenant_site(user)
+        save_kwargs = {}
+        if tenant_site:
+            save_kwargs['site'] = tenant_site
+            if tenant_site.organization:
+                save_kwargs['organization'] = tenant_site.organization
+        role = serializer.save(**save_kwargs)
         try:
             from org_engine.models import OrganizationNode, OrganizationNodeType
             role_type, _ = OrganizationNodeType.objects.get_or_create(name='Role')
