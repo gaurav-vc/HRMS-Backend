@@ -111,13 +111,15 @@ class UserProfileSerializer(serializers.ModelSerializer):
                 except Exception:
                     pass
 
+            if emp.dynamic_role:
+                perms_dash = (emp.dynamic_role.permissions or {}).get('dashboard_type')
+                if perms_dash:
+                    return str(perms_dash).lower()
+                if getattr(emp.dynamic_role, 'dashboard_type', None):
+                    return str(emp.dynamic_role.dashboard_type).lower()
+
             if emp.role and emp.role not in ['employee', 'super_admin']:
                 return emp.role
-
-            if emp.dynamic_role and getattr(emp.dynamic_role, 'dashboard_type', None):
-                dash = str(emp.dynamic_role.dashboard_type).lower()
-                if dash in ['manager', 'payroll_admin', 'group_hr', 'entity_hr', 'site_admin']:
-                    return dash
 
             return emp.role if emp.role != 'super_admin' else 'employee'
         return 'employee'
@@ -155,6 +157,8 @@ class UserProfileSerializer(serializers.ModelSerializer):
         if emp and emp.dynamic_role:
             permissions.update(emp.dynamic_role.permissions or {})
             permissions['can_approve'] = bool(emp.dynamic_role.can_approve)
+            if emp.dynamic_role.dashboard_type and not permissions.get('dashboard_type'):
+                permissions['dashboard_type'] = str(emp.dynamic_role.dashboard_type).lower()
             
         site = self._get_user_site(obj)
         is_site_admin = bool(
@@ -188,6 +192,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
                 'can_view_confidential',
                 'can_process_payroll',
                 'allowed_entities',
+                'dashboard_type',
             }
 
             # Filter module-level permissions strictly by site's allowed modules,
@@ -238,13 +243,16 @@ class UserProfileSerializer(serializers.ModelSerializer):
     def get_dashboard_type(self, obj):
         if obj.is_superuser:
             return 'superadmin'
-        from organisation.models import Site
-        if Site.objects.filter(contact_email=obj.email).exists():
-            return 'manager' # Site Admins see the manager/executive dashboard
         emp = self._get_employee(obj)
-        if emp and emp.dynamic_role and emp.dynamic_role.dashboard_type:
-            return emp.dynamic_role.dashboard_type
-        return None
+        if emp and emp.dynamic_role:
+            perms_dash = (emp.dynamic_role.permissions or {}).get('dashboard_type')
+            if perms_dash:
+                return str(perms_dash).lower()
+            if getattr(emp.dynamic_role, 'dashboard_type', None):
+                return str(emp.dynamic_role.dashboard_type).lower()
+        if emp and emp.role:
+            return str(emp.role).lower()
+        return 'employee'
 
     def get_site_name(self, obj):
         if obj.is_superuser:
