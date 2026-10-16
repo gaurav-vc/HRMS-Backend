@@ -111,7 +111,7 @@ def provision_contact_person(site, origin=None):
 
     try:
         from employees.models import Employee
-        from organisation.models import Role
+        from organisation.models import Role, Entity, Branch
         default_perms = {
             'Entities': {'view': True, 'create': True, 'update': True, 'delete': True},
             'Branches': {'view': True, 'create': True, 'update': True, 'delete': True},
@@ -129,28 +129,34 @@ def provision_contact_person(site, origin=None):
         }
         role_obj = Role.objects.filter(name='Site Admin').first()
         if not role_obj:
-            role_obj = Role.objects.create(name='Site Admin', code='SITE_ADMIN', permissions=default_perms)
+            role_obj = Role.objects.create(name='Site Admin', code='SITE_ADMIN', access_scope='Corporate', permissions=default_perms)
             created = True
         else:
             created = False
             
-        if not created:
-            # Always ensure Site Admin has the latest full permissions
-            changed = False
-            if not role_obj.permissions:
-                role_obj.permissions = {}
-            for k, v in default_perms.items():
-                if k not in role_obj.permissions:
-                    role_obj.permissions[k] = v
-                    changed = True
-            if changed:
-                role_obj.save(update_fields=['permissions'])
+        # Always ensure Site Admin has Corporate scope and full permissions
+        changed = False
+        if role_obj.access_scope != 'Corporate':
+            role_obj.access_scope = 'Corporate'
+            changed = True
+        if not role_obj.permissions:
+            role_obj.permissions = {}
+        for k, v in default_perms.items():
+            if k not in role_obj.permissions:
+                role_obj.permissions[k] = v
+                changed = True
+        if changed:
+            role_obj.save(update_fields=['access_scope', 'permissions'])
 
         if not user.is_superuser:
             emp = getattr(user, 'employee_profile', None)
             
-            branch = site.branch if hasattr(site, 'branch') else None
+            branch = site.branch if hasattr(site, 'branch') and site.branch else None
             entity = branch.entity if branch else None
+            if not entity and getattr(site, 'organization_id', None):
+                entity = Entity.objects.filter(organization_id=site.organization_id).first()
+                if entity and not branch:
+                    branch = entity.branches.first()
             
             if not emp:
                 name_parts = (site.contact_name or email.split('@')[0]).split(' ', 1)

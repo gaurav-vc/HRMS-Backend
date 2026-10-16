@@ -325,24 +325,32 @@ def _get_tenant_scope(user):
         enrolled_subs = employee.enrolled_sites.filter(is_sub_site=True).values_list('id', flat=True)
         all_site_ids.update(enrolled_subs)
 
-    # Branch IDs
+    # 4. Any sub-site belonging to this site's organization
+    if tenant_site.organization_id:
+        org_sub_sites = Site.objects.filter(organization_id=tenant_site.organization_id, is_sub_site=True).values_list('id', flat=True)
+        all_site_ids.update(org_sub_sites)
+
+    # Entity IDs - 100% dynamic, multi-tenant isolated via Organization & Branch relations
+    entity_ids = set()
+    if tenant_site.organization_id:
+        org_entities = Entity.objects.filter(organization_id=tenant_site.organization_id).values_list('id', flat=True)
+        entity_ids.update(org_entities)
+    if employee and employee.entity_id:
+        entity_ids.add(employee.entity_id)
+    if tenant_site.branch and tenant_site.branch.entity_id:
+        entity_ids.add(tenant_site.branch.entity_id)
+
+    # Branch IDs - 100% dynamic from tenant entities and site/employee assignments
     branch_ids = set()
+    if entity_ids:
+        ent_branches = Branch.objects.filter(entity_id__in=entity_ids).values_list('id', flat=True)
+        branch_ids.update(ent_branches)
     if tenant_site.branch_id:
         branch_ids.add(tenant_site.branch_id)
     site_branch_ids = Site.objects.filter(id__in=all_site_ids, branch__isnull=False).values_list('branch_id', flat=True)
     branch_ids.update(site_branch_ids)
     if employee and employee.branch_id:
         branch_ids.add(employee.branch_id)
-
-    # Entity IDs
-    entity_ids = set()
-    if branch_ids:
-        b_entities = Branch.objects.filter(id__in=branch_ids, entity__isnull=False).values_list('entity_id', flat=True)
-        entity_ids.update(b_entities)
-    if employee and employee.entity_id:
-        entity_ids.add(employee.entity_id)
-    if tenant_site.branch and tenant_site.branch.entity_id:
-        entity_ids.add(tenant_site.branch.entity_id)
 
     return all_site_ids, branch_ids, entity_ids, tenant_site
 
@@ -426,23 +434,18 @@ def isolate_queryset(qs, user):
 
     # Strict security boundary: Superuser is only responsible for Super Admin platform data
     # (Organization, Invoice, top-level client Sites). They must NEVER see any site's operational data.
-    if user.is_superuser:
+    is_super = bool(
+        user.is_superuser or 
+        (hasattr(user, 'employee_profile') and user.employee_profile and user.employee_profile.role == 'super_admin') or
+        (hasattr(user, 'groups') and user.groups.filter(name='Super Admin').exists())
+    )
+    if is_super:
         model_name = qs.model.__name__
-        if model_name in ('Organization', 'Invoice'):
+        if model_name in ('Organization', 'Invoice', 'Site'):
             return qs
-        if model_name == 'Site':
-            return qs.filter(is_sub_site=False)
         return qs.none()
 
     employee = getattr(user, 'employee_profile', None)
-
-    if employee and employee.role == 'super_admin':
-        model_name = qs.model.__name__
-        if model_name in ('Organization', 'Invoice'):
-            return qs
-        if model_name == 'Site':
-            return qs.filter(is_sub_site=False)
-        return qs.none()
 
     # Resolve strict tenant scope for user dynamically (multi-tenant outer envelope)
     all_tenant_site_ids, tenant_branch_ids, tenant_entity_ids, tenant_site = _get_tenant_scope(user)
@@ -466,7 +469,16 @@ def isolate_queryset(qs, user):
     access_scope = 'Self'
     custom_allowed_entities = []
 
-    if dynamic_role:
+    # Dynamic detection: Site Admin and Admins ALWAYS have Corporate scope within their tenant boundary
+    is_site_admin = bool(
+        role in ('site_admin', 'admin') or
+        (tenant_site and tenant_site.contact_email and user.email and tenant_site.contact_email.strip().lower() == user.email.strip().lower()) or
+        (dynamic_role and getattr(dynamic_role, 'code', None) == 'SITE_ADMIN')
+    )
+
+    if is_site_admin:
+        access_scope = 'Corporate'
+    elif dynamic_role:
         raw_scope = dynamic_role.access_scope or 'Self'
         if raw_scope in ['Corporate', 'Region']:
             access_scope = 'Corporate'
@@ -482,9 +494,7 @@ def isolate_queryset(qs, user):
             access_scope = 'Self'
     else:
         # Standard legacy roles
-        if role in ('site_admin', 'admin'):
-            access_scope = 'Corporate'
-        elif role == 'hr':
+        if role == 'hr':
             access_scope = 'Location'
         elif role == 'manager':
             access_scope = 'Manager'
@@ -692,23 +702,35 @@ def isolate_queryset(qs, user):
         return qs.filter(id__in=all_tenant_site_ids) if all_tenant_site_ids else qs.none()
 
     if qs.model.__name__ == 'Employee':
+        eq = Q()
         if all_tenant_site_ids:
-            return qs.filter(
-                Q(site_id__in=all_tenant_site_ids) | Q(enrolled_sites__id__in=all_tenant_site_ids)
-            ).exclude(role='super_admin').distinct()
-        return qs.filter(organization=employee.organization).exclude(role='super_admin').distinct() if employee.organization else qs.filter(id=employee.id)
+            eq |= Q(site_id__in=all_tenant_site_ids) | Q(enrolled_sites__id__in=all_tenant_site_ids)
+        if tenant_entity_ids:
+            eq |= Q(entity_id__in=tenant_entity_ids)
+        if tenant_site and tenant_site.organization_id:
+            eq |= Q(entity__organization_id=tenant_site.organization_id)
+        if eq:
+            return qs.filter(eq).exclude(role='super_admin').distinct()
+        return qs.filter(id=employee.id)
 
     if hasattr(qs.model, 'employee'):
+        eq = Q()
         if all_tenant_site_ids:
-            return qs.filter(
-                Q(employee__site_id__in=all_tenant_site_ids) | Q(employee__enrolled_sites__id__in=all_tenant_site_ids)
-            ).distinct()
-        return qs.filter(employee__organization=employee.organization).distinct() if employee.organization else qs.filter(employee=employee)
+            eq |= Q(employee__site_id__in=all_tenant_site_ids) | Q(employee__enrolled_sites__id__in=all_tenant_site_ids)
+        if tenant_entity_ids:
+            eq |= Q(employee__entity_id__in=tenant_entity_ids)
+        if tenant_site and tenant_site.organization_id:
+            eq |= Q(employee__entity__organization_id=tenant_site.organization_id)
+        if eq:
+            return qs.filter(eq).distinct()
+        return qs.filter(employee=employee)
 
     if qs.model.__name__ == 'Entity':
         if tenant_entity_ids:
             return qs.filter(id__in=tenant_entity_ids)
-        return qs.filter(organization=employee.organization) if employee.organization else qs.none()
+        if tenant_site and tenant_site.organization_id:
+            return qs.filter(organization_id=tenant_site.organization_id)
+        return qs.none()
 
     if qs.model.__name__ == 'Branch':
         if tenant_branch_ids or tenant_entity_ids:
@@ -716,29 +738,38 @@ def isolate_queryset(qs, user):
             if tenant_entity_ids:
                 bq |= Q(entity_id__in=tenant_entity_ids)
             return qs.filter(bq)
-        return qs.filter(entity__organization=employee.organization) if employee.organization else qs.none()
+        if tenant_site and tenant_site.organization_id:
+            return qs.filter(entity__organization_id=tenant_site.organization_id)
+        return qs.none()
 
     if qs.model.__name__ == 'Department':
         if tenant_entity_ids:
             return qs.filter(entity_id__in=tenant_entity_ids)
-        return qs.filter(entity__organization=employee.organization) if employee.organization else qs.none()
+        if tenant_site and tenant_site.organization_id:
+            return qs.filter(entity__organization_id=tenant_site.organization_id)
+        return qs.none()
 
     if qs.model.__name__ == 'Designation':
         if tenant_entity_ids:
             return qs.filter(department__entity_id__in=tenant_entity_ids)
-        return qs.filter(department__entity__organization=employee.organization) if employee.organization else qs.none()
+        if tenant_site and tenant_site.organization_id:
+            return qs.filter(department__entity__organization_id=tenant_site.organization_id)
+        return qs.none()
 
     if qs.model.__name__ == 'PayrollRun':
         if tenant_entity_ids:
             return qs.filter(entity_id__in=tenant_entity_ids)
-        return qs.filter(entity__organization=employee.organization) if employee.organization else qs.none()
+        if tenant_site and tenant_site.organization_id:
+            return qs.filter(entity__organization_id=tenant_site.organization_id)
+        return qs.none()
 
     if qs.model.__name__ == 'Role':
         q = Q(site_id__in=all_tenant_site_ids)
         if not qs.filter(q, name__iexact='Site Admin').exists():
             q |= Q(code='SITE_ADMIN', site__isnull=True)
-        if employee.organization_id:
-            q |= Q(site__isnull=True, organization_id=employee.organization_id)
+        org_id = tenant_site.organization_id if tenant_site else getattr(employee, 'organization_id', None)
+        if org_id:
+            q |= Q(site__isnull=True, organization_id=org_id)
         return qs.filter(q).distinct()
 
     if qs.model.__name__ == 'SalaryStructure':
@@ -753,7 +784,8 @@ def isolate_queryset(qs, user):
         return qs.filter(site__isnull=True).distinct()
 
     if qs.model.__name__ == 'Organization':
-        return qs.filter(id=employee.organization_id) if employee.organization_id else qs.none()
+        org_id = tenant_site.organization_id if tenant_site else getattr(employee, 'organization_id', None)
+        return qs.filter(id=org_id) if org_id else qs.none()
 
     if hasattr(qs.model, 'site'):
         return qs.filter(site_id__in=all_tenant_site_ids)
