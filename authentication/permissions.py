@@ -147,6 +147,27 @@ class BaseRolePermission(permissions.BasePermission):
         employee = getattr(request.user, 'employee_profile', None)
 
         from organisation.models import Site
+        site = None
+        if employee and employee.site_id:
+            site = employee.site
+        if not site:
+            site = Site.objects.filter(contact_email=request.user.email).first()
+        if not site and employee and employee.enrolled_sites.exists():
+            site = employee.enrolled_sites.first()
+
+        # Strict site module boundary: If site has modules configured, rbac_module must be allowed
+        if rbac_module and site and site.modules is not None:
+            allowed_mods = set()
+            for m in site.modules:
+                allowed_mods.add(m if isinstance(m, str) else m.get('name', ''))
+            if 'Sub Sites' in allowed_mods:
+                allowed_mods.add('Sites')
+            if 'Sites' in allowed_mods:
+                allowed_mods.add('Sub Sites')
+
+            if rbac_module not in allowed_mods:
+                return False
+
         admin_sites = Site.objects.filter(contact_email=request.user.email)
         if admin_sites.exists():
             if 'site_admin' in self.allowed_roles:
@@ -158,11 +179,11 @@ class BaseRolePermission(permissions.BasePermission):
             elif rbac_module == 'Sub Sites':
                 rbac_aliases.append('Sites')
 
-            for site in admin_sites:
-                if site.modules:
-                    if rbac_aliases and any((m if isinstance(m, str) else m.get('name', '')) in rbac_aliases for m in site.modules):
+            for s in admin_sites:
+                if s.modules:
+                    if rbac_aliases and any((m if isinstance(m, str) else m.get('name', '')) in rbac_aliases for m in s.modules):
                         return True
-                    if any((m if isinstance(m, str) else m.get('name', '')) in ['Payroll', 'Payroll Overview', 'Run Payroll', 'Salary Structure', 'Import CTC'] for m in site.modules):
+                    if any((m if isinstance(m, str) else m.get('name', '')) in ['Payroll', 'Payroll Overview', 'Run Payroll', 'Salary Structure', 'Import CTC'] for m in s.modules):
                         return True
             if 'site_admin' not in self.allowed_roles:
                 pass  # fall through to employee check
@@ -920,13 +941,34 @@ class DynamicCRUDPermission(permissions.BasePermission):
         # 4. Extract module permissions
         module_perms = {}
         from organisation.models import Site
-        site = Site.objects.filter(contact_email=request.user.email).first()
-        if site and site.modules:
-            for mod in site.modules:
-                mod_name = mod if isinstance(mod, str) else mod.get('name', '')
-                if mod_name == rbac_module:
-                    module_perms = {'view': True, 'create': True, 'update': True, 'delete': True}
-                    break
+        site = None
+        if employee and employee.site_id:
+            site = employee.site
+        if not site:
+            site = Site.objects.filter(contact_email=request.user.email).first()
+        if not site and employee and employee.enrolled_sites.exists():
+            site = employee.enrolled_sites.first()
+
+        # Strict site module boundary: If site has modules configured, rbac_module must be allowed
+        if site and site.modules is not None:
+            allowed_mods = set()
+            for m in site.modules:
+                allowed_mods.add(m if isinstance(m, str) else m.get('name', ''))
+            if 'Sub Sites' in allowed_mods:
+                allowed_mods.add('Sites')
+            if 'Sites' in allowed_mods:
+                allowed_mods.add('Sub Sites')
+
+            if rbac_module not in allowed_mods:
+                return False
+
+            is_site_admin = bool(
+                (employee and employee.role in ('site_admin', 'admin')) or
+                (site.contact_email and request.user.email and site.contact_email.strip().lower() == request.user.email.strip().lower()) or
+                (employee and employee.dynamic_role and getattr(employee.dynamic_role, 'code', None) == 'SITE_ADMIN')
+            )
+            if is_site_admin:
+                module_perms = {'view': True, 'create': True, 'update': True, 'delete': True}
 
         dynamic_perms = {}
         if employee and employee.dynamic_role and employee.dynamic_role.permissions:

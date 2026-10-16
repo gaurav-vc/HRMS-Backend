@@ -85,7 +85,7 @@ def generate_random_password(length=12):
     characters = string.ascii_letters + string.digits + "!@#$%^&*"
     return ''.join(random.choice(characters) for i in range(length))
 
-def provision_contact_person(site, origin=None):
+def provision_contact_person(site, origin=None, is_update=False):
     if not site.contact_email:
         return
         
@@ -95,9 +95,10 @@ def provision_contact_person(site, origin=None):
     password = None
     if user:
         if not user.is_superuser:
-            password = generate_random_password()
-            user.set_password(password)
-            user.save()
+            if not is_update:
+                password = generate_random_password()
+                user.set_password(password)
+                user.save()
         else:
             password = "[Your existing password]"
     else:
@@ -127,24 +128,34 @@ def provision_contact_person(site, origin=None):
             'Reports': {'view': True, 'create': True, 'update': True, 'delete': True},
             'Settings': {'view': True, 'create': True, 'update': True, 'delete': True},
         }
+
+        # Build site admin permissions strictly based on assigned site.modules
+        if site.modules is not None and len(site.modules) > 0:
+            target_perms = {}
+            for m in site.modules:
+                m_name = m if isinstance(m, str) else m.get('name', '')
+                if m_name:
+                    target_perms[m_name] = {'view': True, 'create': True, 'update': True, 'delete': True}
+            if 'Sub Sites' in target_perms:
+                target_perms['Sites'] = {'view': True, 'create': True, 'update': True, 'delete': True}
+        else:
+            target_perms = default_perms
+
         role_obj = Role.objects.filter(name='Site Admin').first()
         if not role_obj:
-            role_obj = Role.objects.create(name='Site Admin', code='SITE_ADMIN', access_scope='Corporate', permissions=default_perms)
+            role_obj = Role.objects.create(name='Site Admin', code='SITE_ADMIN', access_scope='Corporate', permissions=target_perms)
             created = True
         else:
             created = False
             
-        # Always ensure Site Admin has Corporate scope and full permissions
+        # Always ensure Site Admin has Corporate scope and strictly aligned permissions
         changed = False
         if role_obj.access_scope != 'Corporate':
             role_obj.access_scope = 'Corporate'
             changed = True
-        if not role_obj.permissions:
-            role_obj.permissions = {}
-        for k, v in default_perms.items():
-            if k not in role_obj.permissions:
-                role_obj.permissions[k] = v
-                changed = True
+        if role_obj.permissions != target_perms:
+            role_obj.permissions = target_perms
+            changed = True
         if changed:
             role_obj.save(update_fields=['access_scope', 'permissions'])
 
@@ -191,17 +202,18 @@ def provision_contact_person(site, origin=None):
     except Exception as e:
         print(f"Failed to create/update employee profile: {e}")
 
-    login_url = f"{origin}/" if origin else "https://hrms.vibesandbox.live/"
-    subject = f"You have been assigned to Site: {site.name}"
-    message = f"Hello {site.contact_name or 'User'},\n\nYou have been assigned as the Site Admin for {site.name}.\n\nWebsite URL: {login_url}\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
-    
-    import threading
-    def send_async():
-        try:
-            send_mail(subject, message, getattr(settings, 'EMAIL_HOST_USER', 'noreply@vibecopilot.ai'), [email], fail_silently=False)
-        except Exception as e:
-            print(f"SITE EMAIL FAILED. Google SMTP Error: {str(e)}")
-    threading.Thread(target=send_async).start()
+    if not is_update and password and password != "[Your existing password]":
+        login_url = f"{origin}/" if origin else "https://hrms.vibecopilot.ai/"
+        subject = f"You have been assigned to Site: {site.name}"
+        message = f"Hello {site.contact_name or 'User'},\n\nYou have been assigned as the Site Admin for {site.name}.\n\nWebsite URL: {login_url}\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
+        
+        import threading
+        def send_async():
+            try:
+                send_mail(subject, message, getattr(settings, 'EMAIL_HOST_USER', 'noreply@vibecopilot.ai'), [email], fail_silently=False)
+            except Exception as e:
+                print(f"SITE EMAIL FAILED. Google SMTP Error: {str(e)}")
+        threading.Thread(target=send_async).start()
 
 
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
@@ -307,9 +319,9 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     def perform_update(self, serializer):
         old_email = serializer.instance.contact_email
         site = serializer.save()
-        if site.contact_email and site.contact_email != old_email:
-            origin = self.request.headers.get('Origin')
-            provision_contact_person(site, origin=origin)
+        origin = self.request.headers.get('Origin')
+        email_changed = bool(site.contact_email and site.contact_email != old_email)
+        provision_contact_person(site, origin=origin, is_update=not email_changed)
 
 class DepartmentViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Departments'

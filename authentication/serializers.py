@@ -46,10 +46,11 @@ class UserProfileSerializer(serializers.ModelSerializer):
     is_wfh = serializers.SerializerMethodField()
     branding_text = serializers.SerializerMethodField()
     logo_url = serializers.SerializerMethodField()
+    site_modules = serializers.SerializerMethodField()
     
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'role', 'employee_id', 'first_name', 'last_name', 'permissions', 'role_name', 'dashboard_type', 'site_name', 'org_name', 'photo_url', 'is_wfh', 'branding_text', 'logo_url', 'is_superuser')
+        fields = ('id', 'username', 'email', 'role', 'employee_id', 'first_name', 'last_name', 'permissions', 'role_name', 'dashboard_type', 'site_name', 'org_name', 'photo_url', 'is_wfh', 'branding_text', 'logo_url', 'is_superuser', 'site_modules')
 
     def _get_employee(self, obj):
         # Strict boundary: Superuser is the system platform admin, NOT a site employee
@@ -121,6 +122,31 @@ class UserProfileSerializer(serializers.ModelSerializer):
             return emp.role if emp.role != 'super_admin' else 'employee'
         return 'employee'
 
+    def _get_user_site(self, obj):
+        from organisation.models import Site
+        site = Site.objects.filter(contact_email=obj.email).first()
+        if site:
+            return site
+        emp = self._get_employee(obj)
+        if emp and emp.site_id:
+            return emp.site
+        if emp and emp.enrolled_sites.exists():
+            return emp.enrolled_sites.first()
+        return None
+
+    def get_site_modules(self, obj):
+        if obj.is_superuser:
+            return None
+        site = self._get_user_site(obj)
+        if site and site.modules is not None:
+            mods = []
+            for m in site.modules:
+                m_name = m if isinstance(m, str) else m.get('name', '')
+                if m_name and m_name not in mods:
+                    mods.append(m_name)
+            return mods
+        return None
+
     def get_permissions(self, obj):
         if obj.is_superuser:
             return {}
@@ -130,15 +156,39 @@ class UserProfileSerializer(serializers.ModelSerializer):
             permissions.update(emp.dynamic_role.permissions or {})
             permissions['can_approve'] = emp.dynamic_role.can_approve
             
-        from organisation.models import Site
-        site = Site.objects.filter(contact_email=obj.email).first()
-        if site:
-            if site.modules:
-                for mod in site.modules:
-                    mod_name = mod if isinstance(mod, str) else mod.get('name', '')
-                    if mod_name:
-                        permissions[mod_name] = {'view': True, 'create': True, 'update': True, 'delete': True}
+        site = self._get_user_site(obj)
+        if site and site.modules is not None:
+            allowed_modules = set()
+            for mod in site.modules:
+                mod_name = mod if isinstance(mod, str) else mod.get('name', '')
+                if mod_name:
+                    allowed_modules.add(mod_name)
             
+            # Map aliases
+            if 'Sub Sites' in allowed_modules:
+                allowed_modules.add('Sites')
+            if 'Sites' in allowed_modules:
+                allowed_modules.add('Sub Sites')
+
+            # Filter out any module not explicitly assigned to this site
+            filtered_permissions = {}
+            for mod_name, perms in permissions.items():
+                if mod_name in allowed_modules or mod_name == 'can_approve':
+                    filtered_permissions[mod_name] = perms
+
+            # For Site Admin, ensure full CRUD for all site-assigned modules
+            is_site_admin = bool(
+                (emp and emp.role in ('site_admin', 'admin')) or
+                (site.contact_email and obj.email and site.contact_email.strip().lower() == obj.email.strip().lower()) or
+                (emp and emp.dynamic_role and getattr(emp.dynamic_role, 'code', None) == 'SITE_ADMIN')
+            )
+            if is_site_admin:
+                for mod_name in allowed_modules:
+                    if mod_name not in filtered_permissions:
+                        filtered_permissions[mod_name] = {'view': True, 'create': True, 'update': True, 'delete': True}
+            
+            return filtered_permissions
+
         return permissions
 
     def get_role_name(self, obj):
