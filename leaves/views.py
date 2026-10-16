@@ -245,8 +245,25 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         qs = isolate_queryset(qs, user)
 
         if mode == 'inbox' and employee:
-            # Show all leaves they have access to, EXCEPT their own
-            return qs.exclude(employee=employee)
+            from django.db.models import Q
+            from authentication.permissions import _get_tenant_scope
+            # The current employee should ONLY see leave requests where THEY are the designated reporting person:
+            # 1. Directly: req.employee.manager == employee
+            # 2. Or via Settings: req.employee.dynamic_role.reporting_to == employee.dynamic_role
+            # 3. Or if Site Admin/Admin of that site, for employees with no manager and no reporting_to
+            q = Q(employee__manager=employee)
+            if employee.dynamic_role_id:
+                q |= Q(employee__dynamic_role__reporting_to_id=employee.dynamic_role_id)
+            
+            if employee.role in ('site_admin', 'admin') or getattr(employee.dynamic_role, 'code', None) == 'SITE_ADMIN':
+                q |= Q(employee__manager__isnull=True, employee__dynamic_role__reporting_to__isnull=True)
+
+            all_tenant_site_ids, _, _, _ = _get_tenant_scope(user)
+            inbox_qs = LeaveRequest.objects.all().order_by('-created_at')
+            if all_tenant_site_ids:
+                inbox_qs = inbox_qs.filter(Q(employee__site_id__in=all_tenant_site_ids) | Q(employee__enrolled_sites__id__in=all_tenant_site_ids))
+            
+            return inbox_qs.filter(q).exclude(employee=employee).distinct()
         elif mode == 'my_leaves':
             # Show only their own leaves
             if employee:

@@ -263,27 +263,37 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         from authentication.permissions import _get_tenant_site
         
         save_kwargs = {}
-        if not user.is_superuser:
+        raw_is_sub = self.request.data.get('is_sub_site')
+        is_explicitly_sub = raw_is_sub is True or str(raw_is_sub).lower() in ['true', '1']
+        is_super = bool(
+            user.is_superuser or 
+            (hasattr(user, 'employee_profile') and user.employee_profile and user.employee_profile.role == 'super_admin') or
+            (hasattr(user, 'groups') and user.groups.filter(name='Super Admin').exists())
+        )
+
+        if is_super or not is_explicitly_sub:
+            # Top-level client site created in Super Admin: strictly isolated, never a subsite
+            save_kwargs['is_sub_site'] = False
+        else:
+            # Only when explicitly creating a sub-site from within an organization/site context
             tenant_site = _get_tenant_site(user)
             if tenant_site:
                 save_kwargs['is_sub_site'] = True
-                if tenant_site.organization:
+                if tenant_site.organization and 'organization' not in serializer.validated_data:
                     save_kwargs['organization'] = tenant_site.organization
                 if tenant_site.branch and 'branch' not in serializer.validated_data:
                     save_kwargs['branch'] = tenant_site.branch
                 if not serializer.validated_data.get('contact_email') and tenant_site.contact_email:
                     save_kwargs['contact_email'] = tenant_site.contact_email
-        elif hasattr(user, 'employee_profile') and user.employee_profile and user.employee_profile.organization:
-            save_kwargs['organization'] = user.employee_profile.organization
             
         site = serializer.save(**save_kwargs)
         
-        # Auto-enroll the creator into the new site so it shows up in their dashboard immediately
-        # Skip this for super_admin and org_admin to prevent them from showing up in the site's employee list
-        if hasattr(user, 'employee_profile') and user.employee_profile:
-            emp = user.employee_profile
-            if emp.role not in ['super_admin', 'org_admin'] and site not in emp.enrolled_sites.all():
-                emp.enrolled_sites.add(site)
+        # Auto-enroll creator into the new site only if it's an operational subsite, never for superadmin sites
+        if not is_super and save_kwargs.get('is_sub_site') is True:
+            if hasattr(user, 'employee_profile') and user.employee_profile:
+                emp = user.employee_profile
+                if emp.role not in ['super_admin', 'org_admin'] and site not in emp.enrolled_sites.all():
+                    emp.enrolled_sites.add(site)
                 
         origin = self.request.headers.get('Origin')
         provision_contact_person(site, origin=origin)

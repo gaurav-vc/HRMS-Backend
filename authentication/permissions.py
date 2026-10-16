@@ -362,11 +362,63 @@ def _get_admin_sites(user):
 # Core isolation function
 # ---------------------------------------------------------------------------
 
+def get_reporting_persons(employee):
+    """
+    Returns a list of active Employees who are designated reporting person(s)
+    for this employee, based on:
+    1. Direct reporting manager (employee.manager)
+    2. Role-based reporting person from Settings: employee.dynamic_role.reporting_to
+       Scoped to the employee's site or entity!
+    """
+    reporters = []
+    if not employee:
+        return reporters
+
+    from employees.models import Employee
+    from django.db.models import Q
+
+    # 1. Direct manager
+    if getattr(employee, 'manager', None) and employee.manager.status == 'Active':
+        reporters.append(employee.manager)
+
+    # 2. Role-based reporting person from Settings (employee.dynamic_role.reporting_to)
+    if getattr(employee, 'dynamic_role', None) and employee.dynamic_role.reporting_to:
+        target_role = employee.dynamic_role.reporting_to
+        qs = Employee.objects.filter(dynamic_role=target_role, status='Active')
+        if employee.site_id:
+            site_candidates = list(qs.filter(Q(site_id=employee.site_id) | Q(enrolled_sites__id=employee.site_id)).distinct())
+            if site_candidates:
+                reporters.extend(site_candidates)
+            elif employee.entity_id:
+                ent_candidates = list(qs.filter(entity_id=employee.entity_id))
+                reporters.extend(ent_candidates if ent_candidates else list(qs))
+            else:
+                reporters.extend(list(qs))
+        elif employee.entity_id:
+            ent_candidates = list(qs.filter(entity_id=employee.entity_id))
+            reporters.extend(ent_candidates if ent_candidates else list(qs))
+        else:
+            reporters.extend(list(qs))
+
+    # Deduplicate while preserving order
+    seen = set()
+    result = []
+    for r in reporters:
+        if r.id not in seen:
+            seen.add(r.id)
+            result.append(r)
+    return result
+
+
 def isolate_queryset(qs, user):
     """
     Filters `qs` so that `user` only sees records they are authorised to access.
     Enforces a strict multi-tenant boundary where Main Sites created in Super Admin
-    never leak data between each other.
+    never leak data between each other, AND enforces role-level data scoping:
+    - 'Self': Self data only.
+    - 'Location' / 'Site': Their assigned location / site.
+    - 'Corporate': All data of the entities in their tenant.
+    - 'Custom': Only selected entities configured in permissions['allowed_entities'].
     100% dynamic - no hardcoded values.
     """
     if not user.is_authenticated:
@@ -392,346 +444,322 @@ def isolate_queryset(qs, user):
             return qs.filter(is_sub_site=False)
         return qs.none()
 
-    # Resolve strict tenant scope for user dynamically
+    # Resolve strict tenant scope for user dynamically (multi-tenant outer envelope)
     all_tenant_site_ids, tenant_branch_ids, tenant_entity_ids, tenant_site = _get_tenant_scope(user)
 
     from django.db.models import Q
+
+    if not employee:
+        # User without employee profile (e.g. initial contact user)
+        if all_tenant_site_ids:
+            if qs.model.__name__ == 'Site':
+                return qs.filter(id__in=all_tenant_site_ids)
+            if hasattr(qs.model, 'site'):
+                return qs.filter(site_id__in=all_tenant_site_ids)
+        return qs.none()
+
+    # ── DETERMINE USER ROLE AND ACCESS SCOPE ───────────────────────────────────
+    role = employee.role
+    dynamic_role = getattr(employee, 'dynamic_role', None)
+
+    # By default, employee access scope is strictly 'Self'
+    access_scope = 'Self'
+    custom_allowed_entities = []
+
+    if dynamic_role:
+        raw_scope = dynamic_role.access_scope or 'Self'
+        if raw_scope in ['Corporate', 'Region']:
+            access_scope = 'Corporate'
+        elif raw_scope in ['Location', 'Site']:
+            access_scope = 'Location'
+        elif raw_scope == 'Custom':
+            access_scope = 'Custom'
+            if dynamic_role.permissions and isinstance(dynamic_role.permissions, dict):
+                custom_allowed_entities = dynamic_role.permissions.get('allowed_entities', [])
+        elif dynamic_role.cross_department_access:
+            access_scope = 'Corporate'
+        else:
+            access_scope = 'Self'
+    else:
+        # Standard legacy roles
+        if role in ('site_admin', 'admin'):
+            access_scope = 'Corporate'
+        elif role == 'hr':
+            access_scope = 'Location'
+        elif role == 'manager':
+            access_scope = 'Manager'
+        else:
+            access_scope = 'Self'
+
+    # ── CASE 1: SELF DATA ONLY ('Self') ──────────────────────────────────────
+    if access_scope == 'Self':
+        # Employees: Strictly only themselves
+        if qs.model.__name__ == 'Employee':
+            return qs.filter(id=employee.id)
+
+        # Direct employee relation: Strictly only their own records
+        if hasattr(qs.model, 'employee'):
+            return qs.filter(employee=employee)
+
+        # User model
+        if qs.model.__name__ == 'User':
+            return qs.filter(id=user.id)
+
+        # PayrollRun: Only runs containing their own payslips
+        if qs.model.__name__ == 'PayrollRun':
+            return qs.filter(payslip__employee=employee).distinct()
+
+        # Structural models: scoped to employee's own assigned structures
+        if qs.model.__name__ == 'Entity':
+            return qs.filter(id=employee.entity_id) if employee.entity_id else qs.none()
+
+        if qs.model.__name__ == 'Branch':
+            return qs.filter(id=employee.branch_id) if employee.branch_id else qs.none()
+
+        if qs.model.__name__ == 'Department':
+            return qs.filter(id=employee.department_id) if employee.department_id else qs.none()
+
+        if qs.model.__name__ == 'Designation':
+            return qs.filter(id=employee.designation_id) if employee.designation_id else qs.none()
+
+        if qs.model.__name__ == 'Site':
+            return qs.filter(Q(id=employee.site_id) | Q(id__in=employee.enrolled_sites.all())).distinct()
+
+        if qs.model.__name__ == 'Role':
+            return qs.filter(id=employee.dynamic_role_id) if employee.dynamic_role_id else qs.none()
+
+        if qs.model.__name__ == 'SalaryStructure':
+            if employee.salary_structure_id:
+                return qs.filter(id=employee.salary_structure_id)
+            if all_tenant_site_ids:
+                return qs.filter(site_id__in=all_tenant_site_ids)
+            return qs.none()
+
+        if qs.model.__name__ == 'AttendancePolicy':
+            if all_tenant_site_ids:
+                return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization__isnull=True)).distinct()
+            return qs.filter(site__isnull=True, organization__isnull=True).distinct()
+
+        if qs.model.__name__ == 'Holiday':
+            if all_tenant_site_ids:
+                return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)).distinct()
+            return qs.filter(site__isnull=True).distinct()
+
+        if qs.model.__name__ == 'Organization':
+            return qs.filter(id=employee.organization_id) if employee.organization_id else qs.none()
+
+        if hasattr(qs.model, 'site'):
+            return qs.filter(site_id=employee.site_id) if employee.site_id else qs.none()
+
+        return qs.none()
+
+    # ── CASE 2: MANAGER (themselves + their reportees) ───────────────────────
+    if access_scope == 'Manager':
+        if qs.model.__name__ == 'Employee':
+            return qs.filter(Q(id=employee.id) | Q(manager=employee)).distinct()
+
+        if hasattr(qs.model, 'employee'):
+            return qs.filter(Q(employee=employee) | Q(employee__manager=employee)).distinct()
+
+        if qs.model.__name__ == 'PayrollRun':
+            return qs.filter(payslip__employee__in=[employee.id] + list(employee.reportees.values_list('id', flat=True))).distinct()
+
+        # Follow Location/tenant scoping for structural models
+        if qs.model.__name__ == 'Entity':
+            return qs.filter(id__in=tenant_entity_ids) if tenant_entity_ids else (qs.filter(id=employee.entity_id) if employee.entity_id else qs.none())
+        if qs.model.__name__ == 'Branch':
+            return qs.filter(id__in=tenant_branch_ids) if tenant_branch_ids else (qs.filter(id=employee.branch_id) if employee.branch_id else qs.none())
+        if qs.model.__name__ == 'Department':
+            return qs.filter(entity_id__in=tenant_entity_ids) if tenant_entity_ids else qs.none()
+        if qs.model.__name__ == 'Designation':
+            return qs.filter(department__entity_id__in=tenant_entity_ids) if tenant_entity_ids else qs.none()
+        if qs.model.__name__ == 'Site':
+            return qs.filter(id__in=all_tenant_site_ids) if all_tenant_site_ids else qs.none()
+        if qs.model.__name__ == 'SalaryStructure':
+            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True))
+        if qs.model.__name__ == 'AttendancePolicy':
+            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization__isnull=True)).distinct()
+        if qs.model.__name__ == 'Holiday':
+            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)).distinct()
+        if qs.model.__name__ == 'Role':
+            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization_id=employee.organization_id)).distinct()
+        if qs.model.__name__ == 'Organization':
+            return qs.filter(id=employee.organization_id) if employee.organization_id else qs.none()
+        return qs.none()
+
+    # ── CASE 3: CUSTOM ENTITIES ('Custom') ──────────────────────────────────
+    if access_scope == 'Custom':
+        effective_entity_ids = [eid for eid in custom_allowed_entities if not tenant_entity_ids or eid in tenant_entity_ids]
+
+        if qs.model.__name__ == 'Entity':
+            return qs.filter(id__in=effective_entity_ids)
+
+        if qs.model.__name__ == 'Branch':
+            return qs.filter(entity_id__in=effective_entity_ids)
+
+        if qs.model.__name__ == 'Department':
+            return qs.filter(entity_id__in=effective_entity_ids)
+
+        if qs.model.__name__ == 'Designation':
+            return qs.filter(department__entity_id__in=effective_entity_ids)
+
+        if qs.model.__name__ == 'Employee':
+            eq = qs.filter(entity_id__in=effective_entity_ids)
+            if all_tenant_site_ids:
+                eq = eq.filter(Q(site_id__in=all_tenant_site_ids) | Q(enrolled_sites__id__in=all_tenant_site_ids))
+            return eq.exclude(role='super_admin').distinct()
+
+        if hasattr(qs.model, 'employee'):
+            return qs.filter(employee__entity_id__in=effective_entity_ids).distinct()
+
+        if qs.model.__name__ == 'PayrollRun':
+            return qs.filter(entity_id__in=effective_entity_ids)
+
+        if qs.model.__name__ == 'Site':
+            return qs.filter(branch__entity_id__in=effective_entity_ids, id__in=all_tenant_site_ids).distinct() if all_tenant_site_ids else qs.filter(branch__entity_id__in=effective_entity_ids)
+
+        if qs.model.__name__ == 'SalaryStructure':
+            return qs.filter(Q(site__branch__entity_id__in=effective_entity_ids) | Q(site__isnull=True))
+
+        if qs.model.__name__ == 'AttendancePolicy':
+            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization__isnull=True)).distinct()
+
+        if qs.model.__name__ == 'Holiday':
+            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)).distinct()
+
+        if qs.model.__name__ == 'Role':
+            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization_id=employee.organization_id)).distinct()
+
+        if qs.model.__name__ == 'Organization':
+            return qs.filter(id=employee.organization_id) if employee.organization_id else qs.none()
+
+        return qs.none()
+
+    # ── CASE 4: LOCATION / SITE ('Location') ─────────────────────────────────
+    if access_scope == 'Location':
+        if qs.model.__name__ == 'Site':
+            return qs.filter(id__in=all_tenant_site_ids) if all_tenant_site_ids else (qs.filter(id=employee.site_id) if employee.site_id else qs.none())
+
+        if qs.model.__name__ == 'Employee':
+            if all_tenant_site_ids:
+                return qs.filter(
+                    Q(site_id__in=all_tenant_site_ids) | Q(enrolled_sites__id__in=all_tenant_site_ids)
+                ).exclude(role='super_admin').distinct()
+            return qs.filter(id=employee.id)
+
+        if hasattr(qs.model, 'employee'):
+            if all_tenant_site_ids:
+                return qs.filter(
+                    Q(employee__site_id__in=all_tenant_site_ids) | Q(employee__enrolled_sites__id__in=all_tenant_site_ids)
+                ).distinct()
+            return qs.filter(employee=employee)
+
+        if qs.model.__name__ == 'Entity':
+            return qs.filter(id__in=tenant_entity_ids) if tenant_entity_ids else (qs.filter(id=employee.entity_id) if employee.entity_id else qs.none())
+
+        if qs.model.__name__ == 'Branch':
+            return qs.filter(id__in=tenant_branch_ids) if tenant_branch_ids else (qs.filter(id=employee.branch_id) if employee.branch_id else qs.none())
+
+        if qs.model.__name__ == 'Department':
+            return qs.filter(entity_id__in=tenant_entity_ids) if tenant_entity_ids else qs.none()
+
+        if qs.model.__name__ == 'Designation':
+            return qs.filter(department__entity_id__in=tenant_entity_ids) if tenant_entity_ids else qs.none()
+
+        if qs.model.__name__ == 'PayrollRun':
+            return qs.filter(entity_id__in=tenant_entity_ids) if tenant_entity_ids else qs.none()
+
+        if qs.model.__name__ == 'Role':
+            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization_id=employee.organization_id)).distinct()
+
+        if qs.model.__name__ == 'SalaryStructure':
+            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True))
+
+        if qs.model.__name__ == 'AttendancePolicy':
+            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization__isnull=True)).distinct()
+
+        if qs.model.__name__ == 'Holiday':
+            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)).distinct()
+
+        if qs.model.__name__ == 'Organization':
+            return qs.filter(id=employee.organization_id) if employee.organization_id else qs.none()
+
+        return qs.none()
+
+    # ── CASE 5: ALL DATA OF THE ENTITIES ('Corporate' / Site Admin) ─────────
+    # Full access within this tenant boundary
+    if qs.model.__name__ == 'Site':
+        return qs.filter(id__in=all_tenant_site_ids) if all_tenant_site_ids else qs.none()
+
+    if qs.model.__name__ == 'Employee':
+        if all_tenant_site_ids:
+            return qs.filter(
+                Q(site_id__in=all_tenant_site_ids) | Q(enrolled_sites__id__in=all_tenant_site_ids)
+            ).exclude(role='super_admin').distinct()
+        return qs.filter(organization=employee.organization).exclude(role='super_admin').distinct() if employee.organization else qs.filter(id=employee.id)
+
+    if hasattr(qs.model, 'employee'):
+        if all_tenant_site_ids:
+            return qs.filter(
+                Q(employee__site_id__in=all_tenant_site_ids) | Q(employee__enrolled_sites__id__in=all_tenant_site_ids)
+            ).distinct()
+        return qs.filter(employee__organization=employee.organization).distinct() if employee.organization else qs.filter(employee=employee)
+
+    if qs.model.__name__ == 'Entity':
+        if tenant_entity_ids:
+            return qs.filter(id__in=tenant_entity_ids)
+        return qs.filter(organization=employee.organization) if employee.organization else qs.none()
+
+    if qs.model.__name__ == 'Branch':
+        if tenant_branch_ids or tenant_entity_ids:
+            bq = Q(id__in=tenant_branch_ids)
+            if tenant_entity_ids:
+                bq |= Q(entity_id__in=tenant_entity_ids)
+            return qs.filter(bq)
+        return qs.filter(entity__organization=employee.organization) if employee.organization else qs.none()
+
+    if qs.model.__name__ == 'Department':
+        if tenant_entity_ids:
+            return qs.filter(entity_id__in=tenant_entity_ids)
+        return qs.filter(entity__organization=employee.organization) if employee.organization else qs.none()
+
+    if qs.model.__name__ == 'Designation':
+        if tenant_entity_ids:
+            return qs.filter(department__entity_id__in=tenant_entity_ids)
+        return qs.filter(department__entity__organization=employee.organization) if employee.organization else qs.none()
+
+    if qs.model.__name__ == 'PayrollRun':
+        if tenant_entity_ids:
+            return qs.filter(entity_id__in=tenant_entity_ids)
+        return qs.filter(entity__organization=employee.organization) if employee.organization else qs.none()
+
+    if qs.model.__name__ == 'Role':
+        q = Q(site_id__in=all_tenant_site_ids)
+        if not qs.filter(q, name__iexact='Site Admin').exists():
+            q |= Q(code='SITE_ADMIN', site__isnull=True)
+        if employee.organization_id:
+            q |= Q(site__isnull=True, organization_id=employee.organization_id)
+        return qs.filter(q).distinct()
+
+    if qs.model.__name__ == 'SalaryStructure':
+        return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True))
+
+    if qs.model.__name__ == 'AttendancePolicy':
+        return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization__isnull=True)).distinct()
 
     if qs.model.__name__ == 'Holiday':
         if all_tenant_site_ids:
             return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)).distinct()
         return qs.filter(site__isnull=True).distinct()
 
-    # ── STRICT TENANT BOUNDARY: APPLIES TO ALL ROLES & USERS ─────────────────
-    if all_tenant_site_ids:
-        # Sites
-        if qs.model.__name__ == 'Site':
-            return qs.filter(id__in=all_tenant_site_ids)
+    if qs.model.__name__ == 'Organization':
+        return qs.filter(id=employee.organization_id) if employee.organization_id else qs.none()
 
-        # Employees
-        if qs.model.__name__ == 'Employee':
-            return qs.filter(
-                Q(site_id__in=all_tenant_site_ids) | Q(enrolled_sites__id__in=all_tenant_site_ids)
-            ).exclude(role='super_admin').distinct()
+    if hasattr(qs.model, 'site'):
+        return qs.filter(site_id__in=all_tenant_site_ids)
 
-        # Roles: Strictly roles configured dynamically for this tenant's sites (+ standard Site Admin template)
-        if qs.model.__name__ == 'Role':
-            q = Q(site_id__in=all_tenant_site_ids)
-            if not qs.filter(q, name__iexact='Site Admin').exists():
-                q |= Q(code='SITE_ADMIN', site__isnull=True)
-            return qs.filter(q).distinct()
-
-        # Departments
-        if qs.model.__name__ == 'Department':
-            if tenant_entity_ids:
-                return qs.filter(entity_id__in=tenant_entity_ids)
-            return qs.none()
-
-        # Designations
-        if qs.model.__name__ == 'Designation':
-            if tenant_entity_ids:
-                return qs.filter(department__entity_id__in=tenant_entity_ids)
-            return qs.none()
-
-        # Branches
-        if qs.model.__name__ == 'Branch':
-            bq = Q(id__in=tenant_branch_ids)
-            if tenant_entity_ids:
-                bq |= Q(entity_id__in=tenant_entity_ids)
-            return qs.filter(bq) if (tenant_branch_ids or tenant_entity_ids) else qs.none()
-
-        # Entities
-        if qs.model.__name__ == 'Entity':
-            if tenant_entity_ids:
-                return qs.filter(id__in=tenant_entity_ids)
-            return qs.none()
-
-        # Salary Structure
-        if qs.model.__name__ == 'SalaryStructure':
-            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True))
-
-        # Attendance Policy
-        if qs.model.__name__ == 'AttendancePolicy':
-            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization__isnull=True)).distinct()
-
-        # Direct site relation
-        if hasattr(qs.model, 'site'):
-            return qs.filter(site_id__in=all_tenant_site_ids)
-
-        # Direct employee relation
-        if hasattr(qs.model, 'employee'):
-            return qs.filter(
-                Q(employee__site_id__in=all_tenant_site_ids) | Q(employee__enrolled_sites__id__in=all_tenant_site_ids)
-            ).distinct()
-
-        # Structure relation (e.g. SalaryStructureAssignment)
-        if hasattr(qs.model, 'structure'):
-            return qs.filter(structure__site_id__in=all_tenant_site_ids)
-
-        # Organization node or graph
-        if hasattr(qs.model, 'organization') and tenant_site and tenant_site.organization_id:
-            org_field = qs.model._meta.get_field('organization')
-            if org_field.is_relation and org_field.related_model.__name__ == 'Entity':
-                if tenant_entity_ids:
-                    return qs.filter(organization_id__in=tenant_entity_ids)
-                return qs.none()
-            else:
-                return qs.filter(organization_id=tenant_site.organization_id)
-
-    # Fallback if no tenant site could be resolved
-    if not employee:
-        return qs.none()
-
-    role = employee.role
-    dynamic_role = getattr(employee, 'dynamic_role', None)
-
-    # ── MULTI-TENANT BOUNDARY: apply organisation scope first ────────────────
-    # Every query from this point is bounded by employee.organization.
-    if hasattr(employee, 'organization') and employee.organization:
-        from django.db.models import Q
-        # If the model has an employee field, it's safest to scope by employee's organization
-        # to prevent missing records if intermediate entities lack an organization link.
-        if hasattr(qs.model, 'employee'):
-            qs = qs.filter(employee__organization=employee.organization)
-        elif hasattr(qs.model, 'organization'):
-            org_field = qs.model._meta.get_field('organization')
-            if org_field.is_relation and org_field.related_model.__name__ == 'Entity':
-                qs = qs.filter(organization__organization=employee.organization)
-            else:
-                qs = qs.filter(organization=employee.organization)
-        elif qs.model.__name__ == 'Employee':
-            qs = qs.filter(organization=employee.organization)
-        elif hasattr(qs.model, 'entity'):
-            qs = qs.filter(entity__organization=employee.organization)
-        elif hasattr(qs.model, 'department'):
-            qs = qs.filter(department__entity__organization=employee.organization)
-        elif hasattr(qs.model, 'structure'):
-            qs = qs.filter(structure__site__organization=employee.organization)
-        elif qs.model.__name__ == 'SalaryStructure':
-            qs = qs.filter(site__organization=employee.organization)
-        elif qs.model.__name__ == 'Organization':
-            qs = qs.filter(id=employee.organization_id)
-
-    # ── DYNAMIC ROLE SCOPING ─────────────────────────────────────────────────
-    has_org_access = False
-    is_location_scope = False
-    custom_allowed = []
-    if dynamic_role:
-        if dynamic_role.access_scope in ['Corporate', 'Region', 'Custom'] or dynamic_role.cross_department_access:
-            has_org_access = True
-            if dynamic_role.access_scope == 'Custom':
-                custom_allowed = dynamic_role.permissions.get('allowed_entities', [])
-        elif dynamic_role.access_scope in ['Location', 'Site']:
-            is_location_scope = True
-
-    if dynamic_role:
-        if has_org_access:
-            if dynamic_role.access_scope == 'Corporate' or dynamic_role.cross_department_access:
-                return qs
-
-            if custom_allowed:
-                if qs.model.__name__ == 'Entity':
-                    return qs.filter(id__in=custom_allowed)
-                if hasattr(qs.model, 'entity'):
-                    return qs.filter(entity_id__in=custom_allowed)
-                if hasattr(qs.model, 'department'):
-                    return qs.filter(department__entity_id__in=custom_allowed)
-                if hasattr(qs.model, 'employee'):
-                    return qs.filter(employee__entity_id__in=custom_allowed)
-                if hasattr(qs.model, 'structure'):
-                    return qs.filter(structure__site__entity_id__in=custom_allowed)
-                if qs.model.__name__ == 'SalaryStructure':
-                    return qs.filter(site__entity_id__in=custom_allowed)
-                if qs.model.__name__ == 'Employee':
-                    return qs.filter(entity_id__in=custom_allowed)
-
-            if qs.model.__name__ == 'AttendancePolicy':
-                from django.db.models import Q
-                return qs.filter(Q(organization=employee.organization) | Q(site__organization=employee.organization) | Q(employee__entity=employee.entity) | Q(employee__isnull=True, site__isnull=True, organization__isnull=True))
-            if hasattr(qs.model, 'entity'):
-                return qs.filter(entity=employee.entity) if employee.entity else qs
-            if hasattr(qs.model, 'department'):
-                return qs.filter(department__entity=employee.entity) if employee.entity else qs
-            if hasattr(qs.model, 'employee'):
-                return qs.filter(employee__entity=employee.entity) if employee.entity else qs
-            if hasattr(qs.model, 'structure'):
-                return qs.filter(structure__site__organization=employee.organization) if employee.organization else qs
-            if qs.model.__name__ == 'SalaryStructure':
-                return qs.filter(site__organization=employee.organization) if employee.organization else qs
-            if qs.model.__name__ == 'Employee':
-                return qs.filter(entity=employee.entity)
-        elif is_location_scope:
-            from django.db.models import Q
-            site_filter = Q(site=employee.site) if employee.site else Q(id=0)
-            if employee.enrolled_sites.exists():
-                site_filter |= Q(site__in=employee.enrolled_sites.all())
-                
-            if qs.model.__name__ == 'AttendancePolicy':
-                return qs.filter(Q(site__in=employee.enrolled_sites.all()) | Q(site=employee.site) | Q(employee__site=employee.site) | Q(employee__enrolled_sites=employee.site) | Q(employee__isnull=True, site__isnull=True, organization__isnull=True)).distinct()
-            if hasattr(qs.model, 'site') and qs.model.__name__ not in ['Site', 'Employee', 'SalaryStructure']:
-                if qs.model.__name__ in ['Role']:
-                    return qs.filter(site_filter | Q(site__isnull=True, organization_id=employee.organization_id) | Q(site__isnull=True, organization__isnull=True)).distinct()
-                return qs.filter(site_filter).distinct()
-            if qs.model.__name__ == 'SalaryStructure':
-                return qs.filter(site_filter)
-            if hasattr(qs.model, 'employee'):
-                return qs.filter(Q(employee__site=employee.site) | Q(employee__enrolled_sites=employee.site)).distinct()
-            if qs.model.__name__ == 'Employee':
-                return qs.filter(Q(site=employee.site) | Q(enrolled_sites=employee.site)).exclude(role='super_admin').distinct()
-            if qs.model.__name__ == 'Site':
-                return qs.model.objects.filter(Q(id=employee.site_id) | Q(id__in=employee.enrolled_sites.all())).distinct()
-
-            # Structural models for Location / Site scoped dynamic roles
-            loc_entity_ids = []
-            if employee.entity_id:
-                loc_entity_ids.append(employee.entity_id)
-            if employee.site and employee.site.branch and employee.site.branch.entity_id:
-                loc_entity_ids.append(employee.site.branch.entity_id)
-            if employee.enrolled_sites.exists():
-                for s in employee.enrolled_sites.select_related('branch'):
-                    if s.branch and s.branch.entity_id:
-                        loc_entity_ids.append(s.branch.entity_id)
-            loc_entity_ids = list(set(loc_entity_ids))
-
-            if qs.model.__name__ == 'Organization':
-                if employee.organization_id:
-                    return qs.filter(id=employee.organization_id)
-                return qs.none()
-            if qs.model.__name__ == 'Entity':
-                if loc_entity_ids:
-                    return qs.filter(id__in=loc_entity_ids)
-                return qs.filter(organization_id=employee.organization_id) if employee.organization_id else qs
-            if qs.model.__name__ == 'Branch':
-                if loc_entity_ids:
-                    return qs.filter(entity_id__in=loc_entity_ids)
-                return qs.filter(entity__organization_id=employee.organization_id) if employee.organization_id else qs
-            if qs.model.__name__ == 'Department':
-                if loc_entity_ids:
-                    return qs.filter(entity_id__in=loc_entity_ids)
-                return qs.filter(entity__organization_id=employee.organization_id) if employee.organization_id else qs
-            if qs.model.__name__ == 'Designation':
-                if loc_entity_ids:
-                    return qs.filter(department__entity_id__in=loc_entity_ids)
-                return qs.filter(department__entity__organization_id=employee.organization_id) if employee.organization_id else qs
-
-            if hasattr(qs.model, 'entity'):
-                return qs.filter(entity_id__in=loc_entity_ids) if loc_entity_ids else (qs.filter(entity=employee.entity) if employee.entity else qs)
-            if hasattr(qs.model, 'department'):
-                return qs.filter(department__entity_id__in=loc_entity_ids) if loc_entity_ids else (qs.filter(department__entity=employee.entity) if employee.entity else qs)
-        else:
-            # Scoped to individual employee only
-            if hasattr(qs.model, 'employee'):
-                return qs.filter(employee=employee)
-            elif qs.model.__name__ == 'Employee':
-                return qs.filter(id=employee.id)
-            elif hasattr(qs.model, 'structure'):
-                return qs.filter(structure__site=employee.site) if employee.site else qs
-            elif qs.model.__name__ == 'SalaryStructure':
-                return qs.filter(site=employee.site) if employee.site else qs
-            elif qs.model.__name__ == 'Site':
-                from django.db.models import Q
-                return qs.model.objects.filter(Q(id=employee.site_id) | Q(id__in=employee.enrolled_sites.all()))
-            return qs.none()
-
-    # ── LEGACY ROLE LOGIC ────────────────────────────────────────────────────
-    if role == 'site_admin':
-        from django.db.models import Q
-        if hasattr(qs.model, 'site'):
-            return qs.filter(site=employee.site)
-        if hasattr(qs.model, 'employee'):
-            return qs.filter(Q(employee__site=employee.site) | Q(employee__enrolled_sites=employee.site)).distinct()
-        if qs.model.__name__ == 'Employee':
-            return qs.filter(Q(site=employee.site) | Q(enrolled_sites=employee.site)).exclude(role='super_admin').distinct()
-
-    if role in ('hr', 'manager'):
-        from django.db.models import Q
-        
-        # Build filter for organization and site
-        manager_org = employee.organization_id
-        manager_site = employee.site_id
-        
-        # If manager doesn't have an org/site, fallback to entity
-        if not manager_org or not manager_site:
-            if hasattr(qs.model, 'entity'):
-                return qs.filter(entity=employee.entity)
-            if hasattr(qs.model, 'department'):
-                return qs.filter(department__entity=employee.entity)
-            if hasattr(qs.model, 'employee'):
-                return qs.filter(employee__entity=employee.entity)
-            if hasattr(qs.model, 'structure'):
-                return qs.filter(structure__site__entity=employee.entity)
-            if qs.model.__name__ == 'SalaryStructure':
-                return qs.filter(site__entity=employee.entity)
-            if qs.model.__name__ == 'Employee':
-                return qs.filter(entity=employee.entity)
-                
-        # Filter by org and site
-        if qs.model.__name__ in ['AttendancePolicy', 'Role']:
-            q = Q(organization_id=manager_org, site_id=manager_site)
-            q |= Q(organization_id=manager_org, site__isnull=True)
-            q |= Q(organization__isnull=True, site__isnull=True)
-            return qs.filter(q).distinct()
-            
-        if hasattr(qs.model, 'site') and hasattr(qs.model, 'organization'):
-            return qs.filter(organization_id=manager_org, site_id=manager_site)
-        if hasattr(qs.model, 'site'):
-            return qs.filter(site_id=manager_site)
-        if hasattr(qs.model, 'employee'):
-            return qs.filter(employee__organization_id=manager_org, employee__site_id=manager_site)
-        if qs.model.__name__ == 'Employee':
-            return qs.filter(organization_id=manager_org, site_id=manager_site).exclude(role='super_admin')
-
-    # ── DEFAULT: employee sees only their own records (and their site's structural data) ────────────────────────
-    if hasattr(qs.model, 'employee'):
-        from django.db.models import Q
-        return qs.filter(Q(employee=employee) | Q(employee__manager=employee)).distinct()
-    
-    # Allow seeing colleagues in the same site
-    if qs.model.__name__ == 'Employee':
-        from django.db.models import Q
-        site_filter = Q(site=employee.site) if employee.site else Q(id=employee.id)
-        if employee.enrolled_sites.exists():
-            site_filter |= Q(site__in=employee.enrolled_sites.all())
-        return qs.filter(site_filter).exclude(role='super_admin').distinct()
-        
-    if qs.model.__name__ == 'Site':
-        from django.db.models import Q
-        return qs.model.objects.filter(Q(id=employee.site_id) | Q(id__in=employee.enrolled_sites.all())).distinct()
-
-    # Allow seeing structural data related to their site's entity
-    if employee.site and employee.site.branch:
-        entity = employee.site.branch.entity
-        if qs.model.__name__ == 'Organization':
-            return qs.filter(id=entity.organization_id)
-        if qs.model.__name__ == 'Entity':
-            return qs.filter(id=entity.id)
-        if qs.model.__name__ == 'Branch':
-            return qs.filter(entity=entity)
-        if qs.model.__name__ == 'Department':
-            return qs.filter(entity=entity)
-            
-        if hasattr(qs.model, 'site'):
-            from django.db.models import Q
-            site_filter = Q(site=employee.site) if employee.site else Q(id=0)
-            if employee.enrolled_sites.exists():
-                site_filter |= Q(site__in=employee.enrolled_sites.all())
-            
-            if hasattr(qs.model, 'organization'):
-                site_filter |= Q(site__isnull=True, organization=entity.organization)
-            elif hasattr(qs.model, 'entity'):
-                site_filter |= Q(site__isnull=True, entity=entity)
-            else:
-                if qs.model.__name__ in ['AttendancePolicy']:
-                    site_filter |= Q(site__isnull=True)
-                
-            return qs.filter(site_filter).distinct()
-            
-        if hasattr(qs.model, 'organization'):
-            return qs.filter(organization=entity.organization)
-        if hasattr(qs.model, 'entity'):
-            return qs.filter(entity=entity)
-        if hasattr(qs.model, 'department'):
-            return qs.filter(department__entity=entity)
+    if hasattr(qs.model, 'organization'):
+        return qs.filter(organization_id=employee.organization_id) if employee.organization_id else qs.none()
 
     return qs.none()
 

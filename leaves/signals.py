@@ -6,12 +6,12 @@ from employees.models import Notification
 @receiver(post_save, sender=LeaveRequest)
 def leave_request_created_notification(sender, instance, created, **kwargs):
     if created:
-        # Notify the manager
+        from authentication.permissions import get_reporting_persons
         employee = instance.employee
-        manager = employee.manager
-        if manager:
+        reporters = get_reporting_persons(employee)
+        for reporter in reporters:
             Notification.objects.create(
-                recipient=manager,
+                recipient=reporter,
                 title="New Leave Request",
                 message=f"{employee.first_name} {employee.last_name} has requested {instance.leave_type.name} from {instance.start_date} to {instance.end_date}."
             )

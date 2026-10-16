@@ -5,20 +5,20 @@ from employees.models import Notification, Employee
 
 def get_authorizers(employee):
     # Returns a list of Employees who are authorized to approve requests for this employee
-    authorizers = []
-    if employee and getattr(employee, 'manager', None):
-        authorizers.append(employee.manager)
-    else:
-        # Fallback to HR Admin or Site Admin
-        admins = Employee.objects.filter(dynamic_role__name__in=['HR Admin', 'Site Admin'])
-        if admins.exists():
-            authorizers.extend(list(admins))
-        else:
-            # Fallback to Org Admin or Site Admin
-            admins = Employee.objects.filter(role__in=['admin', 'org_admin', 'site_admin'])
-            if admins.exists():
-                authorizers.extend(list(admins))
-    return list(set(authorizers))  # Unique authorized employees
+    from authentication.permissions import get_reporting_persons
+    reporters = get_reporting_persons(employee)
+    if reporters:
+        return reporters
+    
+    # Fallback only if no manager and no reporting role configured
+    admins = Employee.objects.filter(dynamic_role__name__in=['HR Admin', 'Site Admin'], status='Active')
+    if employee and employee.site_id:
+        admins = admins.filter(site_id=employee.site_id)
+    if not admins.exists():
+        admins = Employee.objects.filter(role__in=['admin', 'org_admin', 'site_admin'], status='Active')
+        if employee and employee.site_id:
+            admins = admins.filter(site_id=employee.site_id)
+    return list(set(admins))
 
 @receiver(post_save, sender=RegularizationRequest)
 def regularization_notification(sender, instance, created, **kwargs):
