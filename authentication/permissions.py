@@ -91,40 +91,47 @@ def user_can_approve(user, module=None):
         return False  # Platform superusers cannot approve site operations
         
     emp = getattr(user, 'employee_profile', None)
-    if not emp:
+    if not emp and user.email:
+        from employees.models import Employee
+        emp = Employee.objects.filter(email__iexact=user.email).first()
+
+    if not emp or not emp.dynamic_role:
         return False
 
-    # 1. Custom Dynamic Role permissions (primary source of truth)
-    if emp.dynamic_role:
-        role = emp.dynamic_role
-        # Model-level approval toggle (Role.can_approve)
-        if getattr(role, 'can_approve', False):
+    role = emp.dynamic_role
+    perms = role.permissions or {}
+
+    # 1. Module-specific approval workflow checks
+    if module in ['Payroll', 'Run Payroll', 'Payroll Overview']:
+        # Strictly require payroll approval capability
+        if _is_truthy(perms.get('can_approve_payroll')) or _is_truthy(perms.get('can_approve')):
             return True
-
-        # Special permission toggles in role's permissions dictionary
-        perms = role.permissions or {}
-        if any(_is_truthy(perms.get(k)) for k in ['can_approve', 'can_approve_payroll', 'can_approve_leaves']):
+        p_perm = perms.get('Run Payroll') or perms.get('Payroll')
+        if isinstance(p_perm, dict) and (_is_truthy(p_perm.get('approve')) or _is_truthy(p_perm.get('update'))):
             return True
+        return False
 
-        # Module-specific permissions
-        if module and module in perms:
-            m_perm = perms.get(module)
-            if isinstance(m_perm, dict) and (_is_truthy(m_perm.get('approve')) or _is_truthy(m_perm.get('update'))):
-                return True
+    if module in ['Leave Requests', 'Leaves', 'Leave Balances']:
+        # Strictly require leave approval capability
+        if _is_truthy(perms.get('can_approve_leaves')) or _is_truthy(perms.get('can_approve')):
+            return True
+        l_perm = perms.get('Leave Requests') or perms.get('Leaves')
+        if isinstance(l_perm, dict) and (_is_truthy(l_perm.get('approve')) or _is_truthy(l_perm.get('update'))):
+            return True
+        return False
 
-        # For payroll module aliases
-        if module in ['Payroll', 'Run Payroll', 'Payroll Overview']:
-            if _is_truthy(perms.get('can_approve_payroll')):
-                return True
-            p_perm = perms.get('Payroll') or perms.get('Run Payroll')
-            if isinstance(p_perm, dict) and (_is_truthy(p_perm.get('approve')) or _is_truthy(p_perm.get('update'))):
-                return True
+    # 2. General module permissions if specified
+    if module and module in perms:
+        m_perm = perms.get(module)
+        if isinstance(m_perm, dict) and (_is_truthy(m_perm.get('approve')) or _is_truthy(m_perm.get('update'))):
+            return True
+        return False
 
-    # 2. Administrative roles fallback
-    if emp.role in ['admin', 'org_admin', 'site_admin']:
+    # 3. Generic fallback when no module is specified
+    if getattr(role, 'can_approve', False):
         return True
 
-    return False
+    return any(_is_truthy(perms.get(k)) for k in ['can_approve', 'can_approve_payroll', 'can_approve_leaves'])
 
 
 class BaseRolePermission(permissions.BasePermission):

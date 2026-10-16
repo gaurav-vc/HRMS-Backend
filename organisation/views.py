@@ -148,13 +148,31 @@ def provision_contact_person(site, origin=None, is_update=False):
         else:
             created = False
             
+        # Preserve any existing special workflow permissions configured for this role
+        existing_special = {
+            k: v for k, v in (role_obj.permissions or {}).items()
+            if k in (
+                'can_approve',
+                'can_run_payroll',
+                'can_approve_payroll',
+                'can_view_confidential_payroll',
+                'can_release_salary',
+                'can_add_ctc',
+                'can_add_compensation',
+                'can_view_confidential',
+                'can_process_payroll',
+                'allowed_entities',
+            )
+        }
+        merged_target_perms = {**existing_special, **target_perms}
+
         # Always ensure Site Admin has Corporate scope and strictly aligned permissions
         changed = False
         if role_obj.access_scope != 'Corporate':
             role_obj.access_scope = 'Corporate'
             changed = True
-        if role_obj.permissions != target_perms:
-            role_obj.permissions = target_perms
+        if role_obj.permissions != merged_target_perms:
+            role_obj.permissions = merged_target_perms
             changed = True
         if changed:
             role_obj.save(update_fields=['access_scope', 'permissions'])

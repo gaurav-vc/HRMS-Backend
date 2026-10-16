@@ -154,9 +154,15 @@ class UserProfileSerializer(serializers.ModelSerializer):
         emp = self._get_employee(obj)
         if emp and emp.dynamic_role:
             permissions.update(emp.dynamic_role.permissions or {})
-            permissions['can_approve'] = emp.dynamic_role.can_approve
+            permissions['can_approve'] = bool(emp.dynamic_role.can_approve)
             
         site = self._get_user_site(obj)
+        is_site_admin = bool(
+            (emp and emp.role in ('site_admin', 'admin')) or
+            (site and site.contact_email and obj.email and site.contact_email.strip().lower() == obj.email.strip().lower()) or
+            (emp and emp.dynamic_role and getattr(emp.dynamic_role, 'code', None) == 'SITE_ADMIN')
+        )
+
         if site and site.modules is not None:
             allowed_modules = set()
             for mod in site.modules:
@@ -170,23 +176,47 @@ class UserProfileSerializer(serializers.ModelSerializer):
             if 'Sites' in allowed_modules:
                 allowed_modules.add('Sub Sites')
 
-            # Filter out any module not explicitly assigned to this site
-            filtered_permissions = {}
-            for mod_name, perms in permissions.items():
-                if mod_name in allowed_modules or mod_name == 'can_approve':
-                    filtered_permissions[mod_name] = perms
+            # Special workflow and non-module permission flags that must ALWAYS be preserved
+            SPECIAL_WORKFLOW_KEYS = {
+                'can_approve',
+                'can_run_payroll',
+                'can_approve_payroll',
+                'can_view_confidential_payroll',
+                'can_release_salary',
+                'can_add_ctc',
+                'can_add_compensation',
+                'can_view_confidential',
+                'can_process_payroll',
+                'allowed_entities',
+            }
 
-            # For Site Admin, ensure full CRUD for all site-assigned modules
-            is_site_admin = bool(
-                (emp and emp.role in ('site_admin', 'admin')) or
-                (site.contact_email and obj.email and site.contact_email.strip().lower() == obj.email.strip().lower()) or
-                (emp and emp.dynamic_role and getattr(emp.dynamic_role, 'code', None) == 'SITE_ADMIN')
-            )
+            # Filter module-level permissions strictly by site's allowed modules,
+            # while 100% PRESERVING all special workflow permissions!
+            filtered_permissions = {}
+            for key, val in permissions.items():
+                if key in SPECIAL_WORKFLOW_KEYS or key in allowed_modules:
+                    filtered_permissions[key] = val
+
+            # For Site Admin, ensure full CRUD for site-assigned modules (excluding workflow-controlled Run Payroll)
             if is_site_admin:
                 for mod_name in allowed_modules:
-                    if mod_name not in filtered_permissions:
+                    if mod_name != 'Run Payroll' and mod_name not in filtered_permissions:
                         filtered_permissions[mod_name] = {'view': True, 'create': True, 'update': True, 'delete': True}
-            
+
+            # Align 'Run Payroll' module permissions strictly with the special workflow toggles
+            if 'Payroll' in allowed_modules or 'Run Payroll' in allowed_modules:
+                has_run = bool(filtered_permissions.get('can_run_payroll'))
+                has_approve = bool(filtered_permissions.get('can_approve_payroll'))
+                if has_run or has_approve:
+                    filtered_permissions['Run Payroll'] = {
+                        'view': True,
+                        'create': has_run,
+                        'update': has_approve,
+                        'delete': False
+                    }
+                else:
+                    filtered_permissions.pop('Run Payroll', None)
+
             return filtered_permissions
 
         return permissions

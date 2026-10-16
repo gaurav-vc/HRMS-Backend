@@ -164,17 +164,17 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         if user.is_superuser:
             return Response({'error': 'Super admin does not have permission to run site payroll.'}, status=403)
         emp = getattr(user, 'employee_profile', None)
+        if not emp and user.email:
+            from employees.models import Employee
+            emp = Employee.objects.filter(email__iexact=user.email).first()
+
         can_run = False
-        if emp and emp.role in ['admin', 'org_admin']:
-            can_run = True
-        from organisation.models import Site
-        if Site.objects.filter(contact_email=user.email).exists():
-            can_run = True
-        elif emp and emp.dynamic_role and emp.dynamic_role.permissions:
+        if emp and emp.dynamic_role and emp.dynamic_role.permissions:
             perms = emp.dynamic_role.permissions
             if (perms.get('can_run_payroll') in [True, 'true', 'True', 1, '1'] or
-                perms.get('Run Payroll', {}).get('create') in [True, 'true', 'True', 1, '1']):
+                perms.get('can_process_payroll') in [True, 'true', 'True', 1, '1']):
                 can_run = True
+
         if not can_run:
             return Response({'error': 'Permission denied. You do not have permission to run payroll.'}, status=403)
 
