@@ -54,3 +54,21 @@ class AttendancePolicySerializer(serializers.ModelSerializer):
     class Meta:
         model = AttendancePolicy
         fields = '__all__'
+        extra_kwargs = {
+            'site': {'validators': []},
+            'organization': {'validators': []},
+            'employee': {'validators': []},
+        }
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, 'copy') else dict(data)
+        if 'wfhEmployees' in data and 'wfh_employees' not in data:
+            data['wfh_employees'] = data.get('wfhEmployees')
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        wfh_ids = list(instance.wfh_employees.values_list('id', flat=True))
+        ret['wfh_employees'] = wfh_ids
+        ret['wfhEmployees'] = wfh_ids
+        return ret

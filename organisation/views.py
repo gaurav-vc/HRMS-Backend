@@ -38,29 +38,111 @@ class AttendancePolicyViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Attendance'
     queryset = AttendancePolicy.objects.all()
     serializer_class = AttendancePolicySerializer
-    filterset_fields = ['site', 'organization', 'employee']
 
     def get_queryset(self):
         qs = super().get_queryset()
+        
         is_global = self.request.query_params.get('is_global')
         if is_global == 'true':
-            qs = qs.filter(employee__isnull=True, site__isnull=True, organization__isnull=True)
+            return qs.filter(employee__isnull=True, site__isnull=True, organization__isnull=True)
+
+        site_id = self.request.query_params.get('site')
+        if site_id:
+            return qs.filter(site_id=site_id)
+
+        org_id = self.request.query_params.get('organization')
+        if org_id:
+            return qs.filter(organization_id=org_id)
+
+        emp_id = self.request.query_params.get('employee')
+        if emp_id:
+            return qs.filter(employee_id=emp_id)
+
         return qs
 
-    def perform_create(self, serializer):
-        user = self.request.user
-        instance = serializer.save()
-        
-        # If policy is created as global but user is site-scoped, auto-assign their site
-        if not instance.site and not instance.organization and not instance.employee:
-            emp = getattr(user, 'employee_profile', None)
-            if emp:
-                if emp.role == 'site_admin' or (emp.dynamic_role and emp.dynamic_role.access_scope == 'Location'):
-                    instance.site = emp.site
-                    instance.save(update_fields=['site'])
-                elif emp.dynamic_role and emp.dynamic_role.access_scope in ['Corporate', 'Region']:
-                    instance.organization = emp.organization
-                    instance.save(update_fields=['organization'])
+    def create(self, request, *args, **kwargs):
+        site_id = request.data.get('site')
+        org_id = request.data.get('organization')
+        emp_id = request.data.get('employee')
+
+        existing = None
+        if site_id:
+            existing = AttendancePolicy.objects.filter(site_id=site_id).first()
+        elif org_id:
+            existing = AttendancePolicy.objects.filter(organization_id=org_id).first()
+        elif emp_id:
+            existing = AttendancePolicy.objects.filter(employee_id=emp_id).first()
+        else:
+            is_explicit_global = request.query_params.get('is_global') == 'true' or (not site_id and not org_id and not emp_id)
+            if is_explicit_global:
+                existing = AttendancePolicy.objects.filter(
+                    site__isnull=True, organization__isnull=True, employee__isnull=True
+                ).first()
+
+        if existing:
+            serializer = self.get_serializer(existing, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            policy = serializer.save()
+            raw_wfh = request.data.get('wfh_employees')
+            if raw_wfh is None:
+                raw_wfh = request.data.get('wfhEmployees')
+            if raw_wfh is not None:
+                policy.wfh_employees.set(raw_wfh)
+            return Response(self.get_serializer(policy).data, status=status.HTTP_200_OK)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        policy = serializer.save()
+        raw_wfh = request.data.get('wfh_employees')
+        if raw_wfh is None:
+            raw_wfh = request.data.get('wfhEmployees')
+        if raw_wfh is not None:
+            policy.wfh_employees.set(raw_wfh)
+        return Response(self.get_serializer(policy).data, status=status.HTTP_201_CREATED)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+
+        site_id = request.data.get('site')
+        org_id = request.data.get('organization')
+        emp_id = request.data.get('employee')
+
+        if site_id:
+            target = AttendancePolicy.objects.filter(site_id=site_id).first()
+            if target:
+                instance = target
+        elif org_id:
+            target = AttendancePolicy.objects.filter(organization_id=org_id).first()
+            if target:
+                instance = target
+        elif emp_id:
+            target = AttendancePolicy.objects.filter(employee_id=emp_id).first()
+            if target:
+                instance = target
+
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        policy = serializer.save()
+        raw_wfh = request.data.get('wfh_employees')
+        if raw_wfh is None:
+            raw_wfh = request.data.get('wfhEmployees')
+        if raw_wfh is not None:
+            policy.wfh_employees.set(raw_wfh)
+        return Response(self.get_serializer(policy).data, status=status.HTTP_200_OK)
+
+    def get_object(self):
+        queryset = AttendancePolicy.objects.all()
+        lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
+        filter_kwargs = {self.lookup_field: self.kwargs[lookup_url_kwarg]}
+        from django.shortcuts import get_object_or_404
+        obj = get_object_or_404(queryset, **filter_kwargs)
+        self.check_object_permissions(self.request, obj)
+        return obj
+
+    def partial_update(self, request, *args, **kwargs):
+        kwargs['partial'] = True
+        return self.update(request, *args, **kwargs)
 
 
 

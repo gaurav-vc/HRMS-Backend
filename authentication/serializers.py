@@ -47,10 +47,47 @@ class UserProfileSerializer(serializers.ModelSerializer):
     branding_text = serializers.SerializerMethodField()
     logo_url = serializers.SerializerMethodField()
     site_modules = serializers.SerializerMethodField()
+    access_scope = serializers.SerializerMethodField()
+    has_all_entity_access = serializers.SerializerMethodField()
+    can_manage_users = serializers.SerializerMethodField()
     
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'role', 'employee_id', 'first_name', 'last_name', 'permissions', 'role_name', 'dashboard_type', 'site_name', 'org_name', 'photo_url', 'is_wfh', 'branding_text', 'logo_url', 'is_superuser', 'site_modules')
+        fields = ('id', 'username', 'email', 'role', 'employee_id', 'first_name', 'last_name', 'permissions', 'role_name', 'dashboard_type', 'site_name', 'org_name', 'photo_url', 'is_wfh', 'branding_text', 'logo_url', 'is_superuser', 'site_modules', 'access_scope', 'has_all_entity_access', 'can_manage_users')
+
+    def get_access_scope(self, obj):
+        if obj.is_superuser:
+            return 'Corporate'
+        emp = self._get_employee(obj)
+        if emp and emp.dynamic_role and emp.dynamic_role.access_scope:
+            return emp.dynamic_role.access_scope
+        return 'Self'
+
+    def get_can_manage_users(self, obj):
+        if obj.is_superuser:
+            return True
+        emp = self._get_employee(obj)
+        return bool(emp and emp.dynamic_role and emp.dynamic_role.can_manage_users)
+
+    def get_has_all_entity_access(self, obj):
+        if obj.is_superuser:
+            return True
+        emp = self._get_employee(obj)
+        if not emp:
+            return False
+        dynamic_role = getattr(emp, 'dynamic_role', None)
+        if dynamic_role:
+            scope = str(dynamic_role.access_scope or '').strip().lower()
+            if scope in ('corporate', 'region', 'all', 'all entities', 'global'):
+                return True
+            if dynamic_role.cross_department_access or dynamic_role.can_manage_users:
+                return True
+            perms = dynamic_role.permissions or {}
+            if perms.get('allowed_entities') == 'all' or perms.get('all_entities') is True:
+                return True
+            if isinstance(perms.get('allowed_entities'), list) and len(perms.get('allowed_entities')) > 1:
+                return True
+        return False
 
     def _get_employee(self, obj):
         # Strict boundary: Superuser is the system platform admin, NOT a site employee
@@ -157,6 +194,19 @@ class UserProfileSerializer(serializers.ModelSerializer):
         if emp and emp.dynamic_role:
             permissions.update(emp.dynamic_role.permissions or {})
             permissions['can_approve'] = bool(emp.dynamic_role.can_approve)
+            permissions['can_manage_users'] = bool(emp.dynamic_role.can_manage_users)
+            permissions['access_scope'] = emp.dynamic_role.access_scope or 'Self'
+            scope_lower = str(emp.dynamic_role.access_scope or '').strip().lower()
+            permissions['has_all_entity_access'] = bool(
+                scope_lower in ('corporate', 'region', 'all', 'all entities', 'global') or
+                emp.dynamic_role.cross_department_access or
+                emp.dynamic_role.can_manage_users or
+                (emp.dynamic_role.permissions and (
+                    emp.dynamic_role.permissions.get('allowed_entities') == 'all' or
+                    emp.dynamic_role.permissions.get('all_entities') is True or
+                    (isinstance(emp.dynamic_role.permissions.get('allowed_entities'), list) and len(emp.dynamic_role.permissions.get('allowed_entities')) > 1)
+                ))
+            )
             if emp.dynamic_role.dashboard_type and not permissions.get('dashboard_type'):
                 permissions['dashboard_type'] = str(emp.dynamic_role.dashboard_type).lower()
             
@@ -193,6 +243,9 @@ class UserProfileSerializer(serializers.ModelSerializer):
                 'can_process_payroll',
                 'allowed_entities',
                 'dashboard_type',
+                'access_scope',
+                'has_all_entity_access',
+                'can_manage_users',
             }
 
             # Filter module-level permissions strictly by site's allowed modules,

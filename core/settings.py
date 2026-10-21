@@ -52,6 +52,7 @@ INSTALLED_APPS = [
     'ot_engine',
     'org_engine',
     'admin_org',
+    'announcements',
     'drf_spectacular',
 ]
 

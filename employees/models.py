@@ -43,6 +43,8 @@ class Employee(models.Model):
     doj = models.DateField(blank=True, null=True)
     status = models.CharField(max_length=20, default="Active")
     ctc = models.IntegerField(default=0)
+    group_category = models.CharField(max_length=100, blank=True, null=True, default='General', db_index=True)
+    grade_category = models.CharField(max_length=50, blank=True, null=True, default='Unassigned', db_index=True)
     
     # Tax Configuration
     TAX_REGIME_CHOICES = [('New', 'New Regime'), ('Old', 'Old Regime')]

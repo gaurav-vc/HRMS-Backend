@@ -469,7 +469,7 @@ def isolate_queryset(qs, user):
     )
     if is_super:
         model_name = qs.model.__name__
-        if model_name in ('Organization', 'Invoice', 'Site'):
+        if model_name in ('Organization', 'Invoice', 'Site', 'AttendancePolicy'):
             return qs
         return qs.none()
 
@@ -536,7 +536,7 @@ def isolate_queryset(qs, user):
             return qs.filter(id=employee.id)
 
         # Direct employee relation: Strictly only their own records
-        if hasattr(qs.model, 'employee'):
+        if hasattr(qs.model, 'employee') and qs.model.__name__ != 'AttendancePolicy':
             return qs.filter(employee=employee)
 
         # User model
@@ -596,7 +596,7 @@ def isolate_queryset(qs, user):
         if qs.model.__name__ == 'Employee':
             return qs.filter(Q(id=employee.id) | Q(manager=employee)).distinct()
 
-        if hasattr(qs.model, 'employee'):
+        if hasattr(qs.model, 'employee') and qs.model.__name__ != 'AttendancePolicy':
             return qs.filter(Q(employee=employee) | Q(employee__manager=employee)).distinct()
 
         if qs.model.__name__ == 'PayrollRun':
@@ -647,7 +647,7 @@ def isolate_queryset(qs, user):
                 eq = eq.filter(Q(site_id__in=all_tenant_site_ids) | Q(enrolled_sites__id__in=all_tenant_site_ids))
             return eq.exclude(role='super_admin').distinct()
 
-        if hasattr(qs.model, 'employee'):
+        if hasattr(qs.model, 'employee') and qs.model.__name__ != 'AttendancePolicy':
             return qs.filter(employee__entity_id__in=effective_entity_ids).distinct()
 
         if qs.model.__name__ == 'PayrollRun':
@@ -660,7 +660,12 @@ def isolate_queryset(qs, user):
             return qs.filter(Q(site__branch__entity_id__in=effective_entity_ids) | Q(site__isnull=True))
 
         if qs.model.__name__ == 'AttendancePolicy':
-            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization__isnull=True)).distinct()
+            cond = Q(site__isnull=True, organization__isnull=True)
+            if all_tenant_site_ids:
+                cond |= Q(site_id__in=all_tenant_site_ids)
+            if effective_entity_ids:
+                cond |= Q(organization_id__in=effective_entity_ids)
+            return qs.filter(cond).distinct()
 
         if qs.model.__name__ == 'Holiday':
             return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)).distinct()
@@ -685,7 +690,7 @@ def isolate_queryset(qs, user):
                 ).exclude(role='super_admin').distinct()
             return qs.filter(id=employee.id)
 
-        if hasattr(qs.model, 'employee'):
+        if hasattr(qs.model, 'employee') and qs.model.__name__ != 'AttendancePolicy':
             if all_tenant_site_ids:
                 return qs.filter(
                     Q(employee__site_id__in=all_tenant_site_ids) | Q(employee__enrolled_sites__id__in=all_tenant_site_ids)
@@ -714,7 +719,12 @@ def isolate_queryset(qs, user):
             return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True))
 
         if qs.model.__name__ == 'AttendancePolicy':
-            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization__isnull=True)).distinct()
+            cond = Q(site__isnull=True, organization__isnull=True)
+            if all_tenant_site_ids:
+                cond |= Q(site_id__in=all_tenant_site_ids)
+            elif employee.site_id:
+                cond |= Q(site_id=employee.site_id)
+            return qs.filter(cond).distinct()
 
         if qs.model.__name__ == 'Holiday':
             return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)).distinct()
@@ -741,7 +751,7 @@ def isolate_queryset(qs, user):
             return qs.filter(eq).exclude(role='super_admin').distinct()
         return qs.filter(id=employee.id)
 
-    if hasattr(qs.model, 'employee'):
+    if hasattr(qs.model, 'employee') and qs.model.__name__ != 'AttendancePolicy':
         eq = Q()
         if all_tenant_site_ids:
             eq |= Q(employee__site_id__in=all_tenant_site_ids) | Q(employee__enrolled_sites__id__in=all_tenant_site_ids)
@@ -886,21 +896,22 @@ class DataIsolationMixin:
                     mutable_data = dict(request.data)
                     
                 modified = False
-                if hasattr(model, 'site') and not mutable_data.get('site') and target_site:
-                    mutable_data['site'] = target_site
-                    modified = True
-                if hasattr(model, 'organization') and not mutable_data.get('organization'):
-                    org_field = model._meta.get_field('organization')
-                    if org_field.is_relation and org_field.related_model.__name__ == 'Entity':
-                        if target_entity:
-                            mutable_data['organization'] = target_entity
-                            modified = True
-                    elif target_org:
-                        mutable_data['organization'] = target_org
+                if model.__name__ != 'AttendancePolicy':
+                    if hasattr(model, 'site') and not mutable_data.get('site') and target_site:
+                        mutable_data['site'] = target_site
                         modified = True
-                if hasattr(model, 'entity') and not mutable_data.get('entity') and target_entity:
-                    mutable_data['entity'] = target_entity
-                    modified = True
+                    if hasattr(model, 'organization') and not mutable_data.get('organization'):
+                        org_field = model._meta.get_field('organization')
+                        if org_field.is_relation and org_field.related_model.__name__ == 'Entity':
+                            if target_entity:
+                                mutable_data['organization'] = target_entity
+                                modified = True
+                        elif target_org:
+                            mutable_data['organization'] = target_org
+                            modified = True
+                    if hasattr(model, 'entity') and not mutable_data.get('entity') and target_entity:
+                        mutable_data['entity'] = target_entity
+                        modified = True
                     
                 if modified:
                     serializer = self.get_serializer(data=mutable_data)

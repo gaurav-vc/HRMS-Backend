@@ -725,9 +725,8 @@ class AttendanceViewSet(viewsets.ViewSet):
                     duration = daily_att.last_check_out - daily_att.first_check_in
                     hours = duration.total_seconds() / 3600
                     daily_att.total_work_hours = round(hours, 2)
-                    if hours > 8:
-                        raw_ot = round(hours - 8, 2)
-                        daily_att.overtime_hours = raw_ot
+                    daily_att.overtime_hours = daily_att.compute_overtime(hours)
+                    if hours >= 8:
                         if daily_att.attendance_status not in ['Late']:
                             daily_att.attendance_status = 'Present'
                     elif hours >= 4:
@@ -1324,10 +1323,8 @@ class RegularizationViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             duration = daily_att.last_check_out - daily_att.first_check_in
             hours = duration.total_seconds() / 3600
             daily_att.total_work_hours = round(hours, 2)
-            if hours > 8:
-                raw_ot = round(hours - 8, 2)
-                # Overtime is only paid if it exceeds 2 hours
-                daily_att.overtime_hours = raw_ot if raw_ot > 2.0 else 0.0
+            daily_att.overtime_hours = daily_att.compute_overtime(hours)
+            if hours >= 8:
                 if daily_att.attendance_status not in ['Late']:
                     daily_att.attendance_status = 'Present'
             elif hours >= 4:

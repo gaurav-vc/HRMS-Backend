@@ -32,6 +32,10 @@ class EmployeeSerializer(serializers.ModelSerializer):
             data['tax_regime'] = data.pop('taxRegime')
         if 'taxSavingDeductions' in data:
             data['tax_saving_deductions'] = data.pop('taxSavingDeductions')
+        if 'groupCategory' in data:
+            data['group_category'] = data.pop('groupCategory')
+        if 'gradeCategory' in data:
+            data['grade_category'] = data.pop('gradeCategory')
         return super().to_internal_value(data)
 
     def validate(self, attrs):

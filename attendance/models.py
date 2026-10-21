@@ -43,29 +43,54 @@ class DailyAttendance(models.Model):
             
             ot_threshold = float(policy.ot_applicable_after_hours) if policy else 2.0
 
-            # Fetch Shift Definition for this employee on this date for standard hours
-            try:
-                shift_assignment = ShiftAssignment.objects.get(employee=self.employee, date=self.attendance_date)
-                shift = shift_assignment.shift
-                import datetime
-                dt_start = datetime.datetime.combine(self.attendance_date, shift.start_time)
-                dt_end = datetime.datetime.combine(self.attendance_date, shift.end_time)
-                if dt_end < dt_start:
-                    dt_end += datetime.timedelta(days=1)
-                standard_hours = (dt_end - dt_start).total_seconds() / 3600.0
-            except ShiftAssignment.DoesNotExist:
-                standard_hours = float(policy.full_day_hours) if policy else 8.0
-            
-            raw_ot = max(0.0, duration - standard_hours)
-            
             # Rule: only auto-calculate overtime if not explicitly provided (e.g. via CSV upload or manual override)
             if not self.overtime_hours or self.overtime_hours == 0:
-                if raw_ot > 0:
-                    self.overtime_hours = round(raw_ot, 2)
-                else:
-                    self.overtime_hours = 0.00
+                self.overtime_hours = self.compute_overtime(duration)
                 
         super().save(*args, **kwargs)
+
+    def compute_overtime(self, work_hours):
+        """
+        Dynamically computes overtime based on assigned ShiftDefinition.
+        Follows shift-level rules:
+        - is_ot_enabled: If False, OT is 0.00
+        - min_hours_for_ot: Minimum work hours required to qualify for OT (e.g. 10.00)
+        - ot_calculation_base_hours: Base shift hours deducted from work hours (e.g. 8.00)
+          Example: worked 10.0 hours -> OT = 10.0 - 8.0 = 2.0 hours.
+          worked 9.5 hours (< 10.0) -> OT = 0.00 hours.
+        """
+        shift_obj = None
+        standard_hours = 8.0
+        try:
+            from .models import ShiftAssignment
+            shift_assignment = ShiftAssignment.objects.select_related('shift').get(employee=self.employee, date=self.attendance_date)
+            shift_obj = shift_assignment.shift
+            import datetime
+            dt_start = datetime.datetime.combine(self.attendance_date, shift_obj.start_time)
+            dt_end = datetime.datetime.combine(self.attendance_date, shift_obj.end_time)
+            if dt_end < dt_start:
+                dt_end += datetime.timedelta(days=1)
+            standard_hours = (dt_end - dt_start).total_seconds() / 3600.0
+        except Exception:
+            policy = getattr(self.employee, 'attendance_policy', None) or getattr(self.site, 'attendance_policy', None) or None
+            standard_hours = float(policy.full_day_hours) if policy else 8.0
+
+        if shift_obj:
+            if not getattr(shift_obj, 'is_ot_enabled', True):
+                return 0.00
+            min_ot_h = float(getattr(shift_obj, 'min_hours_for_ot', 0.0) or 0.0)
+            base_h = float(getattr(shift_obj, 'ot_calculation_base_hours', None) or standard_hours)
+            if min_ot_h > 0:
+                if work_hours >= min_ot_h:
+                    return round(max(0.0, work_hours - base_h), 2)
+                return 0.00
+            elif work_hours > base_h:
+                return round(work_hours - base_h, 2)
+            return 0.00
+
+        if work_hours > standard_hours:
+            return round(work_hours - standard_hours, 2)
+        return 0.00
 
 class FaceProfile(models.Model):
     employee = models.OneToOneField(Employee, on_delete=models.CASCADE, related_name='face_profile')
@@ -225,6 +250,11 @@ class ShiftDefinition(models.Model):
     ot_multiplier = models.DecimalField(max_digits=4, decimal_places=2, default=1.0)
     color_hex = models.CharField(max_length=20, default="#000000")
     is_active = models.BooleanField(default=True)
+    
+    # Dynamic Overtime Configuration
+    is_ot_enabled = models.BooleanField(default=True, help_text="Master toggle to enable or disable OT computation for this shift")
+    min_hours_for_ot = models.DecimalField(max_digits=4, decimal_places=2, default=0.00, help_text="Minimum work hours required to qualify for OT (e.g. 10.00). If worked hours < this, OT is 0")
+    ot_calculation_base_hours = models.DecimalField(max_digits=4, decimal_places=2, default=8.00, help_text="Base shift hours subtracted from total work hours once threshold is met (e.g. 8.00)")
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

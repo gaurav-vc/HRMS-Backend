@@ -418,7 +418,24 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         for attr, new_val in validated_data.items():
             old_val = getattr(serializer.instance, attr, None)
             if old_val != new_val:
-                changes[attr] = {'old': str(old_val), 'new': str(new_val)}
+                if attr == 'designation':
+                    old_name = old_val.title if hasattr(old_val, 'title') else str(old_val or 'None')
+                    new_name = new_val.title if hasattr(new_val, 'title') else str(new_val or 'None')
+                    changes['designation'] = {'old': old_name, 'new': new_name}
+                elif attr == 'dynamic_role':
+                    old_name = old_val.name if hasattr(old_val, 'name') else str(old_val or 'None')
+                    new_name = new_val.name if hasattr(new_val, 'name') else str(new_val or 'None')
+                    changes['role'] = {'old': old_name, 'new': new_name}
+                elif attr == 'department':
+                    old_name = old_val.name if hasattr(old_val, 'name') else str(old_val or 'None')
+                    new_name = new_val.name if hasattr(new_val, 'name') else str(new_val or 'None')
+                    changes['department'] = {'old': old_name, 'new': new_name}
+                elif attr in ['site', 'branch', 'entity']:
+                    old_name = old_val.name if hasattr(old_val, 'name') else str(old_val or 'None')
+                    new_name = new_val.name if hasattr(new_val, 'name') else str(new_val or 'None')
+                    changes[attr] = {'old': old_name, 'new': new_name}
+                else:
+                    changes[attr] = {'old': str(old_val), 'new': str(new_val)}
                 
         emp = serializer.save()
         if not emp.user and emp.email:
@@ -630,6 +647,148 @@ HRMS Admin
             })
         return Response(data)
 
+    @action(detail=True, methods=['POST'], url_path='reset_credentials')
+    def reset_credentials(self, request, pk=None):
+        target_employee = self.get_object()
+        
+        # Dynamic permission check: NOT hardcoded to static 'admin' or 'hr' strings
+        from authentication.permissions import isolate_queryset, check_module_permission
+        caller_accessible = isolate_queryset(Employee.objects.all(), request.user).filter(id=target_employee.id)
+        if not caller_accessible.exists():
+            return Response({"error": "You do not have permission to manage credentials for this employee."}, status=status.HTTP_403_FORBIDDEN)
+            
+        caller_emp = getattr(request.user, 'employee_profile', None)
+        has_perm = False
+        
+        if request.user.is_superuser:
+            has_perm = True
+        elif caller_emp:
+            dynamic_role = getattr(caller_emp, 'dynamic_role', None)
+            if dynamic_role:
+                if dynamic_role.access_scope in ('Corporate', 'Region'):
+                    has_perm = True
+                elif dynamic_role.can_manage_users:
+                    has_perm = True
+                elif check_module_permission(request.user, 'Employees', 'update'):
+                    has_perm = True
+                
+        if not has_perm:
+            return Response({"error": "Your role does not grant entity-level management rights to reset passwords."}, status=status.HTTP_403_FORBIDDEN)
+            
+        password_mode = request.data.get('password_mode') or request.data.get('passwordMode', 'auto')
+        custom_password = (request.data.get('custom_password') or request.data.get('customPassword') or '').strip()
+        send_email_val = request.data.get('send_email')
+        if send_email_val is None:
+            send_email_val = request.data.get('sendEmail', True)
+        if isinstance(send_email_val, str):
+            send_email = send_email_val.lower() in ('true', '1')
+        else:
+            send_email = bool(send_email_val)
+        
+        import secrets
+        import string
+        if password_mode == 'custom' and custom_password:
+            new_password = custom_password
+        else:
+            alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+            new_password = ''.join(secrets.choice(alphabet) for _ in range(12))
+            
+        from django.contrib.auth.models import User
+        user = target_employee.user
+        target_email = target_employee.email or (user.email if user else None)
+        if not target_email and user and '@' in user.username:
+            target_email = user.username
+
+        if not user:
+            if not target_email:
+                target_email = target_employee.code + "@peoplepulse.internal"
+            user = User.objects.filter(username=target_email).first()
+            if not user and target_employee.code:
+                user = User.objects.filter(username=target_employee.code).first()
+            if not user:
+                user = User.objects.create_user(
+                    username=target_email,
+                    email=target_email,
+                    first_name=target_employee.first_name,
+                    last_name=target_employee.last_name
+                )
+            target_employee.user = user
+            target_employee.save(update_fields=['user'])
+
+        if target_email:
+            if not target_employee.email:
+                target_employee.email = target_email
+                target_employee.save(update_fields=['email'])
+            if not user.email:
+                user.email = target_email
+                user.save(update_fields=['email'])
+            
+        user.set_password(new_password)
+        user.save()
+        
+        try:
+            from .models import EmployeeAuditLog
+            performed_by = request.user.username if request.user and request.user.is_authenticated else 'System'
+            EmployeeAuditLog.objects.create(
+                employee=target_employee,
+                action='Password Reset',
+                performed_by=performed_by,
+                changes={'credentials': {'old': '[Protected]', 'new': f'Password reset by {performed_by}'}}
+            )
+        except Exception as e:
+            print(f"Failed to log password reset: {e}")
+            
+        email_sent = False
+        if send_email and target_email and '@' in target_email:
+            from django.core.mail import send_mail
+            from django.conf import settings
+            import threading
+            
+            origin = request.headers.get('Origin') or request.build_absolute_uri('/')
+            login_url = origin.rstrip('/') + '/auth'
+            subject = "Your HRMS Login Credentials Have Been Updated"
+            message = f"""Hello {target_employee.first_name},
+
+Your password for the HRMS portal has been updated.
+
+Portal URL: {login_url}
+Login ID: {target_email}
+Password: {new_password}
+
+Please log in and update your password if desired.
+
+Regards,
+HR Operations
+"""
+            try:
+                def _send():
+                    try:
+                        from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', None) or getattr(settings, 'EMAIL_HOST_USER', 'noreply@vibecopilot.ai')
+                        send_mail(
+                            subject,
+                            message,
+                            from_email,
+                            [target_email],
+                            fail_silently=False
+                        )
+                    except Exception as err:
+                        print(f"[Password Reset Email Error] Could not send to {target_email}: {err}")
+
+                threading.Thread(target=_send, daemon=True).start()
+                email_sent = True
+            except Exception as e:
+                print(f"Failed to start password email thread: {e}")
+                
+        return Response({
+            "success": True,
+            "email_sent": email_sent,
+            "emailSent": email_sent,
+            "recipient": target_email,
+            "generated_password": new_password if password_mode != 'custom' else None,
+            "generatedPassword": new_password if password_mode != 'custom' else None,
+            "message": f"Credentials updated successfully and sent to {target_email}." if email_sent else "Password updated successfully."
+        })
+
 from .models import EmployeeDocument, EmployeeTransfer, EmployeeExit
 from .serializers import EmployeeDocumentSerializer, EmployeeTransferSerializer, EmployeeExitSerializer
 
@@ -724,11 +883,46 @@ class NotificationViewSet(viewsets.ViewSet):
     
     def list(self, request):
         user = request.user
-        if user.is_superuser or not hasattr(user, 'employee_profile'):
-            return Response([])
-            
         from .models import Notification
-        notifs = Notification.objects.filter(recipient=user.employee_profile, is_read=False).order_by('-created_at')
+        from announcements.models import Announcement
+
+        emp = getattr(user, 'employee_profile', None)
+        if not emp:
+            if user.email:
+                emp = Employee.objects.filter(email__iexact=user.email).first()
+            if not emp and user.username:
+                emp = Employee.objects.filter(code__iexact=user.username).first()
+
+        # Backfill notifications for any active announcements that this user/employee is targeted for
+        active_announcements = Announcement.objects.filter(is_active=True)
+        for a in active_announcements:
+            is_target = False
+            if a.created_by == user:
+                is_target = True
+            elif a.audience_type == 'EVERYONE':
+                if not a.entity or (emp and a.entity == emp.entity):
+                    is_target = True
+            elif emp and a.audience_type == 'ROLE' and emp.dynamic_role_id and hasattr(a, 'target_roles') and a.target_roles.filter(id=emp.dynamic_role_id).exists():
+                is_target = True
+            elif emp and a.audience_type == 'DEPARTMENT' and emp.department and a.target_departments.filter(id=emp.department_id).exists():
+                is_target = True
+            elif emp and a.audience_type == 'INDIVIDUAL' and a.target_employees.filter(id=emp.id).exists():
+                is_target = True
+
+            if is_target and emp:
+                notif_title = f"Announcement: {a.title}"
+                if not Notification.objects.filter(recipient=emp, title=notif_title).exists():
+                    Notification.objects.create(
+                        recipient=emp,
+                        title=notif_title,
+                        message=a.content[:180],
+                        is_read=False
+                    )
+
+        if emp:
+            notifs = Notification.objects.filter(recipient=emp, is_read=False).order_by('-created_at')
+        else:
+            return Response([])
         
         data = []
         for n in notifs:
@@ -746,7 +940,11 @@ class NotificationViewSet(viewsets.ViewSet):
     def mark_read(self, request, pk=None):
         from .models import Notification
         try:
-            n = Notification.objects.get(pk=pk, recipient=request.user.employee_profile)
+            emp = getattr(request.user, 'employee_profile', None)
+            if emp:
+                n = Notification.objects.get(pk=pk, recipient=emp)
+            else:
+                n = Notification.objects.get(pk=pk)
             n.is_read = True
             n.save()
             return Response({'status': 'success'})
