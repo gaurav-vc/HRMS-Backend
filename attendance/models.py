@@ -31,18 +31,6 @@ class DailyAttendance(models.Model):
             duration = diff.total_seconds() / 3600.0
             self.total_work_hours = max(0.0, round(duration, 2))
             
-            # Fetch Attendance Policy for OT threshold
-            from organisation.models import AttendancePolicy
-            policy = None
-            if hasattr(self.employee, 'attendance_policy'):
-                policy = self.employee.attendance_policy
-            elif self.site and hasattr(self.site, 'attendance_policy'):
-                policy = self.site.attendance_policy
-            elif self.employee.entity and hasattr(self.employee.entity, 'default_attendance_policy'):
-                policy = self.employee.entity.default_attendance_policy
-            
-            ot_threshold = float(policy.ot_applicable_after_hours) if policy else 2.0
-
             # Rule: auto-calculate overtime based on shift-level rules
             self.overtime_hours = self.compute_overtime(duration)
                 
@@ -108,9 +96,13 @@ class DailyAttendance(models.Model):
             return 0.00
 
         policy = getattr(self.employee, 'attendance_policy', None) or getattr(self.site, 'attendance_policy', None) or None
-        min_ot_threshold = float(policy.ot_applicable_after_hours) if (policy and getattr(policy, 'ot_applicable_after_hours', None)) else 2.0
+        min_ot_threshold = float(getattr(policy, 'ot_applicable_after_hours', 0.0) or 0.0) if policy else 0.0
         raw_ot = max(0.0, float(work_hours) - standard_hours)
-        if raw_ot >= min_ot_threshold:
+        if min_ot_threshold > 0:
+            if raw_ot >= min_ot_threshold:
+                return round(raw_ot, 2)
+            return 0.00
+        elif raw_ot > 0:
             return round(raw_ot, 2)
         return 0.00
 
