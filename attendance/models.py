@@ -43,9 +43,8 @@ class DailyAttendance(models.Model):
             
             ot_threshold = float(policy.ot_applicable_after_hours) if policy else 2.0
 
-            # Rule: only auto-calculate overtime if not explicitly provided (e.g. via CSV upload or manual override)
-            if not self.overtime_hours or self.overtime_hours == 0:
-                self.overtime_hours = self.compute_overtime(duration)
+            # Rule: auto-calculate overtime based on shift-level rules
+            self.overtime_hours = self.compute_overtime(duration)
                 
         super().save(*args, **kwargs)
 
@@ -54,23 +53,38 @@ class DailyAttendance(models.Model):
         Dynamically computes overtime based on assigned ShiftDefinition.
         Follows shift-level rules:
         - is_ot_enabled: If False, OT is 0.00
-        - min_hours_for_ot: Minimum work hours required to qualify for OT (e.g. 10.00)
-        - ot_calculation_base_hours: Base shift hours deducted from work hours (e.g. 8.00)
-          Example: worked 10.0 hours -> OT = 10.0 - 8.0 = 2.0 hours.
-          worked 9.5 hours (< 10.0) -> OT = 0.00 hours.
+        - min_hours_for_ot: Minimum overtime or work hours required to qualify for OT
+          If min_hours_for_ot < base_h (e.g. 2.0 hrs):
+             qualifies when overtime (work_hours - base_h) >= 2.0 hrs.
+             e.g. worked 9.0h (1.0h OT) -> 0.00 OT (less than 2h min OT).
+             e.g. worked 10.5h (2.5h OT) -> 2.50 OT (>= 2h min OT).
+          If min_hours_for_ot >= base_h (e.g. 10.0 hrs):
+             qualifies when total work hours >= 10.0 hrs.
         """
         shift_obj = None
         standard_hours = 8.0
         try:
-            from .models import ShiftAssignment
-            shift_assignment = ShiftAssignment.objects.select_related('shift').get(employee=self.employee, date=self.attendance_date)
-            shift_obj = shift_assignment.shift
-            import datetime
-            dt_start = datetime.datetime.combine(self.attendance_date, shift_obj.start_time)
-            dt_end = datetime.datetime.combine(self.attendance_date, shift_obj.end_time)
-            if dt_end < dt_start:
-                dt_end += datetime.timedelta(days=1)
-            standard_hours = (dt_end - dt_start).total_seconds() / 3600.0
+            from django.apps import apps
+            ShiftAssignment = apps.get_model('attendance', 'ShiftAssignment')
+            ShiftDefinition = apps.get_model('attendance', 'ShiftDefinition')
+            # 1. Exact date assignment
+            assignment = ShiftAssignment.objects.filter(employee=self.employee, date=self.attendance_date).select_related('shift').first()
+            if not assignment:
+                # 2. Fallback to employee's most recent assigned shift definition
+                assignment = ShiftAssignment.objects.filter(employee=self.employee).order_by('-date').select_related('shift').first()
+            if assignment:
+                shift_obj = assignment.shift
+            else:
+                # 3. Fallback to active shift definition
+                shift_obj = ShiftDefinition.objects.filter(is_active=True).first()
+
+            if shift_obj:
+                import datetime
+                dt_start = datetime.datetime.combine(self.attendance_date, shift_obj.start_time)
+                dt_end = datetime.datetime.combine(self.attendance_date, shift_obj.end_time)
+                if dt_end < dt_start:
+                    dt_end += datetime.timedelta(days=1)
+                standard_hours = (dt_end - dt_start).total_seconds() / 3600.0
         except Exception:
             policy = getattr(self.employee, 'attendance_policy', None) or getattr(self.site, 'attendance_policy', None) or None
             standard_hours = float(policy.full_day_hours) if policy else 8.0
@@ -80,16 +94,24 @@ class DailyAttendance(models.Model):
                 return 0.00
             min_ot_h = float(getattr(shift_obj, 'min_hours_for_ot', 0.0) or 0.0)
             base_h = float(getattr(shift_obj, 'ot_calculation_base_hours', None) or standard_hours)
+            
+            raw_ot = max(0.0, float(work_hours) - base_h)
             if min_ot_h > 0:
-                if work_hours >= min_ot_h:
-                    return round(max(0.0, work_hours - base_h), 2)
+                # If min_ot_h < base_h (e.g. 2.0h), user set minimum OVERTIME duration required
+                # If min_ot_h >= base_h (e.g. 10.0h), user set total WORK HOURS threshold required
+                min_required_ot = min_ot_h if min_ot_h < base_h else (min_ot_h - base_h)
+                if raw_ot >= min_required_ot:
+                    return round(raw_ot, 2)
                 return 0.00
-            elif work_hours > base_h:
-                return round(work_hours - base_h, 2)
+            elif raw_ot > 0:
+                return round(raw_ot, 2)
             return 0.00
 
-        if work_hours > standard_hours:
-            return round(work_hours - standard_hours, 2)
+        policy = getattr(self.employee, 'attendance_policy', None) or getattr(self.site, 'attendance_policy', None) or None
+        min_ot_threshold = float(policy.ot_applicable_after_hours) if (policy and getattr(policy, 'ot_applicable_after_hours', None)) else 2.0
+        raw_ot = max(0.0, float(work_hours) - standard_hours)
+        if raw_ot >= min_ot_threshold:
+            return round(raw_ot, 2)
         return 0.00
 
 class FaceProfile(models.Model):

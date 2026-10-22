@@ -1346,15 +1346,20 @@ class ShiftDefinitionViewSet(DataIsolationMixin, viewsets.ModelViewSet):
 
 def is_holiday_for_employee(employee, date):
     from attendance.models import Holiday
-    holidays = Holiday.objects.filter(date=date, status='Active')
-    for h in holidays:
+    from django.db.models import Q
+    att_holidays = Holiday.objects.filter(date=date).filter(
+        Q(status__iexact='Active') | Q(status__isnull=True) | Q(status='')
+    )
+    for h in att_holidays:
+        if h.site_id and getattr(employee, 'site_id', None) and h.site_id != employee.site_id:
+            continue
         rules = h.rule_groups.all()
         if not rules.exists():
             return True
         for r in rules:
-            if r.excluded_roles.filter(id=employee.dynamic_role_id).exists() if getattr(employee, 'dynamic_role_id', None) else False:
+            if getattr(employee, 'dynamic_role_id', None) and r.excluded_roles.filter(id=employee.dynamic_role_id).exists():
                 continue
-            if r.excluded_departments.filter(id=employee.department_id).exists() if employee.department_id else False:
+            if employee.department_id and r.excluded_departments.filter(id=employee.department_id).exists():
                 continue
             role_match = not r.applicable_roles.exists() or (getattr(employee, 'dynamic_role_id', None) and r.applicable_roles.filter(id=employee.dynamic_role_id).exists())
             dept_match = not r.applicable_departments.exists() or (employee.department_id and r.applicable_departments.filter(id=employee.department_id).exists())
@@ -1362,32 +1367,47 @@ def is_holiday_for_employee(employee, date):
             branch_match = not r.applicable_branches.exists() or (employee.branch_id and r.applicable_branches.filter(id=employee.branch_id).exists())
             if role_match and dept_match and entity_match and branch_match:
                 return True
+
+    # Fallback to leaves.Holiday if configured there
+    try:
+        from leaves.models import Holiday as LeaveHoliday
+        if LeaveHoliday.objects.filter(date=date).exists():
+            return True
+    except Exception:
+        pass
+
     return False
+
+def is_saturday_working_for_employee(employee):
+    site = getattr(employee, 'site', None)
+    if site and getattr(site, 'is_saturday_working', False):
+        return True
+    try:
+        from leaves.models import LeavePolicyConfiguration
+        config = LeavePolicyConfiguration.get_settings()
+        return bool(getattr(config, 'is_saturday_working', False))
+    except Exception:
+        return False
+
+def is_working_day(employee, date):
+    # Sunday is always off
+    if date.weekday() == 6:
+        return False
+    # Saturday is off unless Saturday working toggle is enabled
+    if date.weekday() == 5:
+        if not is_saturday_working_for_employee(employee):
+            return False
+    # Check holiday calendar
+    if is_holiday_for_employee(employee, date):
+        return False
+    return True
 
 def get_valid_date(employee, date):
     from datetime import timedelta
-    site = employee.site
-    saturday_working = getattr(site, 'is_saturday_working', False) if site else False
-    if not saturday_working:
-        try:
-            from leaves.models import LeavePolicyConfiguration
-            config = LeavePolicyConfiguration.get_settings()
-            saturday_working = getattr(config, 'is_saturday_working', False)
-        except Exception:
-            pass
-    
     current_date = date
-    while True:
-        if current_date.weekday() == 6: # Sunday
-            current_date += timedelta(days=1)
-            continue
-        if current_date.weekday() == 5 and not saturday_working: # Saturday
-            current_date += timedelta(days=2) # Skip to Monday
-            continue
-        if is_holiday_for_employee(employee, current_date):
-            current_date += timedelta(days=1)
-            continue
-        return current_date
+    while not is_working_day(employee, current_date):
+        current_date += timedelta(days=1)
+    return current_date
 
 class RosterViewSet(viewsets.ViewSet):
     permission_classes = [AllowAny]
@@ -1436,16 +1456,16 @@ class RosterViewSet(viewsets.ViewSet):
             shift = ShiftDefinition.objects.get(id=shift_id)
             emp = Employee.objects.get(id=employee_id)
             
-            # Determine the valid date (skip holidays/weekends as per rules)
             from datetime import datetime
             date_obj = datetime.strptime(date, "%Y-%m-%d").date()
-            valid_date_obj = get_valid_date(emp, date_obj)
             
             # Strict boundary: Do not allow manual assignment on non-working days
-            if date_obj != valid_date_obj:
-                return Response({"error": "Strict boundary: Cannot assign shift on a non-working day, holiday, or weekend."}, status=400)
+            if not is_working_day(emp, date_obj):
+                day_name = date_obj.strftime("%A")
+                reason = "Sunday weekly off" if date_obj.weekday() == 6 else ("Saturday off (toggle disabled)" if date_obj.weekday() == 5 else "Holiday calendar off")
+                return Response({"error": f"Cannot assign shift on {day_name} ({date}): {reason}."}, status=400)
                 
-            valid_date_str = valid_date_obj.strftime("%Y-%m-%d")
+            valid_date_str = date_obj.strftime("%Y-%m-%d")
             
             assignment, _ = ShiftAssignment.objects.update_or_create(
                 employee_id=employee_id,
@@ -1510,15 +1530,21 @@ class RosterViewSet(viewsets.ViewSet):
         dates = [start_dt + timedelta(days=i) for i in range(delta.days + 1)]
         
         assignments_to_create_dict = {}
+        non_working_dates_map = defaultdict(list)
         for emp in employees:
             for d in dates:
-                valid_date = get_valid_date(emp, d)
-                # Strict boundary: skip assignment entirely if it's a non-working day
-                if valid_date == d:
+                if is_working_day(emp, d):
                     key = (emp.id, d)
                     assignments_to_create_dict[key] = ShiftAssignment(employee=emp, date=d, shift=shift)
+                else:
+                    non_working_dates_map[emp.id].append(d)
                 
         assignments_to_create = list(assignments_to_create_dict.values())
+        
+        # Purge any existing assignments on non-working days (Sundays, holidays, off-Saturdays) for these employees in range
+        for emp_id, bad_dates in non_working_dates_map.items():
+            if bad_dates:
+                ShiftAssignment.objects.filter(employee_id=emp_id, date__in=bad_dates).delete()
                 
         if assignments_to_create:
             ShiftAssignment.objects.bulk_create(

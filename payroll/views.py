@@ -520,13 +520,19 @@ class SalarySlipAPIView(APIView):
                     ).count()
                     late_penalty_days = (late_count // 3) * 0.5
                     
+                    # Recalculate overtime_hours based on shift threshold rules for this period
+                    for att in DailyAttendance.objects.filter(employee=emp, attendance_date__gte=calc_start, attendance_date__lte=calc_end, total_work_hours__gt=0):
+                        correct_ot = att.compute_overtime(float(att.total_work_hours))
+                        if float(att.overtime_hours or 0) != float(correct_ot):
+                            DailyAttendance.objects.filter(id=att.id).update(overtime_hours=correct_ot)
+
                     from django.db.models import Sum
                     ot_agg = DailyAttendance.objects.filter(
                         employee=emp,
                         attendance_date__gte=calc_start,
                         attendance_date__lte=calc_end
                     ).aggregate(total_ot=Sum('overtime_hours'))
-                    total_ot_hours = ot_agg['total_ot'] or 0.0
+                    total_ot_hours = float(ot_agg['total_ot'] or 0.0)
                     
                     paid_leave_days = sum((min(l.end_date, calc_end) - max(l.start_date, calc_start)).days + 1 for l in emp.leave_requests.filter(status='Approved', start_date__lte=calc_end, end_date__gte=calc_start) if 'lop' not in (l.leave_type.name or '').lower())
                     
@@ -548,7 +554,59 @@ class SalarySlipAPIView(APIView):
                 slip_ded = float(slip.deductions)
                 slip_net = float(slip.net)
                 
-                for k in components:
+                # Synchronize snapshot Overtime Allowance if OT was recalculated
+                ot_lines = slip.lines.filter(rule__name__icontains='overtime')
+                if ot_lines.exists() or 'Overtime Allowance' in components:
+                    old_ot_amt = sum(float(l.amount) for l in ot_lines) if ot_lines.exists() else float(components.get('Overtime Allowance', 0))
+                    if total_ot_hours == 0:
+                        ot_lines.delete()
+                        components.pop('Overtime Allowance', None)
+                        components.pop('Overtime Pay', None)
+                        components.pop('Overtime', None)
+                        if old_ot_amt > 0:
+                            slip_gross = max(0.0, slip_gross - old_ot_amt)
+                            slip_net = max(0.0, slip_net - old_ot_amt)
+                            Payslip.objects.filter(id=slip.id).update(gross=slip_gross, net=slip_net)
+                    else:
+                        basic_amt = 0.0
+                        for c_name, c_val in components.items():
+                            if 'basic' in c_name.lower():
+                                basic_amt = float(c_val)
+                                break
+                        if basic_amt == 0.0 and getattr(emp, 'ctc', None):
+                            basic_amt = (float(emp.ctc) / 12.0) * 0.5
+
+                        # Dynamically resolve shift multiplier from assigned shift or active policy
+                        ot_mult = 1.0
+                        from attendance.models import ShiftAssignment, ShiftDefinition
+                        emp_shift = ShiftAssignment.objects.filter(employee=emp, date__gte=calc_start, date__lte=calc_end).select_related('shift').first()
+                        if not emp_shift:
+                            emp_shift = ShiftAssignment.objects.filter(employee=emp).order_by('-date').select_related('shift').first()
+                        if emp_shift and getattr(emp_shift.shift, 'ot_multiplier', None):
+                            ot_mult = float(emp_shift.shift.ot_multiplier)
+                        else:
+                            try:
+                                from ot_engine.models import OTPolicy
+                                active_policy = OTPolicy.objects.order_by('-effective_from').first()
+                                if active_policy and getattr(active_policy, 'multiplier', None):
+                                    ot_mult = float(active_policy.multiplier)
+                            except Exception:
+                                pass
+
+                        policy = getattr(emp, 'attendance_policy', None) or getattr(emp.site, 'attendance_policy', None) or None
+                        day_hours = float(policy.full_day_hours) if policy and getattr(policy, 'full_day_hours', None) else 8.0
+
+                        hourly_rate = (basic_amt / float(calc_days or 30)) / day_hours
+                        new_ot_amt = round(hourly_rate * ot_mult * total_ot_hours, 2)
+                        if abs(new_ot_amt - old_ot_amt) > 0.01:
+                            ot_lines.update(amount=new_ot_amt)
+                            components['Overtime Allowance'] = new_ot_amt
+                            diff = new_ot_amt - old_ot_amt
+                            slip_gross = max(0.0, slip_gross + diff)
+                            slip_net = max(0.0, slip_net + diff)
+                            Payslip.objects.filter(id=slip.id).update(gross=slip_gross, net=slip_net)
+
+                for k in list(components.keys()):
                     components[k] = float(components[k])
                 
                 # Retroactive Fix: If an employee was saved with full salary but actually had 0 paid days due to the old bug, zero it out dynamically here.

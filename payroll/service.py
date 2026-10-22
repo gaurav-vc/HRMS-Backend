@@ -106,6 +106,13 @@ class PayrollService:
         
         # 3. Pre-aggregate attendance (Punches)
         emp_filter = Q(employee__entity=run.entity) | Q(employee__branch__entity=run.entity) | Q(employee__site__branch__entity=run.entity)
+        
+        # Synchronize overtime_hours with shift qualification rules for all punches in period
+        for att in DailyAttendance.objects.filter(emp_filter, attendance_date__range=[start_date, end_date], total_work_hours__gt=0):
+            correct_ot = att.compute_overtime(float(att.total_work_hours))
+            if float(att.overtime_hours or 0) != float(correct_ot):
+                DailyAttendance.objects.filter(id=att.id).update(overtime_hours=correct_ot)
+                
         attendance_qs = DailyAttendance.objects.filter(
             emp_filter,
             attendance_date__range=[start_date, end_date]
