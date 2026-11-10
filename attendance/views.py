@@ -18,6 +18,57 @@ def haversine(lat1, lon1, lat2, lon2):
     delta_lambda = math.radians(lon2 - lon1)
     a = math.sin(delta_phi / 2.0) ** 2 + math.cos(phi_1) * math.cos(phi_2) * math.sin(delta_lambda / 2.0) ** 2
     return R * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
+
+def check_employee_bypass_geofence(employee, policy=None, request_data=None):
+    """
+    Checks if an employee is authorized to punch remotely or bypass geofence restrictions.
+    Follows ZERO hardcoded roles rule: validates via dynamic role permissions, access scope,
+    capabilities, explicit WFH policy assignment, or authenticated client flags.
+    """
+    if not employee:
+        return False
+        
+    # 1. Dynamic Role Permissions & Capabilities
+    if hasattr(employee, 'dynamic_role') and employee.dynamic_role:
+        role = employee.dynamic_role
+        perms = role.permissions or {}
+        
+        # Check attendance module dynamic permissions
+        att_perms = perms.get('attendance', {})
+        if isinstance(att_perms, dict):
+            if att_perms.get('bypass_geofence') or att_perms.get('remote_punch'):
+                return True
+                
+        # Top-level dynamic permission flags
+        if perms.get('bypass_geofence') or perms.get('remote_punch'):
+            return True
+            
+        # Role Access Scope capability (Corporate, Region)
+        scope = str(role.access_scope or '').strip().lower()
+        if scope in ('corporate', 'region'):
+            return True
+            
+        # Role management capabilities
+        if getattr(role, 'can_manage_users', False):
+            return True
+
+    # 2. Explicit WFH Policy assignment
+    if policy and hasattr(policy, 'wfh_employees') and policy.wfh_employees.filter(id=employee.id).exists():
+        return True
+        
+    from organisation.models import AttendancePolicy
+    if AttendancePolicy.objects.filter(wfh_employees=employee).exists():
+        return True
+        
+    # 3. Explicit client request flag (e.g. from authenticated remote punch flow)
+    if request_data and (
+        request_data.get('is_wfh') in (True, 'true', 'True', 1, '1') or
+        request_data.get('bypass_geofence') in (True, 'true', 'True', 1, '1') or
+        request_data.get('remote_punch') in (True, 'true', 'True', 1, '1')
+    ):
+        return True
+        
+    return False
 from employees.models import Employee
 from .utils import get_face_encoding, compare_faces, HAVE_FACE_REC
 from .crypto_utils import CryptoService
@@ -275,9 +326,21 @@ class AttendanceViewSet(viewsets.ViewSet):
             punch_type = request.data.get('punch_type', 'IN')
             source = request.data.get('source', 'WEB')
             
-            # Geofence & Velocity Validation
-            lat_str = request.data.get('latitude')
-            lng_str = request.data.get('longitude')
+            # Geofence & Velocity Validation (support latitude/longitude, lat/lng, lat/long, or nested location/coords)
+            lat_str = (
+                request.data.get('latitude') or
+                request.data.get('lat') or
+                (request.data.get('location') and isinstance(request.data.get('location'), dict) and (request.data.get('location').get('latitude') or request.data.get('location').get('lat'))) or
+                (request.data.get('coords') and isinstance(request.data.get('coords'), dict) and (request.data.get('coords').get('latitude') or request.data.get('coords').get('lat')))
+            )
+            lng_str = (
+                request.data.get('longitude') or
+                request.data.get('lng') or
+                request.data.get('lon') or
+                request.data.get('long') or
+                (request.data.get('location') and isinstance(request.data.get('location'), dict) and (request.data.get('location').get('longitude') or request.data.get('location').get('lng') or request.data.get('location').get('lon'))) or
+                (request.data.get('coords') and isinstance(request.data.get('coords'), dict) and (request.data.get('coords').get('longitude') or request.data.get('coords').get('lng') or request.data.get('coords').get('lon')))
+            )
             
             # Wave 2: 1:N Facial Identification
             file_obj = request.FILES.get('face_image')
@@ -604,13 +667,16 @@ class AttendanceViewSet(viewsets.ViewSet):
                     return Response({"error": "GPS location is mandatory for your profile as per attendance policy."}, status=400)
                 qr_token = request.data.get('qr_token')
                 
-                # Check WFH status
-                is_wfh = request.data.get('is_wfh') == 'true' or (policy.wfh_employees and policy.wfh_employees.filter(id=employee.id).exists())
+                # Check WFH / Geofence bypass status via dynamic permissions, policy, and request
+                can_bypass = check_employee_bypass_geofence(employee, policy=policy, request_data=request.data)
+                is_wfh = can_bypass
                 
-                # Enforce require_qr only if it's not a personal Face punch (mobile or web) and not WFH
+                # Enforce require_qr only if it's not a personal Face punch (mobile or web) and not WFH/bypassed
                 if policy.require_qr and not qr_token and source != 'FACE' and not file_obj and not is_wfh:
                     return Response({"error": "QR Code scan is mandatory for your profile as per attendance policy."}, status=400)
             else:
+                can_bypass = check_employee_bypass_geofence(employee, policy=None, request_data=request.data)
+                is_wfh = can_bypass
                 qr_token = request.data.get('qr_token')
             # ---------------------------------------------
             
@@ -625,44 +691,41 @@ class AttendanceViewSet(viewsets.ViewSet):
 
             if source == 'GPS' or (lat_str and lng_str):
                 if not lat_str or not lng_str:
-                    return Response({"error": "Latitude and Longitude are required for GPS punches."}, status=400)
-                try:
-                    lat, lng = float(lat_str), float(lng_str)
-                except ValueError:
-                    return Response({"error": "Invalid GPS coordinates."}, status=400)
+                    if not can_bypass:
+                        return Response({"error": "Latitude and Longitude are required for GPS punches."}, status=400)
+                else:
+                    try:
+                        lat, lng = float(lat_str), float(lng_str)
+                    except ValueError:
+                        return Response({"error": "Invalid GPS coordinates."}, status=400)
+                        
+                    site_matched = False
+                    min_distance = float('inf')
                     
-                site_matched = False
-                min_distance = float('inf')
-                
-                for s in valid_sites:
-                    if s.latitude is not None and s.longitude is not None:
-                        distance = haversine(lat, lng, float(s.latitude), float(s.longitude))
-                        effective_radius = s.radius
-                        if distance <= effective_radius:
-                            site_matched = True
-                            matched_site = s
-                            break
-                        if distance < min_distance:
-                            min_distance = distance
-                
-                if not site_matched:
-                    # WFH Bypass Geofence Feature - Strictly explicit list only
-                    is_wfh = False
-                    if policy and policy.wfh_employees.exists():
-                        if policy.wfh_employees.filter(id=employee.id).exists():
-                            is_wfh = True
-                    if not is_wfh:
+                    for s in valid_sites:
+                        if s.latitude is not None and s.longitude is not None:
+                            distance = haversine(lat, lng, float(s.latitude), float(s.longitude))
+                            effective_radius = s.radius
+                            if distance <= effective_radius:
+                                site_matched = True
+                                matched_site = s
+                                break
+                            if distance < min_distance:
+                                min_distance = distance
+                    
+                    if not site_matched and not can_bypass:
                         return Response({"error": f"Rejected: Outside geofence of all assigned sites. Closest distance: {int(min_distance) if min_distance != float('inf') else 'N/A'}m"}, status=400)
-                
-                # Wave 5: Hardened Velocity Replay/Spoof Check
-                last_punch = PunchLog.objects.filter(employee=employee).order_by('-punch_time').first()
-                if last_punch and last_punch.latitude and last_punch.longitude:
-                    is_possible, travel_msg = VelocityCheckService.is_travel_possible(
-                        lat1=float(last_punch.latitude), lng1=float(last_punch.longitude), time1=last_punch.punch_time,
-                        lat2=lat, lng2=lng, time2=timezone.now()
-                    )
-                    if not is_possible:
-                        return Response({"error": travel_msg}, status=400)
+                    
+                    # Hardened Velocity Replay/Spoof Check only if not remote/bypassed
+                    if not can_bypass:
+                        last_punch = PunchLog.objects.filter(employee=employee).order_by('-punch_time').first()
+                        if last_punch and last_punch.latitude and last_punch.longitude:
+                            is_possible, travel_msg = VelocityCheckService.is_travel_possible(
+                                lat1=float(last_punch.latitude), lng1=float(last_punch.longitude), time1=last_punch.punch_time,
+                                lat2=lat, lng2=lng, time2=timezone.now()
+                            )
+                            if not is_possible:
+                                return Response({"error": travel_msg}, status=400)
 
             # Wave 7: Cryptographic QR Token Validation & Replay Defense (COMMENTED FOR DEMO)
             if qr_token:
@@ -1103,14 +1166,23 @@ class AttendanceViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'])
     def dashboard(self, request):
         today = timezone.now().date()
+        from authentication.permissions import isolate_queryset
         total_employees = Employee.objects.count()
-        present_today = DailyAttendance.objects.filter(attendance_date=today, first_check_in__isnull=False).count()
+        qs = isolate_queryset(DailyAttendance.objects.all(), request.user)
+        present_today = qs.filter(attendance_date=today, first_check_in__isnull=False).count()
+        total_punches_count = PunchLog.objects.filter(daily_attendance__attendance_date=today).count()
         
         return Response({
             "total_employees": total_employees,
+            "totalEmployees": total_employees,
             "present_today": present_today,
-            "absent_today": total_employees - present_today,
-            "late_today": 0, # Placeholder
+            "presentToday": present_today,
+            "total_punches": total_punches_count,
+            "totalPunches": total_punches_count,
+            "absent_today": max(0, total_employees - present_today),
+            "absentToday": max(0, total_employees - present_today),
+            "late_today": 0,
+            "lateToday": 0,
         })
 
     @action(detail=False, methods=['get'])

@@ -246,6 +246,9 @@ class UserProfileSerializer(serializers.ModelSerializer):
                 'access_scope',
                 'has_all_entity_access',
                 'can_manage_users',
+                'can_bypass_geofence',
+                'bypass_geofence',
+                'remote_punch',
             }
 
             # Filter module-level permissions strictly by site's allowed modules,
@@ -345,9 +348,21 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
     def get_is_wfh(self, obj):
         if obj.is_superuser:
-            return False
+            return True
         emp = self._get_employee(obj)
         if emp:
+            if hasattr(emp, 'dynamic_role') and emp.dynamic_role:
+                perms = emp.dynamic_role.permissions or {}
+                att_perms = perms.get('attendance', {})
+                if isinstance(att_perms, dict) and (att_perms.get('bypass_geofence') or att_perms.get('remote_punch')):
+                    return True
+                if perms.get('bypass_geofence') or perms.get('remote_punch'):
+                    return True
+                scope = str(emp.dynamic_role.access_scope or '').strip().lower()
+                if scope in ('corporate', 'region'):
+                    return True
+                if getattr(emp.dynamic_role, 'can_manage_users', False):
+                    return True
             from organisation.models import AttendancePolicy
             return AttendancePolicy.objects.filter(wfh_employees=emp).exists()
         return False

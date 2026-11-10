@@ -56,6 +56,18 @@ class EmployeeSerializer(serializers.ModelSerializer):
         return None
 
     def get_is_wfh(self, obj):
+        if hasattr(obj, 'dynamic_role') and obj.dynamic_role:
+            perms = obj.dynamic_role.permissions or {}
+            att_perms = perms.get('attendance', {})
+            if isinstance(att_perms, dict) and (att_perms.get('bypass_geofence') or att_perms.get('remote_punch')):
+                return True
+            if perms.get('bypass_geofence') or perms.get('remote_punch'):
+                return True
+            scope = str(obj.dynamic_role.access_scope or '').strip().lower()
+            if scope in ('corporate', 'region'):
+                return True
+            if getattr(obj.dynamic_role, 'can_manage_users', False):
+                return True
         from organisation.models import AttendancePolicy
         return AttendancePolicy.objects.filter(wfh_employees=obj).exists()
 

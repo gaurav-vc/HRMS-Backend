@@ -4,7 +4,8 @@ import numpy as np
 try:
     from deepface import DeepFace
     HAVE_FACE_REC = True
-except ImportError:
+except Exception:
+    DeepFace = None
     HAVE_FACE_REC = False
 
 def get_face_encoding(image_bytes):

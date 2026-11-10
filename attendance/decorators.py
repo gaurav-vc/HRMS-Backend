@@ -40,21 +40,14 @@ def strict_liveness_precheck(view_func):
             except LivenessLockout.DoesNotExist:
                 pass
                 
-        # Determine if WFH or Office (Requires querying the Employee/Policy)
+        # Determine if WFH or Office (Requires querying the Employee/Policy/Dynamic Role)
         is_wfh = False
         employee = None
         if emp_id:
             try:
                 employee = Employee.objects.get(id=emp_id)
-                from organisation.models import AttendancePolicy
-                policy = None
-                if hasattr(employee, 'attendance_policy') and employee.attendance_policy:
-                    policy = employee.attendance_policy
-                elif employee.site and hasattr(employee.site, 'attendance_policy'):
-                    policy = employee.site.attendance_policy
-                    
-                if policy and policy.wfh_employees.filter(id=employee.id).exists():
-                    is_wfh = True
+                from attendance.views import check_employee_bypass_geofence
+                is_wfh = check_employee_bypass_geofence(employee, request_data=request.data)
             except Exception:
                 pass
                 
@@ -72,8 +65,20 @@ def strict_liveness_precheck(view_func):
             # Reset file pointer for the actual punch method
             file_obj.seek(0)
             
-            lat_str = request.data.get('latitude')
-            lng_str = request.data.get('longitude')
+            lat_str = (
+                request.data.get('latitude') or
+                request.data.get('lat') or
+                (request.data.get('location') and isinstance(request.data.get('location'), dict) and (request.data.get('location').get('latitude') or request.data.get('location').get('lat'))) or
+                (request.data.get('coords') and isinstance(request.data.get('coords'), dict) and (request.data.get('coords').get('latitude') or request.data.get('coords').get('lat')))
+            )
+            lng_str = (
+                request.data.get('longitude') or
+                request.data.get('lng') or
+                request.data.get('lon') or
+                request.data.get('long') or
+                (request.data.get('location') and isinstance(request.data.get('location'), dict) and (request.data.get('location').get('longitude') or request.data.get('location').get('lng') or request.data.get('location').get('lon'))) or
+                (request.data.get('coords') and isinstance(request.data.get('coords'), dict) and (request.data.get('coords').get('longitude') or request.data.get('coords').get('lng') or request.data.get('coords').get('lon')))
+            )
             
             lat = float(lat_str) if lat_str else 0.0
             lng = float(lng_str) if lng_str else 0.0
