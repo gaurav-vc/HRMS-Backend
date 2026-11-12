@@ -14,6 +14,7 @@ class BranchSerializer(serializers.ModelSerializer):
 
 class SiteSerializer(serializers.ModelSerializer):
     organization_name = serializers.CharField(source='organization.name', read_only=True)
+    parent_site_name = serializers.CharField(source='parent_site.name', read_only=True)
     users_count = serializers.SerializerMethodField()
     entity = serializers.SerializerMethodField()
 

@@ -50,10 +50,19 @@ class UserProfileSerializer(serializers.ModelSerializer):
     access_scope = serializers.SerializerMethodField()
     has_all_entity_access = serializers.SerializerMethodField()
     can_manage_users = serializers.SerializerMethodField()
+    site_id = serializers.SerializerMethodField()
     
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'role', 'employee_id', 'first_name', 'last_name', 'permissions', 'role_name', 'dashboard_type', 'site_name', 'org_name', 'photo_url', 'is_wfh', 'branding_text', 'logo_url', 'is_superuser', 'site_modules', 'access_scope', 'has_all_entity_access', 'can_manage_users')
+        fields = ('id', 'username', 'email', 'role', 'employee_id', 'first_name', 'last_name', 'permissions', 'role_name', 'dashboard_type', 'site_name', 'site_id', 'org_name', 'photo_url', 'is_wfh', 'branding_text', 'logo_url', 'is_superuser', 'site_modules', 'access_scope', 'has_all_entity_access', 'can_manage_users')
+
+    def get_site_id(self, obj):
+        if obj.is_superuser:
+            return None
+        site = self._get_main_site(obj)
+        if site:
+            return site.id
+        return None
 
     def get_access_scope(self, obj):
         if obj.is_superuser:

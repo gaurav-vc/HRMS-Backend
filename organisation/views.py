@@ -414,6 +414,25 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             return [AllowAny()]
         return super().get_permissions()
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        is_sub = self.request.query_params.get('is_sub_site')
+        parent_id = self.request.query_params.get('parent_site')
+
+        if is_sub is not None:
+            if str(is_sub).lower() in ['true', '1']:
+                qs = qs.filter(is_sub_site=True)
+            elif str(is_sub).lower() in ['false', '0']:
+                qs = qs.filter(is_sub_site=False, parent_site__isnull=True)
+        elif parent_id is not None:
+            qs = qs.filter(parent_site_id=parent_id)
+        else:
+            user = self.request.user
+            show_all = str(self.request.query_params.get('all', '')).lower() in ['true', '1']
+            if user.is_authenticated and user.is_superuser and not show_all:
+                qs = qs.filter(is_sub_site=False, parent_site__isnull=True)
+        return qs
+
     @action(detail=False, methods=['get'])
     def branding(self, request):
         """
@@ -464,20 +483,36 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         save_kwargs = {}
         raw_is_sub = self.request.data.get('is_sub_site')
         is_explicitly_sub = raw_is_sub is True or str(raw_is_sub).lower() in ['true', '1']
-        is_super = bool(
-            user.is_superuser or 
-            (hasattr(user, 'employee_profile') and user.employee_profile and user.employee_profile.role == 'super_admin') or
-            (hasattr(user, 'groups') and user.groups.filter(name='Super Admin').exists())
-        )
+        is_super = bool(user.is_authenticated and user.is_superuser)
 
-        if is_super or not is_explicitly_sub:
+        if is_super and not is_explicitly_sub:
             # Top-level client site created in Super Admin: strictly isolated, never a subsite
             save_kwargs['is_sub_site'] = False
+            save_kwargs['parent_site'] = None
         else:
-            # Only when explicitly creating a sub-site from within an organization/site context
+            # Sub-site created in Sites: strictly belongs to the main site
+            save_kwargs['is_sub_site'] = True
+            
+            # Resolve parent_site:
+            req_parent = self.request.data.get('parent_site') or self.request.data.get('parentSite')
             tenant_site = _get_tenant_site(user)
-            if tenant_site:
-                save_kwargs['is_sub_site'] = True
+            
+            parent_obj = None
+            if req_parent:
+                from .models import Site
+                parent_obj = Site.objects.filter(id=req_parent, is_sub_site=False).first()
+            if not parent_obj and tenant_site:
+                parent_obj = tenant_site.parent_site if (tenant_site.is_sub_site and tenant_site.parent_site) else tenant_site
+            
+            if parent_obj:
+                save_kwargs['parent_site'] = parent_obj
+                if not serializer.validated_data.get('organization') and parent_obj.organization:
+                    save_kwargs['organization'] = parent_obj.organization
+                if not serializer.validated_data.get('branch') and parent_obj.branch:
+                    save_kwargs['branch'] = parent_obj.branch
+                if not serializer.validated_data.get('contact_email') and parent_obj.contact_email:
+                    save_kwargs['contact_email'] = parent_obj.contact_email
+            elif tenant_site:
                 if tenant_site.organization and 'organization' not in serializer.validated_data:
                     save_kwargs['organization'] = tenant_site.organization
                 if tenant_site.branch and 'branch' not in serializer.validated_data:
@@ -491,7 +526,7 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         if not is_super and save_kwargs.get('is_sub_site') is True:
             if hasattr(user, 'employee_profile') and user.employee_profile:
                 emp = user.employee_profile
-                if emp.role not in ['super_admin', 'org_admin'] and site not in emp.enrolled_sites.all():
+                if site not in emp.enrolled_sites.all():
                     emp.enrolled_sites.add(site)
                 
         origin = self.request.headers.get('Origin')

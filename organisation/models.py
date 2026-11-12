@@ -60,6 +60,7 @@ class Site(models.Model):
     face_enabled = models.BooleanField(default=True)
     is_saturday_working = models.BooleanField(default=False)
     is_sub_site = models.BooleanField(default=False)
+    parent_site = models.ForeignKey('self', on_delete=models.CASCADE, related_name='sub_sites', null=True, blank=True, help_text="The main client site this sub-site belongs to")
     
     # Tablet Attendance Kiosk Configuration (Dynamic Per-Site)
     kiosk_enabled = models.BooleanField(default=False)

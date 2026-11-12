@@ -300,6 +300,8 @@ def _get_tenant_site(user):
             if not employee.site.is_sub_site:
                 return employee.site
             # If assigned to a sub-site, find parent main site
+            if employee.site.parent_site:
+                return employee.site.parent_site
             enrolled_main = employee.enrolled_sites.filter(is_sub_site=False).first()
             if enrolled_main:
                 return enrolled_main
@@ -319,7 +321,12 @@ def _get_tenant_site(user):
             return enrolled_main
 
     # 3. Fallback: any site matching contact email
-    return Site.objects.filter(contact_email=user.email).first()
+    contact_site = Site.objects.filter(contact_email=user.email).first()
+    if contact_site:
+        if contact_site.is_sub_site and contact_site.parent_site:
+            return contact_site.parent_site
+        return contact_site
+    return None
 
 
 def _get_tenant_scope(user):
@@ -337,6 +344,10 @@ def _get_tenant_scope(user):
     all_site_ids = {tenant_site.id}
 
     # Include all sub-sites belonging strictly to this tenant site:
+    # 0. Sub-sites explicitly linked via parent_site
+    parent_sub_sites = Site.objects.filter(parent_site_id=tenant_site.id).values_list('id', flat=True)
+    all_site_ids.update(parent_sub_sites)
+
     # 1. Any sub-site with the same branch as tenant_site
     if tenant_site.branch_id:
         sub_branch_sites = Site.objects.filter(branch_id=tenant_site.branch_id, is_sub_site=True).values_list('id', flat=True)
