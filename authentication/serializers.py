@@ -172,14 +172,30 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
     def _get_user_site(self, obj):
         from organisation.models import Site
-        site = Site.objects.filter(contact_email=obj.email).first()
+        # First priority: Main site (parent_site is None, is_sub_site is False) matching contact email
+        site = Site.objects.filter(contact_email=obj.email, is_sub_site=False, parent_site__isnull=True).first()
         if site:
             return site
+        # Second priority: Match via employee profile
         emp = self._get_employee(obj)
         if emp and emp.site_id:
+            if not emp.site.is_sub_site:
+                return emp.site
+            if emp.site.parent_site:
+                return emp.site.parent_site
             return emp.site
         if emp and emp.enrolled_sites.exists():
-            return emp.enrolled_sites.first()
+            enrolled_main = emp.enrolled_sites.filter(is_sub_site=False, parent_site__isnull=True).first()
+            if enrolled_main:
+                return enrolled_main
+            first_enrolled = emp.enrolled_sites.first()
+            if first_enrolled.parent_site:
+                return first_enrolled.parent_site
+            return first_enrolled
+        # Third priority: Any site matching contact email, but resolving to its parent if it's a sub-site
+        any_site = Site.objects.filter(contact_email=obj.email).first()
+        if any_site:
+            return any_site.parent_site if (any_site.is_sub_site and any_site.parent_site) else any_site
         return None
 
     def get_site_modules(self, obj):
@@ -322,8 +338,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
     def get_site_name(self, obj):
         if obj.is_superuser:
             return None
-        from organisation.models import Site
-        site = Site.objects.filter(contact_email=obj.email).first()
+        site = self._get_user_site(obj)
         if site:
             return site.name
         emp = self._get_employee(obj)
@@ -334,8 +349,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
     def get_org_name(self, obj):
         if obj.is_superuser:
             return None
-        from organisation.models import Site
-        site = Site.objects.filter(contact_email=obj.email).first()
+        site = self._get_user_site(obj)
         if site and site.organization:
             return site.organization.name
         emp = self._get_employee(obj)

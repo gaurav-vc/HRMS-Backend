@@ -504,6 +504,9 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             if not parent_obj and tenant_site:
                 parent_obj = tenant_site.parent_site if (tenant_site.is_sub_site and tenant_site.parent_site) else tenant_site
             
+            # Strict Rule: Sub-sites NEVER have modules stored on them; modules belong ONLY to the main site!
+            save_kwargs['modules'] = None
+
             if parent_obj:
                 save_kwargs['parent_site'] = parent_obj
                 if not serializer.validated_data.get('organization') and parent_obj.organization:
@@ -512,6 +515,10 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                     save_kwargs['branch'] = parent_obj.branch
                 if not serializer.validated_data.get('contact_email') and parent_obj.contact_email:
                     save_kwargs['contact_email'] = parent_obj.contact_email
+                if not serializer.validated_data.get('contact_name') and parent_obj.contact_name:
+                    save_kwargs['contact_name'] = parent_obj.contact_name
+                if not serializer.validated_data.get('contact_phone') and parent_obj.contact_phone:
+                    save_kwargs['contact_phone'] = parent_obj.contact_phone
             elif tenant_site:
                 if tenant_site.organization and 'organization' not in serializer.validated_data:
                     save_kwargs['organization'] = tenant_site.organization
@@ -519,6 +526,16 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                     save_kwargs['branch'] = tenant_site.branch
                 if not serializer.validated_data.get('contact_email') and tenant_site.contact_email:
                     save_kwargs['contact_email'] = tenant_site.contact_email
+
+            # Clean kiosk_token: empty string or blank must be saved as None to avoid unique constraint collisions
+            if not serializer.validated_data.get('kiosk_token'):
+                save_kwargs['kiosk_token'] = None
+
+            # Clean site_code: ensure empty string is replaced with a generated unique subsite code
+            site_code_val = serializer.validated_data.get('site_code')
+            if not site_code_val or not str(site_code_val).strip():
+                p_code = parent_obj.site_code if parent_obj and parent_obj.site_code else 'SUB'
+                save_kwargs['site_code'] = f"{p_code}-{random.randint(100, 9999)}"
             
         site = serializer.save(**save_kwargs)
         
@@ -529,15 +546,21 @@ class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 if site not in emp.enrolled_sites.all():
                     emp.enrolled_sites.add(site)
                 
-        origin = self.request.headers.get('Origin')
-        provision_contact_person(site, origin=origin)
+        # ONLY call provision_contact_person for top-level Main Sites, NEVER for sub-sites!
+        if not save_kwargs.get('is_sub_site'):
+            origin = self.request.headers.get('Origin')
+            provision_contact_person(site, origin=origin)
         
     def perform_update(self, serializer):
         old_email = serializer.instance.contact_email
-        site = serializer.save()
-        origin = self.request.headers.get('Origin')
-        email_changed = bool(site.contact_email and site.contact_email != old_email)
-        provision_contact_person(site, origin=origin, is_update=not email_changed)
+        if serializer.instance.is_sub_site:
+            # Sub-sites NEVER have modules stored on them; modules belong strictly to the main site!
+            site = serializer.save(modules=None)
+        else:
+            site = serializer.save()
+            origin = self.request.headers.get('Origin')
+            email_changed = bool(site.contact_email and site.contact_email != old_email)
+            provision_contact_person(site, origin=origin, is_update=not email_changed)
 
 class DepartmentViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Departments'

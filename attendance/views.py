@@ -1317,10 +1317,12 @@ class AttendanceViewSet(viewsets.ViewSet):
     def dashboard(self, request):
         today = timezone.now().date()
         from authentication.permissions import isolate_queryset
-        total_employees = Employee.objects.count()
+        allowed_emps = isolate_queryset(Employee.objects.all(), request.user)
+        total_employees = allowed_emps.count()
         qs = isolate_queryset(DailyAttendance.objects.all(), request.user)
         present_today = qs.filter(attendance_date=today, first_check_in__isnull=False).count()
-        total_punches_count = PunchLog.objects.filter(daily_attendance__attendance_date=today).count()
+        allowed_punches = isolate_queryset(PunchLog.objects.all(), request.user)
+        total_punches_count = allowed_punches.filter(daily_attendance__attendance_date=today).count()
         
         return Response({
             "total_employees": total_employees,

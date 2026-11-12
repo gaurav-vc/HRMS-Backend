@@ -49,8 +49,7 @@ def check_module_permission(user, module_name, action='view'):
         return module_name in ['Sites', 'Organizations', 'Billing']
 
     # Check site modules if user is site contact
-    from organisation.models import Site
-    site = Site.objects.filter(contact_email=user.email).first()
+    site = _get_tenant_site(user)
     if site and site.modules:
         for mod in site.modules:
             mod_name = mod if isinstance(mod, str) else mod.get('name', '')
@@ -153,14 +152,7 @@ class BaseRolePermission(permissions.BasePermission):
 
         employee = getattr(request.user, 'employee_profile', None)
 
-        from organisation.models import Site
-        site = None
-        if employee and employee.site_id:
-            site = employee.site
-        if not site:
-            site = Site.objects.filter(contact_email=request.user.email).first()
-        if not site and employee and employee.enrolled_sites.exists():
-            site = employee.enrolled_sites.first()
+        site = _get_tenant_site(request.user)
 
         # Strict site module boundary: If site has modules configured, rbac_module must be allowed
         if rbac_module and site and site.modules is not None:
@@ -981,14 +973,7 @@ class DynamicCRUDPermission(permissions.BasePermission):
             
         # 4. Extract module permissions
         module_perms = {}
-        from organisation.models import Site
-        site = None
-        if employee and employee.site_id:
-            site = employee.site
-        if not site:
-            site = Site.objects.filter(contact_email=request.user.email).first()
-        if not site and employee and employee.enrolled_sites.exists():
-            site = employee.enrolled_sites.first()
+        site = _get_tenant_site(request.user)
 
         # Strict site module boundary: If site has modules configured, rbac_module must be allowed
         if site and site.modules is not None:
@@ -1081,8 +1066,7 @@ class DynamicCRUDPermission(permissions.BasePermission):
             return True
             
         module_perms = {}
-        from organisation.models import Site
-        site = Site.objects.filter(contact_email=request.user.email).first()
+        site = _get_tenant_site(request.user)
         if site and site.modules:
             for mod in site.modules:
                 mod_name = mod if isinstance(mod, str) else mod.get('name', '')
