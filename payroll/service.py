@@ -121,7 +121,8 @@ class PayrollService:
             late_count=Count('id', filter=Q(attendance_status='Late')),
             half_day_count=Count('id', filter=Q(attendance_status='Half Day')),
             absent_count=Count('id', filter=Q(attendance_status='Absent')),
-            total_overtime=Sum('overtime_hours')
+            total_overtime=Sum('overtime_hours'),
+            total_late_deductions=Sum('late_deduction_amount')
         )
         att_map = {item['employee_id']: item for item in attendance_qs}
         
@@ -285,6 +286,7 @@ class PayrollService:
             'current_month': precomputed_data.get('month', 1),
             'gender': getattr(employee, 'gender', 'Male'),
             'reimbursement': Decimal(str(reimbursement_amount)),
+            'late_deduction_amount': Decimal(str(emp_att.get('total_late_deductions', 0) or 0)),
         }
 
     @staticmethod
@@ -532,18 +534,112 @@ class PayrollService:
                 print(f"Error processing leave encashment: {e}")
                 traceback.print_exc()
 
-        net = total_gross - total_deductions
-        if net < 0:
-            diff = total_deductions - total_gross
+        # ==========================================
+        # PUNCTUALITY & LATE DEDUCTIONS INJECTION
+        # ==========================================
+        late_deduction_val = context.get('late_deduction_amount', Decimal('0.00'))
+        if late_deduction_val > Decimal('0.00'):
+            late_deduction_val = late_deduction_val.quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+            total_deductions += late_deduction_val
+            virtual_punct_rule, _ = ComponentRule.objects.get_or_create(
+                name="Punctuality & Late Deductions",
+                defaults={
+                    'type': 'Deduction',
+                    'formula': '0',
+                    'is_statutory': False,
+                    'effective_from': timezone.now().date()
+                }
+            )
+            line_items.append({'rule': virtual_punct_rule, 'amount': late_deduction_val})
+
+        # ==========================================
+        # EMPLOYEE WALLET (SECURITY DEPOSIT) INJECTION
+        # ==========================================
+        from payroll.models import EmployeeWallet, WalletPolicy
+        wallet = EmployeeWallet.objects.filter(employee_id=employee.id).first() if hasattr(employee, 'id') else None
+
+        wallet_policy = None
+        if getattr(employee, 'site_id', None):
+            wallet_policy = WalletPolicy.objects.filter(site_id=employee.site_id).first()
+        if not wallet_policy and getattr(employee, 'entity_id', None):
+            wallet_policy = WalletPolicy.objects.filter(organization_id=employee.entity_id).first()
+
+        if wallet and wallet.is_active and wallet_policy and wallet_policy.is_enabled:
+            ceiling = Decimal(str(wallet.effective_ceiling))
+            current_bal = Decimal(str(wallet.current_balance))
+            remaining_capacity = max(Decimal('0.00'), ceiling - current_bal)
+
+            if remaining_capacity > Decimal('0.00'):
+                # Calculate nominal monthly cut with strict Decimal precision
+                if wallet_policy.deduction_basis == 'GROSS':
+                    nominal_cut = (total_gross * Decimal(str(wallet_policy.deduction_rate))) / Decimal('100.00')
+                elif wallet_policy.deduction_basis == 'BASIC':
+                    nominal_cut = (Decimal(str(context.get('basic', 0))) * Decimal(str(wallet_policy.deduction_rate))) / Decimal('100.00')
+                else:  # FIXED
+                    nominal_cut = Decimal(str(wallet_policy.deduction_rate))
+
+                # Clamp deduction so it never exceeds ceiling by even 0.01 paise
+                wallet_deduction = min(nominal_cut, remaining_capacity).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+
+                if wallet_deduction > Decimal('0.00'):
+                    total_deductions += wallet_deduction
+                    virtual_wallet_rule, _ = ComponentRule.objects.get_or_create(
+                        name="Security Deposit (Wallet)",
+                        defaults={
+                            'type': 'Deduction',
+                            'formula': '0',
+                            'is_statutory': False,
+                            'effective_from': timezone.now().date()
+                        }
+                    )
+                    line_items.append({'rule': virtual_wallet_rule, 'amount': wallet_deduction})
+
+        # ==========================================
+        # DISCIPLINARY MEMO DEDUCTIONS INJECTION
+        # ==========================================
+        from payroll.models import EmployeeDisciplinaryMemo
+        pending_memos = EmployeeDisciplinaryMemo.objects.filter(
+            employee_id=employee.id,
+            status='PENDING',
+            is_active=True
+        )
+        for memo in pending_memos:
+            memo_val = Decimal(str(memo.amount or '0.00')).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+            if memo_val > Decimal('0.00'):
+                total_deductions += memo_val
+                reason_clean = (memo.infraction_reason or "Disciplinary Penalty").strip()
+                virtual_memo_rule, _ = ComponentRule.objects.get_or_create(
+                    name=f"Disciplinary Memo: {reason_clean}",
+                    defaults={
+                        'type': 'Deduction',
+                        'formula': '0',
+                        'is_statutory': False,
+                        'effective_from': timezone.now().date()
+                    }
+                )
+                line_items.append({'rule': virtual_memo_rule, 'amount': memo_val})
+
+        # ==========================================
+        # 100% MATHEMATICAL PRECISION & INVARIANT VERIFICATION
+        # ==========================================
+        # Ensure every individual line item amount is quantized to exact paise
+        for item in line_items:
+            item['amount'] = Decimal(str(item['amount'])).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+
+        total_gross = sum((item['amount'] for item in line_items if item['rule'].type == 'Earning'), Decimal('0.00')).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+        total_deductions = sum((item['amount'] for item in line_items if item['rule'].type == 'Deduction'), Decimal('0.00')).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+
+        net = (total_gross - total_deductions).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+        if net < Decimal('0.00'):
+            diff = (total_deductions - total_gross).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
             virtual_adjustment, _ = ComponentRule.objects.get_or_create(
                 name="Negative Pay Adjustment",
-                type="Earning",
-                defaults={'formula': "0", 'effective_from': "2020-01-01"}
+                defaults={'type': 'Earning', 'formula': "0", 'effective_from': timezone.now().date()}
             )
             line_items.append({'rule': virtual_adjustment, 'amount': diff})
-            total_gross += diff
+            total_gross = (total_gross + diff).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
             net = Decimal('0.00')
-            
+
         return total_gross, total_deductions, net, line_items
 
     @staticmethod

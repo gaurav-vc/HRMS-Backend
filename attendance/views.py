@@ -134,6 +134,128 @@ def send_shift_email_async(emp_email, emp_name, shift_name, shift_start, shift_e
             
     threading.Thread(target=_send).start()
 
+
+def evaluate_punctuality_slabs(employee, punch_time, shift_start_dt):
+    """
+    Evaluates site-isolated Punctuality Slabs for an employee punch-in.
+    Complies with ZERO HARDCODED ROLES: checks employee.designation dynamically.
+    Returns:
+        dict: {
+            "matched": bool,
+            "slab": PunctualitySlab or None,
+            "penalty_amount": Decimal,
+            "penalty_type": str,
+            "status": str, # 'Present', 'Late', or 'Half Day'
+            "minutes_offset": float,
+            "details": dict
+        }
+    """
+    from decimal import Decimal
+    from organisation.models import AttendancePolicy, PunctualitySlab
+
+    # Multi-tenant site isolation resolution:
+    # 1. Site policy -> 2. Entity policy -> 3. Global policy
+    policy = None
+    if getattr(employee, 'site', None) and hasattr(employee.site, 'attendance_policy'):
+        policy = employee.site.attendance_policy
+    if not policy and getattr(employee, 'entity', None) and hasattr(employee.entity, 'default_attendance_policy'):
+        policy = employee.entity.default_attendance_policy
+    if not policy:
+        policy = AttendancePolicy.objects.filter(site__isnull=True, organization__isnull=True, employee__isnull=True).first()
+
+    if not policy:
+        return {"matched": False, "status": "Present", "penalty_amount": Decimal('0.00'), "penalty_type": "NONE", "slab": None, "minutes_offset": 0.0, "details": {}}
+
+    slabs = policy.punctuality_slabs.all().order_by('order', 'minutes_threshold')
+    if not slabs.exists():
+        return {"matched": False, "status": "Present", "penalty_amount": Decimal('0.00'), "penalty_type": "NONE", "slab": None, "minutes_offset": 0.0, "details": {}}
+
+    # Dynamic role / designation check: Zero hardcoded roles!
+    emp_designation_id = getattr(employee, 'designation_id', None)
+    emp_dynamic_role_id = getattr(employee, 'dynamic_role_id', None)
+    applicable_slabs = []
+    for s in slabs:
+        has_desigs = s.applicable_designations.exists()
+        has_roles = s.applicable_roles.exists()
+        # If no specific roles or designations are assigned, it applies to all.
+        if not has_desigs and not has_roles:
+            applicable_slabs.append(s)
+            continue
+
+        role_matched = has_roles and emp_dynamic_role_id and s.applicable_roles.filter(id=emp_dynamic_role_id).exists()
+        desig_matched = has_desigs and emp_designation_id and s.applicable_designations.filter(id=emp_designation_id).exists()
+        if role_matched or desig_matched:
+            applicable_slabs.append(s)
+
+    if not applicable_slabs:
+        return {"matched": False, "status": "Present", "penalty_amount": Decimal('0.00'), "penalty_type": "NONE", "slab": None, "minutes_offset": 0.0, "details": {}}
+
+    # Calculate offset in minutes from shift start
+    diff_seconds = (punch_time - shift_start_dt).total_seconds()
+    offset_minutes = diff_seconds / 60.0
+
+    matched_slab = None
+
+    def get_trigger_offset(s):
+        if s.comparison_type == 'AFTER_GRACE_MINUTES':
+            return float(s.minutes_threshold)
+        elif s.comparison_type == 'AFTER_SHIFT_START':
+            return 0.0
+        elif s.comparison_type == 'AFTER_MANDATORY_PRIOR':
+            return -float(s.minutes_threshold)
+        return 0.0
+
+    sorted_slabs = sorted(applicable_slabs, key=get_trigger_offset, reverse=True)
+
+    for s in sorted_slabs:
+        trigger_min = get_trigger_offset(s)
+        if offset_minutes > trigger_min:
+            matched_slab = s
+            break
+
+    if not matched_slab:
+        # Arrived on or before mandatory reporting mark -> Perfect punctuality!
+        return {
+            "matched": False,
+            "status": "Present",
+            "penalty_amount": Decimal('0.00'),
+            "penalty_type": "NONE",
+            "slab": None,
+            "minutes_offset": offset_minutes,
+            "details": {}
+        }
+
+    penalty_amt = Decimal('0.00')
+    status_str = 'Late'
+    if matched_slab.deduction_type == 'HALF_DAY':
+        status_str = 'Half Day'
+        penalty_amt = Decimal(str(matched_slab.deduction_value or '0.00'))
+    elif matched_slab.deduction_type == 'FIXED_AMOUNT':
+        penalty_amt = Decimal(str(matched_slab.deduction_value or '0.00'))
+    elif matched_slab.deduction_type == 'PERCENTAGE':
+        penalty_amt = Decimal(str(matched_slab.deduction_value or '0.00'))
+
+    details = {
+        "slab_id": matched_slab.id,
+        "slab_name": matched_slab.name,
+        "comparison_type": matched_slab.comparison_type,
+        "deduction_type": matched_slab.deduction_type,
+        "deduction_value": float(matched_slab.deduction_value),
+        "minutes_offset": round(offset_minutes, 1),
+        "shift_start": shift_start_dt.isoformat()
+    }
+
+    return {
+        "matched": True,
+        "slab": matched_slab,
+        "penalty_amount": penalty_amt,
+        "penalty_type": matched_slab.deduction_type,
+        "status": status_str,
+        "minutes_offset": offset_minutes,
+        "details": details
+    }
+
+
 class AttendanceViewSet(viewsets.ViewSet):
     parser_classes = (MultiPartParser, FormParser, JSONParser)
     
@@ -766,21 +888,49 @@ class AttendanceViewSet(viewsets.ViewSet):
                         from .models import ShiftAssignment
                         import datetime
                         shift_assignment = ShiftAssignment.objects.filter(employee=employee, date=today).first()
+                        
+                        shift_start_dt = None
                         if shift_assignment and shift_assignment.shift:
                             shift = shift_assignment.shift
-                            cutoff_dt = datetime.datetime.combine(today, shift.start_time) + datetime.timedelta(minutes=shift.grace_minutes)
-                            if timezone.is_naive(cutoff_dt):
-                                cutoff_dt = timezone.make_aware(cutoff_dt)
-                            if now > cutoff_dt:
-                                daily_att.attendance_status = 'Late'
-                            else:
-                                daily_att.attendance_status = 'Present'
+                            shift_start_dt = datetime.datetime.combine(today, shift.start_time)
+                            if timezone.is_naive(shift_start_dt):
+                                shift_start_dt = timezone.make_aware(shift_start_dt)
                         else:
-                            shift_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
-                            if now > shift_start:
-                                daily_att.attendance_status = 'Late'
+                            shift_start_dt = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                            if timezone.is_naive(shift_start_dt):
+                                shift_start_dt = timezone.make_aware(shift_start_dt)
+
+                        # Evaluate punctuality slabs dynamically
+                        punct_res = evaluate_punctuality_slabs(employee, now, shift_start_dt)
+                        if punct_res["matched"]:
+                            daily_att.attendance_status = punct_res["status"]
+                            daily_att.late_deduction_amount = punct_res["penalty_amount"]
+                            daily_att.punctuality_penalty_details = punct_res["details"]
+                            
+                            from organisation.models import PunctualityPenaltyLog
+                            PunctualityPenaltyLog.objects.create(
+                                daily_attendance=daily_att,
+                                slab=punct_res["slab"],
+                                penalty_amount=punct_res["penalty_amount"],
+                                penalty_type=punct_res["penalty_type"],
+                                punch_time=now,
+                                shift_start=shift_start_dt,
+                                minutes_late=int(max(0, punct_res["minutes_offset"]))
+                            )
+                        else:
+                            # Standard fallback if no custom slab policy applies
+                            if shift_assignment and shift_assignment.shift:
+                                shift = shift_assignment.shift
+                                cutoff_dt = shift_start_dt + datetime.timedelta(minutes=shift.grace_minutes)
+                                if now > cutoff_dt:
+                                    daily_att.attendance_status = 'Late'
+                                else:
+                                    daily_att.attendance_status = 'Present'
                             else:
-                                daily_att.attendance_status = 'Present'
+                                if now > shift_start_dt:
+                                    daily_att.attendance_status = 'Late'
+                                else:
+                                    daily_att.attendance_status = 'Present'
                 else:
                     daily_att.last_check_out = now
                     

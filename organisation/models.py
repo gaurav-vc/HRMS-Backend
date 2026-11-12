@@ -132,6 +132,61 @@ class AttendancePolicy(models.Model):
             return f"Default Policy for Org: {self.organization.name}"
         return "Global Attendance Policy"
 
+
+class PunctualitySlab(models.Model):
+    COMPARISON_CHOICES = (
+        ('AFTER_MANDATORY_PRIOR', 'After Mandatory Prior Mark (Before Shift Start)'),
+        ('AFTER_SHIFT_START', 'After Exact Shift Start Time'),
+        ('AFTER_GRACE_MINUTES', 'After Grace Period Past Shift Start'),
+    )
+    DEDUCTION_TYPE_CHOICES = (
+        ('FIXED_AMOUNT', 'Fixed Monetary Amount (₹)'),
+        ('HALF_DAY', 'Half Day Salary Deduction'),
+        ('PERCENTAGE', 'Percentage of Daily Wage (%)'),
+    )
+
+    policy = models.ForeignKey(AttendancePolicy, on_delete=models.CASCADE, related_name='punctuality_slabs')
+    name = models.CharField(max_length=100, help_text="e.g. Late Reporting (15m Prior), Post-Shift Start")
+    applicable_designations = models.ManyToManyField(
+        Designation, blank=True,
+        help_text="Designations subject to this slab (e.g. Trainers). Empty applies to all."
+    )
+    applicable_roles = models.ManyToManyField(
+        'Role', blank=True, related_name='punctuality_slabs',
+        help_text="Dynamic roles subject to this slab. Empty applies to all."
+    )
+    comparison_type = models.CharField(max_length=30, choices=COMPARISON_CHOICES)
+    minutes_threshold = models.IntegerField(
+        default=0,
+        help_text="Minutes relative to shift start or prior arrival mark"
+    )
+    deduction_type = models.CharField(max_length=20, choices=DEDUCTION_TYPE_CHOICES, default='FIXED_AMOUNT')
+    deduction_value = models.DecimalField(
+        max_digits=10, decimal_places=2, default=0.00,
+        help_text="₹ amount if FIXED_AMOUNT, or percentage if PERCENTAGE, or 0.5 for HALF_DAY"
+    )
+    order = models.IntegerField(default=1, help_text="Evaluation priority order")
+
+    class Meta:
+        ordering = ['order', 'minutes_threshold']
+
+    def __str__(self):
+        return f"{self.name} ({self.get_deduction_type_display()} - {self.deduction_value})"
+
+
+class PunctualityPenaltyLog(models.Model):
+    daily_attendance = models.ForeignKey('attendance.DailyAttendance', on_delete=models.CASCADE, related_name='punctuality_logs')
+    slab = models.ForeignKey(PunctualitySlab, on_delete=models.SET_NULL, null=True, blank=True)
+    penalty_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
+    penalty_type = models.CharField(max_length=50)
+    punch_time = models.DateTimeField()
+    shift_start = models.DateTimeField(null=True, blank=True)
+    minutes_late = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Penalty {self.penalty_amount} for {self.daily_attendance.employee}"
+
 class Role(models.Model):
     name = models.CharField(max_length=100)
     code = models.CharField(max_length=50, unique=True)

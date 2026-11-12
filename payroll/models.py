@@ -1,5 +1,6 @@
 from django.db import models
 from django.conf import settings
+from decimal import Decimal
 from employees.models import Employee
 from organisation.models import Entity, Department
 
@@ -251,3 +252,122 @@ class Form16Document(models.Model):
 
     class Meta:
         unique_together = ('employee', 'financial_year', 'version')
+
+
+# ==========================================
+# EMPLOYEE WALLET & SECURITY DEPOSIT SYSTEM
+# ==========================================
+
+class WalletPolicy(models.Model):
+    BASIS_CHOICES = (
+        ('GROSS', 'Percentage of Monthly Gross Salary'),
+        ('BASIC', 'Percentage of Basic Salary'),
+        ('FIXED', 'Fixed Monthly Amount (₹)'),
+    )
+    site = models.OneToOneField('organisation.Site', on_delete=models.CASCADE, related_name='wallet_policy', null=True, blank=True)
+    organization = models.OneToOneField('organisation.Entity', on_delete=models.CASCADE, related_name='default_wallet_policy', null=True, blank=True)
+    is_enabled = models.BooleanField(default=False)
+    deduction_basis = models.CharField(max_length=10, choices=BASIS_CHOICES, default='GROSS')
+    deduction_rate = models.DecimalField(max_digits=7, decimal_places=2, default=10.00, help_text="e.g. 10.00 for 10%")
+    target_ceiling = models.DecimalField(max_digits=12, decimal_places=2, default=30000.00, help_text="Maximum accumulated deposit limit (e.g. ₹30,000)")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        target = f"Site: {self.site.name}" if self.site else f"Org: {self.organization.name}" if self.organization else "Global"
+        return f"Wallet Policy ({target}) - {self.deduction_rate}% up to ₹{self.target_ceiling}"
+
+
+class EmployeeWallet(models.Model):
+    employee = models.OneToOneField(Employee, on_delete=models.CASCADE, related_name='wallet')
+    is_active = models.BooleanField(default=True, help_text="Toggle wallet deposit deduction on/off for this employee")
+    current_balance = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
+    custom_target_ceiling = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True, help_text="Overrides policy ceiling if set")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    @property
+    def effective_ceiling(self):
+        if self.custom_target_ceiling is not None:
+            return self.custom_target_ceiling
+        policy = getattr(self.employee.site, 'wallet_policy', None) or getattr(self.employee.entity, 'default_wallet_policy', None)
+        return policy.target_ceiling if policy else Decimal('30000.00')
+
+    def __str__(self):
+        return f"Wallet: {self.employee} - Balance: ₹{self.current_balance} / Limit: ₹{self.effective_ceiling}"
+
+
+class WalletLedgerEntry(models.Model):
+    TXN_TYPES = (
+        ('SALARY_DEDUCTION', 'Salary Deduction Credit'),
+        ('REFUND', 'Security Deposit Refund Debit'),
+        ('MANUAL_ADJUSTMENT', 'Manual Adjustment'),
+    )
+    wallet = models.ForeignKey(EmployeeWallet, on_delete=models.CASCADE, related_name='transactions')
+    payroll_run = models.ForeignKey('PayrollRun', on_delete=models.SET_NULL, null=True, blank=True, related_name='wallet_transactions')
+    period = models.CharField(max_length=7, help_text="YYYY-MM")
+    transaction_type = models.CharField(max_length=20, choices=TXN_TYPES, default='SALARY_DEDUCTION')
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    balance_after = models.DecimalField(max_digits=12, decimal_places=2)
+    notes = models.CharField(max_length=255, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.period} - {self.transaction_type}: {self.amount} (Balance: {self.balance_after})"
+
+
+# ==========================================
+# DISCIPLINARY MEMOS & PENALTIES
+# ==========================================
+
+class DisciplinaryInfractionCategory(models.Model):
+    organization = models.ForeignKey(Entity, on_delete=models.SET_NULL, null=True, blank=True, related_name='disciplinary_categories')
+    name = models.CharField(max_length=150)
+    code = models.CharField(max_length=50, blank=True)
+    description = models.TextField(blank=True, null=True)
+    default_penalty_amount = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('500.00'))
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['name']
+        verbose_name = 'Disciplinary Infraction Category'
+        verbose_name_plural = 'Disciplinary Infraction Categories'
+
+    def __str__(self):
+        return f"{self.name} (Default: ₹{self.default_penalty_amount})"
+
+
+class EmployeeDisciplinaryMemo(models.Model):
+    STATUS_CHOICES = (
+        ('PENDING', 'Pending Payroll Deduction'),
+        ('DEDUCTED', 'Deducted in Payroll'),
+        ('WAIVED', 'Waived / Pardoned'),
+        ('CANCELLED', 'Cancelled'),
+    )
+
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='disciplinary_memos')
+    issued_by = models.ForeignKey(Employee, on_delete=models.SET_NULL, null=True, blank=True, related_name='issued_disciplinary_memos')
+    category = models.ForeignKey(DisciplinaryInfractionCategory, on_delete=models.SET_NULL, null=True, blank=True, related_name='memos')
+    is_custom_reason = models.BooleanField(default=False)
+    infraction_reason = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    incident_date = models.DateField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    is_active = models.BooleanField(default=True, help_text="True while pending payroll deduction")
+    payroll_run = models.ForeignKey('PayrollRun', on_delete=models.SET_NULL, null=True, blank=True, related_name='disciplinary_memos')
+    payslip = models.ForeignKey('Payslip', on_delete=models.SET_NULL, null=True, blank=True, related_name='disciplinary_memos')
+    deducted_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-incident_date', '-created_at']
+
+    def __str__(self):
+        return f"Memo #{self.id}: {self.employee} - {self.infraction_reason} (₹{self.amount}) [{self.status}]"
+

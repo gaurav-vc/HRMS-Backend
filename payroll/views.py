@@ -2,23 +2,32 @@ from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from .models import PayrollRun, Loan, Reimbursement, ComponentRule, ComplianceReport, SalaryStructure, PayrollException
-from .serializers import PayrollRunSerializer, LoanSerializer, ReimbursementSerializer, ComponentRuleSerializer, ComplianceReportSerializer, SalaryStructureSerializer
+from .models import (
+    PayrollRun, Loan, Reimbursement, ComponentRule, ComplianceReport,
+    SalaryStructure, PayrollException, WalletPolicy, EmployeeWallet,
+    WalletLedgerEntry, DisciplinaryInfractionCategory, EmployeeDisciplinaryMemo
+)
+from .serializers import (
+    PayrollRunSerializer, LoanSerializer, ReimbursementSerializer,
+    ComponentRuleSerializer, ComplianceReportSerializer, SalaryStructureSerializer,
+    WalletPolicySerializer, EmployeeWalletSerializer, WalletLedgerEntrySerializer,
+    DisciplinaryInfractionCategorySerializer, EmployeeDisciplinaryMemoSerializer
+)
 from employees.models import Employee
 from django.utils import timezone
 
-from authentication.permissions import DataIsolationMixin, IsHR
+from authentication.permissions import DataIsolationMixin
 from rest_framework.permissions import IsAuthenticated
 
 class SalaryStructureViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Salary Structure'
-    permission_classes = [IsAuthenticated, IsHR]
+    permission_classes = [IsAuthenticated]
     queryset = SalaryStructure.objects.all()
     serializer_class = SalaryStructureSerializer
 
 class ComponentRuleViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Salary Structure'
-    permission_classes = [IsAuthenticated, IsHR]
+    permission_classes = [IsAuthenticated]
     queryset = ComponentRule.objects.all()
     serializer_class = ComponentRuleSerializer
     
@@ -293,6 +302,53 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         from .models import Reimbursement
         paid_employees = run.payslip_set.values_list('employee_id', flat=True)
         Reimbursement.objects.filter(employee_id__in=paid_employees, status='Approved').update(status='Paid')
+
+        # Credit Employee Wallets & Post Ledger Entries for Security Deposits
+        from decimal import Decimal
+        import decimal
+        from .models import PayslipLineItem, EmployeeWallet, WalletLedgerEntry
+        wallet_lines = PayslipLineItem.objects.filter(
+            payslip__run=run,
+            rule__name="Security Deposit (Wallet)"
+        ).select_related('payslip__employee')
+
+        for item in wallet_lines:
+            emp = item.payslip.employee
+            amt = Decimal(str(item.amount or '0.00')).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+            if amt > Decimal('0.00'):
+                wallet, _ = EmployeeWallet.objects.get_or_create(employee=emp)
+                if not WalletLedgerEntry.objects.filter(wallet=wallet, payroll_run=run).exists():
+                    new_bal = (wallet.current_balance + amt).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+                    wallet.current_balance = new_bal
+                    wallet.save(update_fields=['current_balance', 'updated_at'])
+                    WalletLedgerEntry.objects.create(
+                        wallet=wallet,
+                        payroll_run=run,
+                        period=run.period,
+                        transaction_type='SALARY_DEDUCTION',
+                        amount=amt,
+                        balance_after=new_bal,
+                        notes=f"Security deposit deduction from payroll {run.period}"
+                    )
+
+        # Inactivate and link Disciplinary Memos deducted in this payroll run
+        from .models import EmployeeDisciplinaryMemo
+        paid_slips = run.payslip_set.all().select_related('employee')
+        slip_by_emp = {s.employee_id: s for s in paid_slips}
+        pending_memos = EmployeeDisciplinaryMemo.objects.filter(
+            employee_id__in=paid_employees,
+            status='PENDING',
+            is_active=True
+        )
+        for memo in pending_memos:
+            matching_slip = slip_by_emp.get(memo.employee_id)
+            if matching_slip:
+                memo.status = 'DEDUCTED'
+                memo.is_active = False
+                memo.payroll_run = run
+                memo.payslip = matching_slip
+                memo.deducted_at = timezone.now()
+                memo.save(update_fields=['status', 'is_active', 'payroll_run', 'payslip', 'deducted_at', 'updated_at'])
         
         comment_text = request.data.get('comment', 'Approved')
         from .models import PayrollRunComment
@@ -1250,13 +1306,13 @@ from django.http import HttpResponse
 
 class CTCImportHistoryViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Import CTC'
-    permission_classes = [IsAuthenticated, IsHR]
+    permission_classes = [IsAuthenticated]
     queryset = CTCImportHistory.objects.all().order_by('-import_date')
     serializer_class = CTCImportHistorySerializer
 
 class ImportCTCTemplateView(APIView):
     rbac_module = 'Import CTC'
-    permission_classes = [IsAuthenticated, IsHR]
+    permission_classes = [IsAuthenticated]
     
     def get(self, request):
         response = HttpResponse(content_type='text/csv')
@@ -1278,7 +1334,7 @@ class ImportCTCTemplateView(APIView):
 
 class ImportCTCAPIView(APIView):
     rbac_module = 'Import CTC'
-    permission_classes = [IsAuthenticated, IsHR]
+    permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser]
 
     def post(self, request, *args, **kwargs):
@@ -1424,4 +1480,232 @@ class ImportCTCAPIView(APIView):
             "successful": successful,
             "failed": failed,
             "status": status_val
+        })
+
+
+class WalletPolicyViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Payroll Overview'
+    queryset = WalletPolicy.objects.all()
+    serializer_class = WalletPolicySerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        site_id = self.request.query_params.get('site')
+        if site_id:
+            return qs.filter(site_id=site_id)
+        org_id = self.request.query_params.get('organization')
+        if org_id:
+            return qs.filter(organization_id=org_id)
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        site_id = request.data.get('site')
+        org_id = request.data.get('organization')
+        existing = None
+        if site_id:
+            existing = WalletPolicy.objects.filter(site_id=site_id).first()
+        elif org_id:
+            existing = WalletPolicy.objects.filter(organization_id=org_id).first()
+
+        if existing:
+            serializer = self.get_serializer(existing, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data, status=200)
+        return super().create(request, *args, **kwargs)
+
+
+class EmployeeWalletViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Payroll Overview'
+    queryset = EmployeeWallet.objects.all().select_related('employee', 'employee__user', 'employee__department', 'employee__designation', 'employee__site')
+    serializer_class = EmployeeWalletSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        site_id = self.request.query_params.get('site')
+        org_id = self.request.query_params.get('organization')
+        emp_id = self.request.query_params.get('employee')
+
+        # Auto-initialize wallets for active employees in the filtered scope if missing
+        if site_id:
+            from employees.models import Employee
+            emps = Employee.objects.filter(site_id=site_id, status='Active')
+            existing_wallet_emp_ids = set(EmployeeWallet.objects.filter(employee__in=emps).values_list('employee_id', flat=True))
+            missing_emps = [e for e in emps if e.id not in existing_wallet_emp_ids]
+            if missing_emps:
+                EmployeeWallet.objects.bulk_create([
+                    EmployeeWallet(employee=e, current_balance=0.00, is_active=True) for e in missing_emps
+                ], ignore_conflicts=True)
+            return qs.filter(employee__site_id=site_id)
+        elif org_id:
+            from employees.models import Employee
+            emps = Employee.objects.filter(entity_id=org_id, status='Active')
+            existing_wallet_emp_ids = set(EmployeeWallet.objects.filter(employee__in=emps).values_list('employee_id', flat=True))
+            missing_emps = [e for e in emps if e.id not in existing_wallet_emp_ids]
+            if missing_emps:
+                EmployeeWallet.objects.bulk_create([
+                    EmployeeWallet(employee=e, current_balance=0.00, is_active=True) for e in missing_emps
+                ], ignore_conflicts=True)
+            return qs.filter(employee__entity_id=org_id)
+        elif emp_id:
+            return qs.filter(employee_id=emp_id)
+        return qs
+
+    @action(detail=True, methods=['post'], url_path='adjust-balance')
+    def adjust_balance(self, request, pk=None):
+        wallet = self.get_object()
+        amount_str = request.data.get('amount')
+        txn_type = request.data.get('transaction_type', 'MANUAL_ADJUSTMENT')
+        notes = request.data.get('notes', 'Manual adjustment')
+        if not amount_str:
+            return Response({'error': 'amount is required'}, status=400)
+        from decimal import Decimal
+        import decimal
+        adj_amount = Decimal(str(amount_str)).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+        new_balance = (wallet.current_balance + adj_amount).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+        wallet.current_balance = max(Decimal('0.00'), new_balance)
+        wallet.save(update_fields=['current_balance', 'updated_at'])
+
+        WalletLedgerEntry.objects.create(
+            wallet=wallet,
+            period=timezone.now().strftime('%Y-%m'),
+            transaction_type=txn_type,
+            amount=adj_amount,
+            balance_after=wallet.current_balance,
+            notes=notes
+        )
+        return Response(EmployeeWalletSerializer(wallet).data)
+
+
+# ==========================================
+# DISCIPLINARY INFRACTION CATEGORIES VIEWSET
+# ==========================================
+
+class DisciplinaryInfractionCategoryViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated]
+    queryset = DisciplinaryInfractionCategory.objects.all()
+    serializer_class = DisciplinaryInfractionCategorySerializer
+
+    def get_queryset(self):
+        qs = DisciplinaryInfractionCategory.objects.filter(is_active=True)
+        org_id = self.request.query_params.get('organization') or self.request.query_params.get('entity')
+        if org_id and org_id != 'all' and str(org_id).isdigit():
+            from django.db.models import Q
+            qs = qs.filter(Q(organization_id=int(org_id)) | Q(organization__isnull=True))
+        return qs.order_by('name')
+
+
+# ==========================================
+# EMPLOYEE DISCIPLINARY MEMO VIEWSET
+# ==========================================
+
+class EmployeeDisciplinaryMemoViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated]
+    queryset = EmployeeDisciplinaryMemo.objects.all()
+    serializer_class = EmployeeDisciplinaryMemoSerializer
+
+    def get_queryset(self):
+        qs = EmployeeDisciplinaryMemo.objects.all().select_related(
+            'employee', 'employee__dynamic_role', 'employee__designation',
+            'employee__department', 'employee__site', 'issued_by',
+            'category', 'payroll_run', 'payslip'
+        )
+
+        site_id = self.request.query_params.get('site')
+        emp_id = self.request.query_params.get('employee')
+        status_filter = self.request.query_params.get('status')
+        active_filter = self.request.query_params.get('is_active')
+
+        if site_id and site_id != 'all' and str(site_id).isdigit():
+            qs = qs.filter(employee__site_id=int(site_id))
+        if emp_id and str(emp_id).isdigit():
+            qs = qs.filter(employee_id=int(emp_id))
+        if status_filter and status_filter != 'ALL':
+            qs = qs.filter(status=status_filter)
+        if active_filter is not None:
+            is_act = active_filter.lower() in ('true', '1')
+            qs = qs.filter(is_active=is_act)
+
+        # Scoped access isolation for dynamic roles
+        user = self.request.user
+        if hasattr(user, 'employee_profile') and user.employee_profile:
+            emp_prof = user.employee_profile
+            role = emp_prof.dynamic_role
+            if role and role.access_scope == 'Site' and emp_prof.site_id and not site_id:
+                qs = qs.filter(employee__site_id=emp_prof.site_id)
+
+        return qs.order_by('-incident_date', '-created_at')
+
+    def perform_create(self, serializer):
+        from decimal import Decimal
+        import decimal
+
+        issuer = None
+        if hasattr(self.request.user, 'employee_profile') and self.request.user.employee_profile:
+            issuer = self.request.user.employee_profile
+
+        raw_amount = self.request.data.get('amount', 0)
+        quantized_amt = Decimal(str(raw_amount)).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+
+        serializer.save(
+            issued_by=issuer,
+            amount=quantized_amt,
+            status='PENDING',
+            is_active=True
+        )
+
+    @action(detail=True, methods=['post'], url_path='waive')
+    def waive(self, request, pk=None):
+        memo = self.get_object()
+        if memo.status == 'DEDUCTED':
+            return Response({'error': 'Cannot waive a memo that has already been deducted in payroll.'}, status=400)
+        memo.status = 'WAIVED'
+        memo.is_active = False
+        memo.save(update_fields=['status', 'is_active', 'updated_at'])
+        return Response(EmployeeDisciplinaryMemoSerializer(memo).data)
+
+    @action(detail=True, methods=['post'], url_path='cancel')
+    def cancel(self, request, pk=None):
+        memo = self.get_object()
+        if memo.status == 'DEDUCTED':
+            return Response({'error': 'Cannot cancel a memo that has already been deducted in payroll.'}, status=400)
+        memo.status = 'CANCELLED'
+        memo.is_active = False
+        memo.save(update_fields=['status', 'is_active', 'updated_at'])
+        return Response(EmployeeDisciplinaryMemoSerializer(memo).data)
+
+    @action(detail=False, methods=['get'], url_path='summary')
+    def summary(self, request):
+        site_id = request.query_params.get('site')
+        qs = EmployeeDisciplinaryMemo.objects.all()
+        if site_id and site_id != 'all' and str(site_id).isdigit():
+            qs = qs.filter(employee__site_id=int(site_id))
+
+        from django.db.models import Sum
+        from decimal import Decimal
+
+        now = timezone.now()
+        current_year = now.year
+        current_month = now.month
+
+        pending_qs = qs.filter(status='PENDING', is_active=True)
+        pending_count = pending_qs.count()
+        pending_amount = pending_qs.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+
+        deducted_month_qs = qs.filter(
+            status='DEDUCTED',
+            deducted_at__year=current_year,
+            deducted_at__month=current_month
+        )
+        deducted_count = deducted_month_qs.count()
+        deducted_amount = deducted_month_qs.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+
+        total_count = qs.count()
+
+        return Response({
+            'pending_count': pending_count,
+            'pending_amount': float(pending_amount),
+            'deducted_this_month_count': deducted_count,
+            'deducted_this_month_amount': float(deducted_amount),
+            'total_count': total_count
         })

@@ -6,7 +6,7 @@ def _is_truthy(val):
 
 
 def _has_view_perm(val):
-    return val in (True, 'true', 'True', 1, '1', 'self', 'selected_entities')
+    return val in (True, 'true', 'True', 1, '1', 'self', 'selected_entities', 'all')
 
 
 def check_user_permission(user, permission_name):
@@ -570,8 +570,15 @@ def isolate_queryset(qs, user):
             if employee.salary_structure_id:
                 return qs.filter(id=employee.salary_structure_id)
             if all_tenant_site_ids:
-                return qs.filter(site_id__in=all_tenant_site_ids)
-            return qs.none()
+                return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True))
+            return qs.filter(site__isnull=True)
+
+        if qs.model.__name__ == 'ComponentRule':
+            if employee.salary_structure_id:
+                return qs.filter(structure_id=employee.salary_structure_id)
+            if all_tenant_site_ids:
+                return qs.filter(Q(structure__site_id__in=all_tenant_site_ids) | Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
+            return qs.filter(Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
 
         if qs.model.__name__ == 'AttendancePolicy':
             if all_tenant_site_ids:
@@ -615,6 +622,10 @@ def isolate_queryset(qs, user):
             return qs.filter(id__in=all_tenant_site_ids) if all_tenant_site_ids else qs.none()
         if qs.model.__name__ == 'SalaryStructure':
             return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True))
+        if qs.model.__name__ == 'ComponentRule':
+            if all_tenant_site_ids:
+                return qs.filter(Q(structure__site_id__in=all_tenant_site_ids) | Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
+            return qs.filter(Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
         if qs.model.__name__ == 'AttendancePolicy':
             return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization__isnull=True)).distinct()
         if qs.model.__name__ == 'Holiday':
@@ -658,6 +669,9 @@ def isolate_queryset(qs, user):
 
         if qs.model.__name__ == 'SalaryStructure':
             return qs.filter(Q(site__branch__entity_id__in=effective_entity_ids) | Q(site__isnull=True))
+
+        if qs.model.__name__ == 'ComponentRule':
+            return qs.filter(Q(structure__site__branch__entity_id__in=effective_entity_ids) | Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
 
         if qs.model.__name__ == 'AttendancePolicy':
             cond = Q(site__isnull=True, organization__isnull=True)
@@ -717,6 +731,10 @@ def isolate_queryset(qs, user):
 
         if qs.model.__name__ == 'SalaryStructure':
             return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True))
+        if qs.model.__name__ == 'ComponentRule':
+            if all_tenant_site_ids:
+                return qs.filter(Q(structure__site_id__in=all_tenant_site_ids) | Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
+            return qs.filter(Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
 
         if qs.model.__name__ == 'AttendancePolicy':
             cond = Q(site__isnull=True, organization__isnull=True)
@@ -812,6 +830,11 @@ def isolate_queryset(qs, user):
 
     if qs.model.__name__ == 'SalaryStructure':
         return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True))
+
+    if qs.model.__name__ == 'ComponentRule':
+        if all_tenant_site_ids:
+            return qs.filter(Q(structure__site_id__in=all_tenant_site_ids) | Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
+        return qs.filter(Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
 
     if qs.model.__name__ == 'AttendancePolicy':
         return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization__isnull=True)).distinct()
@@ -980,19 +1003,18 @@ class DynamicCRUDPermission(permissions.BasePermission):
             if rbac_module not in allowed_mods:
                 return False
 
-            is_site_admin = bool(
-                (employee and employee.role in ('site_admin', 'admin')) or
-                (site.contact_email and request.user.email and site.contact_email.strip().lower() == request.user.email.strip().lower()) or
-                (employee and employee.dynamic_role and getattr(employee.dynamic_role, 'code', None) == 'SITE_ADMIN')
-            )
-            if is_site_admin:
-                module_perms = {'view': True, 'create': True, 'update': True, 'delete': True}
-
         dynamic_perms = {}
         if employee and employee.dynamic_role and employee.dynamic_role.permissions:
             dynamic_perms = employee.dynamic_role.permissions
-            if not module_perms:
-                module_perms = dynamic_perms.get(rbac_module, {})
+            module_perms = dynamic_perms.get(rbac_module, {})
+
+        # If user has dynamic capabilities to manage all (can_manage_users, Corporate/Region scope, or site contact)
+        has_full_site_mgmt = bool(
+            (site and site.contact_email and request.user.email and site.contact_email.strip().lower() == request.user.email.strip().lower()) or
+            (employee and employee.dynamic_role and (getattr(employee.dynamic_role, 'can_manage_users', False) or getattr(employee.dynamic_role, 'access_scope', None) in ('Corporate', 'Region')))
+        )
+        if not module_perms and has_full_site_mgmt:
+            module_perms = {'view': True, 'create': True, 'update': True, 'delete': True}
                             
         # Special workflow permissions handling for Run Payroll
         if rbac_module == 'Run Payroll':

@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Entity, Branch, Site, Department, Designation, Role, AttendancePolicy
+from .models import Entity, Branch, Site, Department, Designation, Role, AttendancePolicy, PunctualitySlab, PunctualityPenaltyLog
 
 
 class EntitySerializer(serializers.ModelSerializer):
@@ -50,7 +50,35 @@ class RoleSerializer(serializers.ModelSerializer):
             return obj.reporting_to.name
         return None
 
+class PunctualitySlabSerializer(serializers.ModelSerializer):
+    applicable_designation_ids = serializers.PrimaryKeyRelatedField(
+        many=True, queryset=Designation.objects.all(), source='applicable_designations', required=False
+    )
+    applicable_designations_details = serializers.SerializerMethodField()
+    applicable_role_ids = serializers.PrimaryKeyRelatedField(
+        many=True, queryset=Role.objects.all(), source='applicable_roles', required=False
+    )
+    applicable_roles_details = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PunctualitySlab
+        fields = [
+            'id', 'policy', 'name', 'comparison_type', 'minutes_threshold',
+            'deduction_type', 'deduction_value', 'order',
+            'applicable_designation_ids', 'applicable_designations_details',
+            'applicable_role_ids', 'applicable_roles_details'
+        ]
+
+    def get_applicable_designations_details(self, obj):
+        return [{'id': d.id, 'title': d.title} for d in obj.applicable_designations.all()]
+
+    def get_applicable_roles_details(self, obj):
+        return [{'id': r.id, 'name': r.name} for r in obj.applicable_roles.all()]
+
+
 class AttendancePolicySerializer(serializers.ModelSerializer):
+    punctuality_slabs = PunctualitySlabSerializer(many=True, read_only=True)
+
     class Meta:
         model = AttendancePolicy
         fields = '__all__'

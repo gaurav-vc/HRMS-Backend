@@ -17,6 +17,8 @@ class DailyAttendance(models.Model):
     overtime_hours = models.DecimalField(max_digits=5, decimal_places=2, default=0.00)
     
     attendance_status = models.CharField(max_length=20, default='Present') # Present, Absent, Half Day
+    late_deduction_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
+    punctuality_penalty_details = models.JSONField(default=dict, blank=True)
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

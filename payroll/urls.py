@@ -1,6 +1,13 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import PayrollRunViewSet, LoanViewSet, ReimbursementViewSet, ComponentRuleViewSet, ComplianceReportViewSet, SalarySlipAPIView, SalaryStructureViewSet, PayslipPDFView, PayslipEmailView, PayrollPreviewAPIView, Form16DocumentViewSet, CTCImportHistoryViewSet, ImportCTCTemplateView, ImportCTCAPIView
+from .views import (
+    PayrollRunViewSet, LoanViewSet, ReimbursementViewSet, ComponentRuleViewSet,
+    ComplianceReportViewSet, SalarySlipAPIView, SalaryStructureViewSet,
+    PayslipPDFView, PayslipEmailView, PayrollPreviewAPIView, Form16DocumentViewSet,
+    CTCImportHistoryViewSet, ImportCTCTemplateView, ImportCTCAPIView,
+    WalletPolicyViewSet, EmployeeWalletViewSet,
+    DisciplinaryInfractionCategoryViewSet, EmployeeDisciplinaryMemoViewSet
+)
 
 router = DefaultRouter()
 router.register(r'runs', PayrollRunViewSet)
@@ -11,6 +18,10 @@ router.register(r'compliance', ComplianceReportViewSet)
 router.register(r'structures', SalaryStructureViewSet)
 router.register(r'form16', Form16DocumentViewSet)
 router.register(r'import-ctc/history', CTCImportHistoryViewSet, basename='ctc-import-history')
+router.register(r'wallet-policies', WalletPolicyViewSet, basename='wallet-policy')
+router.register(r'wallets', EmployeeWalletViewSet, basename='employee-wallet')
+router.register(r'disciplinary-categories', DisciplinaryInfractionCategoryViewSet, basename='disciplinary-category')
+router.register(r'disciplinary-memos', EmployeeDisciplinaryMemoViewSet, basename='disciplinary-memo')
 
 urlpatterns = [
     path('import-ctc/upload/', ImportCTCAPIView.as_view(), name='import-ctc-upload'),

@@ -2,11 +2,11 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
-from .models import Entity, Branch, Site, Department, Designation, Role, AttendancePolicy
+from .models import Entity, Branch, Site, Department, Designation, Role, AttendancePolicy, PunctualitySlab
 from .serializers import (
     EntitySerializer, BranchSerializer, SiteSerializer,
     DepartmentSerializer, DesignationSerializer, RoleSerializer,
-    AttendancePolicySerializer
+    AttendancePolicySerializer, PunctualitySlabSerializer
 )
 from authentication.permissions import DataIsolationMixin
 
@@ -143,6 +143,87 @@ class AttendancePolicyViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     def partial_update(self, request, *args, **kwargs):
         kwargs['partial'] = True
         return self.update(request, *args, **kwargs)
+
+
+class PunctualitySlabViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Attendance'
+    queryset = PunctualitySlab.objects.all().select_related('policy').prefetch_related('applicable_designations')
+    serializer_class = PunctualitySlabSerializer
+
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve', 'available_roles']:
+            from rest_framework.permissions import IsAuthenticated
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        policy_id = self.request.query_params.get('policy')
+        if policy_id:
+            qs = qs.filter(policy_id=policy_id)
+        site_id = self.request.query_params.get('site')
+        if site_id:
+            qs = qs.filter(policy__site_id=site_id)
+        return qs
+
+    @action(detail=False, methods=['get'], url_path='available-roles')
+    def available_roles(self, request):
+        site_id = request.query_params.get('site')
+        policy_id = request.query_params.get('policy')
+        if not site_id and policy_id:
+            policy = AttendancePolicy.objects.filter(id=policy_id).first()
+            if policy and policy.site_id:
+                site_id = policy.site_id
+
+        if not site_id and request.user and request.user.is_authenticated:
+            from authentication.permissions import _get_tenant_site
+            tenant_site = _get_tenant_site(request.user)
+            if tenant_site:
+                site_id = tenant_site.id
+
+        from employees.models import Employee
+        from organisation.models import Role, Designation
+        from django.db.models import Q
+
+        results = []
+        if site_id:
+            # Dynamic roles specifically assigned to this site OR held by active employees in this site
+            site_emp_role_ids = Employee.objects.filter(site_id=site_id, dynamic_role__isnull=False).values_list('dynamic_role_id', flat=True)
+            roles = Role.objects.filter(Q(site_id=site_id) | Q(id__in=site_emp_role_ids)).distinct().order_by('name')
+
+            for r in roles:
+                results.append({
+                    "id": r.id,
+                    "type": "ROLE",
+                    "title": r.name,
+                    "code": r.code,
+                    "category": f"Dynamic Role ({r.code})"
+                })
+
+            # Designations held by active employees in this site
+            site_emp_desig_ids = Employee.objects.filter(site_id=site_id, designation__isnull=False).values_list('designation_id', flat=True)
+            desigs = Designation.objects.filter(id__in=site_emp_desig_ids).distinct().order_by('title')
+            for d in desigs:
+                results.append({
+                    "id": d.id,
+                    "type": "DESIGNATION",
+                    "title": d.title,
+                    "code": getattr(d, 'grade', '') or "",
+                    "category": "Designation"
+                })
+        else:
+            # Global fallback: Dynamic roles
+            for r in Role.objects.all().order_by('name'):
+                site_label = f" ({r.site.name})" if r.site else ""
+                results.append({
+                    "id": r.id,
+                    "type": "ROLE",
+                    "title": r.name,
+                    "code": r.code,
+                    "category": f"Dynamic Role{site_label}"
+                })
+
+        return Response(results)
 
 
 
