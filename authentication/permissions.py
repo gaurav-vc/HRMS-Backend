@@ -343,31 +343,20 @@ def _get_tenant_scope(user):
 
     all_site_ids = {tenant_site.id}
 
-    # Include all sub-sites belonging strictly to this tenant site:
+    # Include all sub-sites belonging strictly to this main site:
     # 0. Sub-sites explicitly linked via parent_site
-    parent_sub_sites = Site.objects.filter(parent_site_id=tenant_site.id).values_list('id', flat=True)
+    parent_sub_sites = Site.objects.filter(parent_site_id=tenant_site.id, is_sub_site=True).values_list('id', flat=True)
     all_site_ids.update(parent_sub_sites)
 
-    # 1. Any sub-site with the same branch as tenant_site
+    # For legacy sub-sites created before parent_site foreign key was introduced:
+    legacy_subs = Site.objects.filter(parent_site__isnull=True, is_sub_site=True)
     if tenant_site.branch_id:
-        sub_branch_sites = Site.objects.filter(branch_id=tenant_site.branch_id, is_sub_site=True).values_list('id', flat=True)
-        all_site_ids.update(sub_branch_sites)
-    
-    # 2. Any sub-site created by / administered by the same contact_email
+        all_site_ids.update(legacy_subs.filter(branch_id=tenant_site.branch_id).values_list('id', flat=True))
     if tenant_site.contact_email:
-        sub_contact_sites = Site.objects.filter(contact_email=tenant_site.contact_email, is_sub_site=True).values_list('id', flat=True)
-        all_site_ids.update(sub_contact_sites)
-
-    # 3. Any sub-site enrolled in the admin employee's enrolled_sites
+        all_site_ids.update(legacy_subs.filter(contact_email=tenant_site.contact_email).values_list('id', flat=True))
     employee = getattr(user, 'employee_profile', None)
     if employee and employee.enrolled_sites.exists():
-        enrolled_subs = employee.enrolled_sites.filter(is_sub_site=True).values_list('id', flat=True)
-        all_site_ids.update(enrolled_subs)
-
-    # 4. Any sub-site belonging to this site's organization
-    if tenant_site.organization_id:
-        org_sub_sites = Site.objects.filter(organization_id=tenant_site.organization_id, is_sub_site=True).values_list('id', flat=True)
-        all_site_ids.update(org_sub_sites)
+        all_site_ids.update(employee.enrolled_sites.filter(parent_site__isnull=True, is_sub_site=True).values_list('id', flat=True))
 
     # Entity IDs - 100% dynamic, multi-tenant isolated via Organization & Branch relations
     entity_ids = set()
