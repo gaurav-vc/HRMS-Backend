@@ -1,0 +1,2310 @@
+# Copyright 2010 Dirk Holtwick, holtwick.it
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from __future__ import annotations
+
+import contextlib
+import logging
+import re
+from copy import copy
+from io import BytesIO
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
+
+import arabic_reshaper
+import reportlab.pdfbase._cidfontdata
+from reportlab.lib.colors import CMYKColor, Color, toColor
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
+from reportlab.lib.units import cm, inch
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase._glyphlist import _glyphname2unicode
+from reportlab.pdfbase.cidfonts import CIDEncoding, UnicodeCIDFont
+from reportlab.pdfgen.canvas import FILL_EVEN_ODD
+from reportlab.rl_config import register_reset
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+import xhtml2pdf.default
+
+log = logging.getLogger(__name__)
+
+#: An rgb()/rgba() written out as text, as an HTML attribute delivers it
+#: (`<td bgcolor="rgb(1, 2, 3)">`); the parser hands a CSS one over as a
+#: function object, which :func:`_rgbFunctionColor` reads instead.
+#:
+#: Anchored at both ends, with separators that cannot also match a channel.
+#: Both matter: an unanchored `.*?` beside a class that accepts the same
+#: characters can divide one value many ways, and a value with no closing
+#: paren then backtracks catastrophically -- `rgb(` followed by 90 digits
+#: costs tens of seconds of CPU, well inside the 100-character limit below.
+rgb_re = re.compile(
+    # `[^(]*` rather than `.*?`: the leading text is still tolerated -- a
+    # function object's repr, "<css function: rgb(255,0,0)>", reaches here as
+    # a string -- but it cannot cross the opening paren, so there is only one
+    # place it can end.
+    r"^[^(]*rgba?\(\s*(\d{1,3})[\s,]+(\d{1,3})[\s,]+(\d{1,3})"
+    r"(?:[\s,/]+[\d.]+%?)?\s*\).*$"
+)
+
+#: The number in one argument of a colour function. A percentage argument
+#: reaches CSSTerminalFunction as the stringified tuple "('50', '%')", because
+#: that class turns any argument which is not already a str into one, so the
+#: number is found rather than parsed off a known shape.
+color_arg_re = re.compile(r"-?\d*\.?\d+")
+
+#: The tokens of the arguments of cmyk()/device-cmyk(): numbers, the percent
+#: sign that follows one, and the slash before the alpha. They are read off
+#: the text of the arguments, which for `device-cmyk(0 1 1 0 / 0.5)` holds
+#: the last one as the stringified operator "op('0', '/', '0.5')".
+cmyk_token_re = re.compile(r"-?\d*\.?\d+(?:e-?\d+)?|%|/")
+
+#: The CSS functions that name a colour in DeviceCMYK.
+CMYK_FUNCTIONS: frozenset[str] = frozenset({"cmyk", "device-cmyk"})
+
+# =========================================================================
+# Memoize decorator
+# =========================================================================
+
+
+class Memoized:
+    """
+    A kwargs-aware memoizer, better than the one in python :).
+
+    Don't pass in too large kwargs, since this turns them into a tuple of
+    tuples. Also, avoid mutable types (as usual for memoizers)
+
+    What this does is to create a dictionary of {(*parameters):return value},
+    and uses it as a cache for subsequent calls to the same method.
+    It is especially useful for functions that don't rely on external variables
+    and that are called often. It's a perfect match for our getSize etc...
+
+    The cache is bounded and evicts in FIFO order. Keys are derived from CSS
+    values taken straight out of the rendered document, so an unbounded cache
+    grows without limit in a long-running server process.
+
+    ``functools.lru_cache`` is not a substitute here: the ``TypeError`` fallback
+    below (unhashable arguments, e.g. a list ``pagesize``) is load-bearing, and
+    ``lru_cache`` raises instead.
+    """
+
+    #: Maximum number of memoized results kept per decorated function.
+    DEFAULT_MAXSIZE: int = 1000
+
+    #: Every instance, so the whole memoization layer can be dropped at once.
+    _instances: ClassVar[list[Memoized]] = []
+
+    def __init__(self, func, maxsize: int | None = None) -> None:
+        self.cache: dict = {}
+        self.maxsize: int = self.DEFAULT_MAXSIZE if maxsize is None else maxsize
+        self.func = func
+        self.__doc__ = self.func.__doc__  # To avoid great confusion
+        self.__name__ = self.func.__name__  # This also avoids great confusion
+        Memoized._instances.append(self)
+        # NB: must be a bound method of a real object -- reportlab >= 4.5.1
+        # wraps the callback in a WeakMethod, which rejects builtins such as
+        # dict.clear. Older versions store a plain weakref, which would expire
+        # immediately on a temporary bound method, so keep a strong reference.
+        self._reset_callback = self.clear
+        register_reset(self._reset_callback)
+
+    def clear(self) -> None:
+        self.cache.clear()
+
+    def __call__(self, *args, **kwargs):
+        # Make sure the following line is not actually slower than what you're
+        # trying to memoize
+        args_plus = tuple(kwargs.items())
+        key = (args, args_plus)
+        try:
+            if key not in self.cache:
+                res = self.func(*args, **kwargs)
+                if self.maxsize and len(self.cache) >= self.maxsize:
+                    # dicts are insertion-ordered, so this is FIFO eviction
+                    self.cache.pop(next(iter(self.cache)))
+                self.cache[key] = res
+            return self.cache[key]
+        except TypeError:
+            # happens if any of the parameters is a list
+            return self.func(*args, **kwargs)
+
+
+#: (text, font name, size, encoding) -> width, for stringWidth below.
+_string_widths: dict[tuple, float] = {}
+
+#: Entries kept before the cache starts over. A long book reaches a few tens
+#: of thousands of distinct words; this keeps a pathological document from
+#: holding more than some megabytes.
+STRING_WIDTHS_MAX: int = 100_000
+
+
+def stringWidth(text, fontName, fontSize, encoding="utf8") -> float:
+    """
+    pdfmetrics.stringWidth, remembered for the length of a render.
+
+    Breaking a paragraph into lines measures every word, again for every
+    width it is tried at, and ReportLab without its C accelerator measures
+    in Python: encode the word, then sum a width per byte. The same words
+    recur all through a document, so most of those were measured before.
+
+    The cache is dropped at the end of each render, with the memoized
+    results, so a font registered again under the same name between two
+    documents is measured afresh.
+    """
+    key = (text, fontName, fontSize, encoding)
+    width = _string_widths.get(key)
+    if width is None:
+        if len(_string_widths) >= STRING_WIDTHS_MAX:
+            _string_widths.clear()
+        width = _string_widths[key] = pdfmetrics.stringWidth(
+            text, fontName, fontSize, encoding
+        )
+    return width
+
+
+def reset_caches() -> None:
+    """Drop every memoized result. Called at the end of each render."""
+    for memoized in Memoized._instances:
+        memoized.clear()
+    _string_widths.clear()
+
+
+def toList(value: Any, *, cast_tuple: bool = True) -> list:
+    cls: tuple[type, ...] = (list, tuple) if cast_tuple else (list,)
+    return list(value) if isinstance(value, cls) else [value]  # type: ignore[call-overload]
+
+
+def transform_attrs(obj, keys, container, func, extras=None):
+    """
+    Allows to apply one function to set of keys checking if key is in container,
+    also transform ccs key to report lab keys.
+
+    extras = Are extra params for func, it will be call like func(*[param1, param2])
+
+    obj = frag
+    keys = [(reportlab, css), ... ]
+    container = cssAttr
+    """
+    cpextras = extras
+
+    for reportlab_key, css in keys:
+        extras = cpextras
+        if extras is None:
+            extras = []
+        elif not isinstance(extras, list):
+            extras = [extras]
+        if css in container:
+            extras.insert(0, container[css])
+            setattr(obj, reportlab_key, func(*extras))
+
+
+def copy_attrs(obj1, obj2, attrs):
+    """
+    Allows copy a list of attributes from object2 to object1.
+    Useful for copy ccs attributes to fragment.
+    """
+    for attr in attrs:
+        value = getattr(obj2, attr) if hasattr(obj2, attr) else None
+        if value is None and isinstance(obj2, dict) and attr in obj2:
+            value = obj2[attr]
+        setattr(obj1, attr, value)
+
+
+def set_value(obj, attrs, value, *, do_copy=False):
+    """Allows set the same value to a list of attributes."""
+    for attr in attrs:
+        if do_copy:
+            value = copy(value)
+        setattr(obj, attr, value)
+
+
+def _clamp01(number: float) -> float:
+    """Keep a colour channel inside the 0..1 the PDF format allows."""
+    return min(max(number, 0.0), 1.0)
+
+
+def _colorComponent(param, maximum: float) -> float:
+    """One argument of rgb()/rgba(), as a fraction of its maximum."""
+    text = str(param)
+    match = color_arg_re.search(text)
+    if match is None:
+        msg = f"not a colour component: {text!r}"
+        raise ValueError(msg)
+    number = float(match.group())
+    return number / 100.0 if "%" in text else number / maximum
+
+
+def _rgbFunctionColor(function, default):
+    """
+    Read an rgb()/rgba() the parser handed over as a function object.
+
+    Going through str() and a regular expression, as this used to, reads the
+    channels off the object's *repr*: for `rgba(10, 200, 10, 1)` that is
+    "<css function: rgba(10, 200, 10, 1)>", and the pattern -- written for
+    `rgb(` -- matched from the "a" onwards and took the alpha as the blue
+    channel. The arguments are right there on the object, so they are read
+    from there.
+    """
+    channels, rest = function.params[:3], function.params[3:]
+    try:
+        red, green, blue = (_colorComponent(arg, 255.0) for arg in channels)
+        alpha = _colorComponent(rest[0], 1.0) if rest else 1.0
+    except (ValueError, IndexError):
+        log.warning("Cannot read the colour %r", function)
+        return default
+    return Color(_clamp01(red), _clamp01(green), _clamp01(blue), alpha=_clamp01(alpha))
+
+
+def _cmykColor(arguments: str, original, default):
+    """
+    Read the arguments of `device-cmyk()` or `cmyk()` into a CMYKColor.
+
+    Each of the four inks is a number from 0 to 1 or a percentage, separated
+    by spaces or commas; an alpha may follow a slash (CSS Color 5) or come as
+    a fifth argument.
+    """
+    values: list[float] = []
+    alpha_at = None
+    for token in cmyk_token_re.findall(arguments):
+        if token == "%":
+            if values:
+                values[-1] /= 100.0
+        elif token == "/":
+            alpha_at = len(values)
+        else:
+            values.append(float(token))
+    if alpha_at not in {None, 4} or len(values) not in {4, 5}:
+        log.warning("Cannot read the colour %r, using %r", original, default)
+        return default
+    cyan, magenta, yellow, black = (_clamp01(v) for v in values[:4])
+    alpha = _clamp01(values[4]) if len(values) == 5 else 1.0
+    return CMYKColor(cyan, magenta, yellow, black, alpha=alpha)
+
+
+def _hexAlphaColor(value, original, default):
+    """
+    Read `#rgba` or `#rrggbbaa`, the hex forms with an alpha channel.
+
+    reportlab reads neither: `#rgba` failed an assertion and took the
+    document down, and `#rrggbbaa` was read as one big number, a colour
+    nobody wrote.
+    """
+    digits = value[1:]
+    if len(digits) == 4:
+        digits = "".join(digit * 2 for digit in digits)
+    try:
+        red, green, blue, alpha = (
+            int(digits[i : i + 2], 16) / 255.0 for i in range(0, 8, 2)
+        )
+    except ValueError:
+        log.warning("Cannot read the colour %r, using %r", original, default)
+        return default
+    return Color(red, green, blue, alpha=alpha)
+
+
+@Memoized
+def getColor(value, default=None):
+    """
+    Convert to color value.
+    This returns a Color object instance from a text bit.
+    Mitigation for ReDoS attack applied by limiting input length and validating input.
+    """
+    original = value
+    if value is None:
+        return None
+    if isinstance(value, Color):
+        return value
+
+    # Imported here and not at module scope: xhtml2pdf.w3c.css reaches this
+    # module through cssParser, so importing it from the top would be circular.
+    from xhtml2pdf.w3c.css import CSSTerminalFunction
+
+    if isinstance(value, CSSTerminalFunction) and value.name.lower() in {"rgb", "rgba"}:
+        return _rgbFunctionColor(value, default)
+    if isinstance(value, CSSTerminalFunction) and value.name.lower() in CMYK_FUNCTIONS:
+        return _cmykColor(" ".join(value.params), value, default)
+
+    value = str(value).strip().lower()
+
+    # Limit the length of the value to prevent excessive input causing ReDoS
+    if len(value) > 100:  # Set a reasonable length limit to avoid extreme inputs
+        return default
+
+    if value in {"transparent", "none"}:
+        return default
+    name, _, arguments = value.partition("(")
+    if name.strip() in CMYK_FUNCTIONS and arguments.endswith(")"):
+        return _cmykColor(arguments[:-1], original, default)
+    if value in COLOR_BY_NAME:
+        return COLOR_BY_NAME[value]
+    if value.startswith("#") and len(value) in {5, 9}:
+        return _hexAlphaColor(value, original, default)
+    if value.startswith("#") and len(value) == 4:
+        value = "#" + value[1] + value[1] + value[2] + value[2] + value[3] + value[3]
+    elif rgb_match := rgb_re.match(value):
+        r, g, b = (min(255, int(x)) for x in rgb_match.groups())
+        value = f"#{r:02x}{g:02x}{b:02x}"
+    else:
+        # Shrug
+        pass
+
+    try:
+        return toColor(value, default)  # Calling the reportlab function
+    except (ValueError, AssertionError):
+        # AssertionError too: toColor asserts on some shapes it cannot read,
+        # a hex of the wrong length among them.
+        # reportlab raises rather than handing back the default it was given.
+        # A colour nobody can read is worth a line in the log; it is not worth
+        # abandoning the document.
+        log.warning("Cannot read the colour %r, using %r", original, default)
+        return default
+
+
+def apply_text_transform(text: str, transform) -> str:
+    """
+    CSS 2.1 16.5 text-transform.
+
+    capitalize is applied per word rather than per typographic word boundary,
+    and a word split across two fragments -- by a nested <b>, say -- has each
+    half capitalised. Neither matters for the usual case of a whole phrase.
+    """
+    transform = str(transform).lower()
+    if transform == "uppercase":
+        return text.upper()
+    if transform == "lowercase":
+        return text.lower()
+    if transform == "capitalize":
+        return re.sub(r"\b[a-z]", lambda m: m.group(0).upper(), text)
+    return text
+
+
+def getBorderStyle(value, default=None):
+    if value and (str(value).lower() not in {"none", "hidden"}):
+        return value
+    return default
+
+
+def getBorderWidth(style, width) -> float:
+    """
+    The width a border actually occupies in the box.
+
+    CSS 2.1 8.5.3: `border-style: none` forces the computed border width to
+    zero whatever border-width says. It is not only that nothing is drawn --
+    the box is that much smaller. DEFAULT_CSS gives every element
+    `border: 1px none`, so treating the declared width as occupied added 2pt
+    of height and 2pt of width to every block on the page.
+    """
+    if not width or not getBorderStyle(style):
+        return 0
+    return width
+
+
+#: On/off lengths of a dashed or dotted border, as multiples of its width.
+#: Measured off Chromium through testrender/browsercompare.py rather than
+#: guessed: a 5px dashed border rasterises to a 15px dash and an 8px gap at
+#: 150dpi, and a 2px dotted one to a 3px dot and a 4px gap.
+BORDER_DASH_PATTERNS: dict[str, tuple[float, float]] = {
+    "dashed": (2.0, 1.0),
+    "dotted": (1.0, 1.0),
+}
+
+
+def _is_double(style: str, width) -> bool:
+    """
+    Whether a border should be drawn as CSS 2.1's two lines with a gap.
+
+    Below three units there is nothing to divide into three bands, so a
+    double border that thin stays a single line, as browsers draw it.
+    """
+    return style == "double" and isinstance(width, int | float) and width >= 3
+
+
+def getBorderDash(style, width: float) -> list[float] | None:
+    """
+    Dash array for a border style, or None when the line is continuous.
+
+    A dash is proportional to the border's width, which is why the pattern
+    cannot be a constant: a 1pt dotted border and a 6pt one are the same
+    figure at different scales.
+    """
+    pattern = BORDER_DASH_PATTERNS.get(str(style).lower())
+    if not pattern or not isinstance(width, int | float) or not width:
+        return None
+    return [max(part * width, 0.1) for part in pattern]
+
+
+def getBorderTableLine(
+    style, width: float
+) -> tuple[float, str, list[float] | None, None, int, float]:
+    """
+    Trailing arguments of a ReportLab LINE* table command for a border style.
+
+    Returns (weight, cap, dashes, join, count, space). A table border is not
+    stroked by xhtml2pdf but described to ReportLab, so the style has to be
+    expressed in those terms: a dash array for dashed and dotted, and for
+    double the `count` parallel lines ReportLab can draw, narrowed to a third
+    of the declared width and set two thirds apart so the three bands add up
+    to the width that was asked for.
+
+    A solid line is squared off so that two edges meeting at a corner fill
+    it. A dashed one has butt ends: a squared cap adds half the width at
+    each end of every dash, which would close the gaps of dashed and
+    dotted, one width wide.
+    """
+    style = str(style).lower()
+    if _is_double(style, width):
+        band = width / 3.0
+        return (band, "squared", None, None, 2, 2 * band)
+    dashes = getBorderDash(style, width)
+    return (width, "butt" if dashes else "squared", dashes, None, 1, 0)
+
+
+def drawBorderLine(
+    canvas, bstyle, width: float, color, x1: float, y1: float, x2: float, y2: float
+) -> None:
+    """
+    Draw one edge of a box, honouring its border-style.
+
+    Every caller used to stroke a plain line whatever the style said, so
+    dashed, dotted and double all came out solid. The style is still only
+    consulted for the shape of the line: groove, ridge, inset and outset need
+    two shades of the declared colour and are drawn solid for now.
+    """
+    if not width or not getBorderStyle(bstyle) or color is None:
+        return
+
+    style = str(bstyle).lower()
+    canvas.saveState()
+    canvas.setStrokeColor(color)
+
+    # CSS 2.1 8.5.3: double is two solid lines with a gap, and the three
+    # together are the declared width. Below 3 units there is nothing to
+    # split, so it stays a single line.
+    if _is_double(style, width):
+        band = width / 3.0
+        canvas.setLineWidth(band)
+        if y1 == y2:
+            canvas.line(x1, y1 - band, x2, y2 - band)
+            canvas.line(x1, y1 + band, x2, y2 + band)
+        else:
+            canvas.line(x1 - band, y1, x2 - band, y2)
+            canvas.line(x1 + band, y1, x2 + band, y2)
+        canvas.restoreState()
+        return
+
+    canvas.setLineWidth(width)
+    dash = getBorderDash(style, width)
+    if dash:
+        canvas.setDash(dash)
+    canvas.line(x1, y1, x2, y2)
+    canvas.restoreState()
+
+
+_BOX_SIDES = ("Left", "Right", "Top", "Bottom")
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ Rounded boxes
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#: The Bezier handle length, as a fraction of the radius, that makes a cubic
+#: the closest match to a quarter of an ellipse.
+_KAPPA = 0.5522847498
+
+#: The two sides that meet at each corner, in RADIUS_CORNERS order: the one
+#: that bounds it vertically, then the one that bounds it horizontally.
+_CORNER_SIDES = (
+    ("Top", "Left"),
+    ("Top", "Right"),
+    ("Bottom", "Right"),
+    ("Bottom", "Left"),
+)
+
+Radii = tuple[tuple[float, float], ...]
+
+
+class RoundedBox(NamedTuple):
+    """
+    A box with a border-radius, as CSS draws it.
+
+    x, y, w, h are the outer edge of the border. The border of a side is
+    centred on the edge the caller passes, like the straight borders, so the
+    outer edge lies half a border width further out. `radii` are those of the
+    outer edge, top-left clockwise -- what border-radius declares -- and an
+    edge further in has each radius less by how far in it is, as
+    css-backgrounds-3 5.2 has the padding edge.
+    """
+
+    x: float
+    y: float
+    w: float
+    h: float
+    radii: Radii
+    #: Side -> (style, width, colour) for each side that strokes.
+    borders: dict
+    #: Side -> width of the border drawn there, 0 where none is.
+    widths: dict
+
+    def inset(self, f: float) -> tuple[float, float, float, float, Radii]:
+        """(x, y, w, h, radii) of the edge f of the way in through the border."""
+        left, right, top, bottom = (
+            f * self.widths[side] for side in ("Left", "Right", "Top", "Bottom")
+        )
+        inward = {"Left": left, "Right": right, "Top": top, "Bottom": bottom}
+        radii = []
+        for (rx, ry), (vertical, horizontal) in zip(
+            self.radii, _CORNER_SIDES, strict=True
+        ):
+            rx, ry = rx - inward[horizontal], ry - inward[vertical]
+            radii.append((rx, ry) if rx > 0 and ry > 0 else (0.0, 0.0))
+        return (
+            self.x + left,
+            self.y + bottom,
+            max(self.w - left - right, 0.0),
+            max(self.h - top - bottom, 0.0),
+            tuple(radii),
+        )
+
+
+def _drawnBorders(style, sides) -> dict:
+    """Side -> (style, width, colour) for the sides in `sides` that stroke."""
+    text_color = getattr(style, "textColor", None)
+    drawn = {}
+    for side in _BOX_SIDES:
+        if side not in sides:
+            continue
+        bstyle = getattr(style, f"border{side}Style", None)
+        width = getattr(style, f"border{side}Width", 0)
+        color = getattr(style, f"border{side}Color", None)
+        if color is None:
+            color = text_color
+        # drawBorderLine's test for a line that shows.
+        if width and getBorderStyle(bstyle) and color is not None:
+            drawn[side] = (str(bstyle).lower(), width, color)
+    return drawn
+
+
+def roundedBox(
+    style, x: float, y: float, w: float, h: float, sides=_BOX_SIDES
+) -> RoundedBox | None:
+    """
+    The rounded geometry of a box, or None when it has no border-radius.
+
+    None is what every box without a radius gets, and the painters keep
+    their plain rectangles for it, so a document that declares none draws
+    exactly what it drew before.
+
+    A corner next to a side in no `sides` -- the edge of a box cut by a line
+    or page break -- is square, as box-decoration-break: slice has it. It is
+    squared before the radii are scaled, so a corner this fragment does not
+    have cannot shrink the ones it does. css-backgrounds-3 5.5: when two
+    radii on one side add up to more than the side, all of them shrink by
+    the same factor until they fit.
+    """
+    declared = [
+        getattr(style, f"border{corner}Radius", None) for corner in RADIUS_CORNERS
+    ]
+    if w <= 0 or h <= 0 or all(d is None or d is NO_RADIUS for d in declared):
+        return None
+    borders = _drawnBorders(style, sides)
+    widths = {side: borders[side][1] if side in borders else 0.0 for side in _BOX_SIDES}
+    x -= widths["Left"] / 2.0
+    y -= widths["Bottom"] / 2.0
+    w += (widths["Left"] + widths["Right"]) / 2.0
+    h += (widths["Top"] + widths["Bottom"]) / 2.0
+    radii = [
+        (
+            (0.0, 0.0)
+            if d is None or d is NO_RADIUS or a not in sides or b not in sides
+            else d.resolve(w, h)
+        )
+        for d, (a, b) in zip(declared, _CORNER_SIDES, strict=True)
+    ]
+    if not any(rx for rx, _ in radii):
+        return None
+    tl, tr, br, bl = radii
+    factor = min(
+        [1.0]
+        + [
+            length / total
+            for length, total in (
+                (w, tl[0] + tr[0]),
+                (w, bl[0] + br[0]),
+                (h, tl[1] + bl[1]),
+                (h, tr[1] + br[1]),
+            )
+            if total > length
+        ]
+    )
+    if factor < 1.0:
+        radii = [(rx * factor, ry * factor) for rx, ry in radii]
+    return RoundedBox(x, y, w, h, tuple(radii), borders, widths)
+
+
+def _cornerCurves(x: float, y: float, w: float, h: float, radii: Radii) -> tuple:
+    """
+    The four corners as cubic Beziers, top-left clockwise, in PDF's y-up space.
+
+    Each runs from the side before it to the side after it -- the top-left
+    one from the left side up to the top -- so that a side is what lies
+    between two curves. A square corner is its corner point four times over.
+    """
+    (tlx, tly), (trx, try_), (brx, bry), (blx, bly) = radii
+    k = _KAPPA
+    top, right = y + h, x + w
+    return (
+        (
+            (x, top - tly),
+            (x, top - tly + k * tly),
+            (x + tlx - k * tlx, top),
+            (x + tlx, top),
+        ),
+        (
+            (right - trx, top),
+            (right - trx + k * trx, top),
+            (right, top - try_ + k * try_),
+            (right, top - try_),
+        ),
+        (
+            (right, y + bry),
+            (right, y + bry - k * bry),
+            (right - brx + k * brx, y),
+            (right - brx, y),
+        ),
+        ((x + blx, y), (x + blx - k * blx, y), (x, y + bly - k * bly), (x, y + bly)),
+    )
+
+
+def _splitCurve(curve, t: float = 0.5) -> tuple:
+    """De Casteljau: the curve cut in two at t, each half a cubic of its own."""
+
+    def lerp(a, b):
+        return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+
+    p0, p1, p2, p3 = curve
+    p01, p12, p23 = lerp(p0, p1), lerp(p1, p2), lerp(p2, p3)
+    p012, p123 = lerp(p01, p12), lerp(p12, p23)
+    middle = lerp(p012, p123)
+    return (p0, p01, p012, middle), (middle, p123, p23, p3)
+
+
+def _curveTo(path, curve) -> None:
+    if curve[0] != curve[3]:
+        path.curveTo(*curve[1], *curve[2], *curve[3])
+
+
+def _addRoundedRect(path, x: float, y: float, w: float, h: float, radii: Radii):
+    curves = _cornerCurves(x, y, w, h, radii)
+    path.moveTo(*curves[0][0])
+    for index, curve in enumerate(curves):
+        if index:
+            path.lineTo(*curve[0])
+        _curveTo(path, curve)
+    path.close()
+    return path
+
+
+def roundedRectPath(canvas, x: float, y: float, w: float, h: float, radii: Radii):
+    """A closed path around the box with its corners rounded."""
+    return _addRoundedRect(canvas.beginPath(), x, y, w, h, radii)
+
+
+def _ringPath(canvas, box: RoundedBox, outer: float, inner: float):
+    """The band of the border between two insets, to be filled even-odd."""
+    path = roundedRectPath(canvas, *box.inset(outer))
+    x, y, w, h, radii = box.inset(inner)
+    if w > 0 and h > 0:
+        _addRoundedRect(path, x, y, w, h, radii)
+    return path
+
+
+def _sidePath(canvas, x: float, y: float, w: float, h: float, radii: Radii, side: str):
+    """
+    One side of a rounded outline as an open path, taking half of each corner.
+
+    What a dashed or dotted side is stroked along when its neighbours differ.
+    """
+    curves = _cornerCurves(x, y, w, h, radii)
+    before, after = {"Top": (0, 1), "Right": (1, 2), "Bottom": (2, 3), "Left": (3, 0)}[
+        side
+    ]
+    first = _splitCurve(curves[before])[1]
+    second = _splitCurve(curves[after])[0]
+    path = canvas.beginPath()
+    path.moveTo(*first[0])
+    _curveTo(path, first)
+    path.lineTo(*second[0])
+    _curveTo(path, second)
+    return path
+
+
+def _intersection(p1, p2, p3, p4):
+    """Where segment p1-p2 crosses segment p3-p4, or None."""
+    d = (p2[0] - p1[0]) * (p4[1] - p3[1]) - (p2[1] - p1[1]) * (p4[0] - p3[0])
+    if abs(d) < 1e-9:
+        return None
+    t = ((p3[0] - p1[0]) * (p4[1] - p3[1]) - (p3[1] - p1[1]) * (p4[0] - p3[0])) / d
+    u = ((p3[0] - p1[0]) * (p2[1] - p1[1]) - (p3[1] - p1[1]) * (p2[0] - p1[0])) / d
+    if 0 <= t <= 1 and 0 <= u <= 1:
+        return (p1[0] + t * (p2[0] - p1[0]), p1[1] + t * (p2[1] - p1[1]))
+    return None
+
+
+def _sideWedge(canvas, box: RoundedBox, side: str):
+    """
+    The part of the box that belongs to one side's border.
+
+    CSS splits a corner between its two sides along the line from the outer
+    corner to the inner one, so a wide border takes more of the corner than
+    a thin one, and a side with no border gives the whole corner to its
+    neighbour. The line runs on past the curve of the corner; where the two
+    lines of a side cross first, in a box narrower than its corners, they
+    stop there.
+    """
+    x, y, w, h = box.x, box.y, box.w, box.h
+    wd = box.widths
+    outer = {0: (x, y + h), 1: (x + w, y + h), 2: (x + w, y), 3: (x, y)}
+    inner = {
+        0: (x + wd["Left"], y + h - wd["Top"]),
+        1: (x + w - wd["Right"], y + h - wd["Top"]),
+        2: (x + w - wd["Right"], y + wd["Bottom"]),
+        3: (x + wd["Left"], y + wd["Bottom"]),
+    }
+
+    def reach(corner):
+        (outer_x, outer_y), (inner_x, inner_y) = outer[corner], inner[corner]
+        dx, dy = inner_x - outer_x, inner_y - outer_y
+        rx, ry = box.radii[corner]
+        # Far enough to clear the curve on both axes.
+        scale = 1.0
+        if dx:
+            scale = max(scale, (rx + abs(dx)) / abs(dx))
+        if dy:
+            scale = max(scale, (ry + abs(dy)) / abs(dy))
+        return (outer_x + dx * scale, outer_y + dy * scale)
+
+    first, second = {"Top": (0, 1), "Right": (1, 2), "Bottom": (2, 3), "Left": (3, 0)}[
+        side
+    ]
+    a, b = outer[first], outer[second]
+    far_a, far_b = reach(first), reach(second)
+    path = canvas.beginPath()
+    path.moveTo(*a)
+    path.lineTo(*b)
+    crossing = _intersection(a, far_a, b, far_b)
+    if crossing is None:
+        path.lineTo(*far_b)
+        path.lineTo(*far_a)
+    else:
+        path.lineTo(*crossing)
+    path.close()
+    return path
+
+
+def clipRoundedRect(
+    canvas, x: float, y: float, w: float, h: float, radii: Radii
+) -> None:
+    """Clip what is drawn next to the rounded box, until the next restoreState."""
+    canvas.clipPath(roundedRectPath(canvas, x, y, w, h, radii), stroke=0, fill=0)
+
+
+@contextlib.contextmanager
+def roundedClip(canvas, style, x: float, y: float, w: float, h: float):
+    """
+    Clip what is drawn inside the block to the box's rounded corners.
+
+    For content with no box of its own to paint, an image: nothing happens
+    when the style declares no radius.
+    """
+    box = roundedBox(style, x, y, w, h)
+    if box is None:
+        yield
+        return
+    canvas.saveState()
+    try:
+        clipRoundedRect(canvas, *box.inset(0.5))
+        yield
+    finally:
+        canvas.restoreState()
+
+
+def drawBoxBackground(
+    canvas, x: float, y: float, w: float, h: float, style, sides=_BOX_SIDES
+) -> None:
+    """
+    Paint the background of a box: the colour, then the image over it.
+
+    CSS 2.1 14.2: the image goes over the colour and under the content, which
+    is why this is separate from drawBoxBorders -- a caller paints this, then
+    its content, then the borders. `style` is read by attribute name, the way
+    a ParagraphStyle spells them (backColor, backgroundImage, ...), so any
+    object carrying those names will do; a missing one means "none".
+
+    A box with a border-radius is painted inside its curve, the image
+    included. `sides` are the edges this fragment of the box has, as for
+    drawBoxBorders; the corners at a cut stay square.
+    """
+    box = roundedBox(style, x, y, w, h, sides)
+    # The middle of the border, which is where a square box's fill stops.
+    clip = None if box is None else box.inset(0.5)
+    bg = getattr(style, "backColor", None)
+    if bg:
+        # draw a filled rectangle (with no stroke) using bg color
+        canvas.saveState()
+        canvas.setFillColor(bg)
+        if clip is None:
+            canvas.rect(x, y, w, h, fill=1, stroke=0)
+        else:
+            canvas.drawPath(roundedRectPath(canvas, *clip), fill=1, stroke=0)
+        canvas.restoreState()
+
+    background_image = getattr(style, "backgroundImage", None)
+    if background_image is not None:
+        reader = getBackgroundImageReader(background_image)
+        if reader is not None:
+            if clip is not None:
+                canvas.saveState()
+                clipRoundedRect(canvas, *clip)
+            drawBackgroundImage(
+                canvas,
+                reader,
+                x,
+                y,
+                w,
+                h,
+                natural=getBackgroundImageSize(reader),
+                repeat=getattr(style, "backgroundRepeat", "repeat"),
+                position=getattr(style, "backgroundPosition", "0% 0%"),
+                font_size=getattr(style, "fontSize", 0),
+            )
+            if clip is not None:
+                canvas.restoreState()
+
+
+def _drawRoundedSide(canvas, box: RoundedBox, spec, side: str | None) -> None:
+    """
+    Paint one side's border, or all four when `side` is None.
+
+    A solid or double border is filled as the band between two edges of the
+    box -- the whole ring, or the part in the side's wedge -- so its corner
+    grows and thins the way CSS draws it. Dashes need a stroke, so dashed
+    and dotted are stroked along the middle of the band.
+    """
+    bstyle, width, color = spec
+    canvas.saveState()
+    dash = getBorderDash(bstyle, width)
+    if dash:
+        canvas.setStrokeColor(color)
+        canvas.setLineWidth(width)
+        canvas.setDash(dash)
+        middle = box.inset(0.5)
+        path = (
+            roundedRectPath(canvas, *middle)
+            if side is None
+            else _sidePath(canvas, *middle, side)
+        )
+        canvas.drawPath(path, fill=0, stroke=1)
+        canvas.restoreState()
+        return
+    if side is not None:
+        canvas.clipPath(_sideWedge(canvas, box, side), stroke=0, fill=0)
+    canvas.setFillColor(color)
+    # CSS 2.1 8.5.3: double is two lines with a gap, a third of the width each.
+    bands = ((0.0, 1 / 3), (2 / 3, 1.0)) if _is_double(bstyle, width) else ((0.0, 1.0),)
+    for outer, inner in bands:
+        canvas.drawPath(
+            _ringPath(canvas, box, outer, inner),
+            fill=1,
+            stroke=0,
+            fillMode=FILL_EVEN_ODD,
+        )
+    canvas.restoreState()
+
+
+def drawBoxBorders(
+    canvas, x: float, y: float, w: float, h: float, style, sides=_BOX_SIDES
+) -> None:
+    """
+    Stroke the borders of a box, each side with its own style, width and colour.
+
+    ReportLab only knows a uniform border, so every side is drawn by hand. A
+    side with no colour takes the text colour, as W3C defines. `style` is read
+    by attribute name like drawBoxBackground's. `sides` names the edges to
+    draw: a box cut by a line or page break has none at the cut.
+    """
+    box = roundedBox(style, x, y, w, h, sides)
+    if box is not None:
+        specs = set(box.borders.values())
+        if len(box.borders) == 4 and len(specs) == 1:
+            _drawRoundedSide(canvas, box, specs.pop(), None)
+        else:
+            for side, spec in box.borders.items():
+                _drawRoundedSide(canvas, box, spec, side)
+        return
+    text_color = getattr(style, "textColor", None)
+    canvas.saveState()
+    for side, (x1, y1, x2, y2) in (
+        ("Left", (x, y, x, y + h)),
+        ("Right", (x + w, y, x + w, y + h)),
+        ("Top", (x, y + h, x + w, y + h)),
+        ("Bottom", (x, y, x + w, y)),
+    ):
+        if side not in sides:
+            continue
+        color = getattr(style, f"border{side}Color", None)
+        if color is None:
+            color = text_color
+        drawBorderLine(
+            canvas,
+            getattr(style, f"border{side}Style", None),
+            getattr(style, f"border{side}Width", 0),
+            color,
+            x1,
+            y1,
+            x2,
+            y2,
+        )
+    canvas.restoreState()
+
+
+MM: float = cm / 10.0
+DPI96: float = 1.0 / 96.0 * inch
+
+ABSOLUTE_SIZE_TABLE: dict[str, float] = {
+    "1": 50.0 / 100.0,
+    "xx-small": 50.0 / 100.0,
+    "x-small": 50.0 / 100.0,
+    "2": 75.0 / 100.0,
+    "small": 75.0 / 100.0,
+    "3": 1.0,
+    "medium": 1.0,
+    "4": 125.0 / 100.0,
+    "large": 125.0 / 100.0,
+    "5": 150.0 / 100.0,
+    "x-large": 150.0 / 100.0,
+    "6": 175.0 / 100.0,
+    "xx-large": 175.0 / 100.0,
+    "7": 200.0 / 100.0,
+    "xxx-large": 200.0 / 100.0,
+}
+
+RELATIVE_SIZE_TABLE: dict[str, float] = {
+    "larger": 1.25,
+    "smaller": 0.75,
+    "+4": 200.0 / 100.0,
+    "+3": 175.0 / 100.0,
+    "+2": 150.0 / 100.0,
+    "+1": 125.0 / 100.0,
+    "-1": 75.0 / 100.0,
+    "-2": 50.0 / 100.0,
+    "-3": 25.0 / 100.0,
+}
+
+MIN_FONT_SIZE: float = 1.0
+
+#: Base for relative lengths in @page and @frame. There is no element in scope
+#: at that point to inherit a font size from, so CSS resolves em, ex and % in
+#: the page context against the initial font size, which DEFAULT_CSS sets with
+#: html { font-size: 10px }.
+DEFAULT_FONT_SIZE: float = 10.0 * DPI96
+
+
+@Memoized
+def getSize(
+    value: str | float | list | tuple,
+    relative=0,
+    base: int | None = None,
+    default: float = 0.0,
+) -> float:
+    """
+    Converts strings to standard sizes.
+    That is the function taking a string of CSS size ('12pt', '1cm' and so on)
+    and converts it into a float in a standard unit (in our case, points).
+
+    >>> getSize('12pt')
+    12.0
+    >>> getSize('1cm')
+    28.346456692913385
+    """
+    try:
+        original = value
+        if value is None:
+            return relative
+        if isinstance(value, float):
+            return value
+        if isinstance(value, int):
+            return float(value)
+        if isinstance(value, tuple | list):
+            value = "".join(value)
+        value = str(value).strip().lower().replace(",", ".")
+        if value.endswith("cm"):
+            return float(value[:-2].strip()) * cm
+        if value.endswith("mm"):
+            return float(value[:-2].strip()) * MM  # 1MM = 0.1cm
+        if value.endswith("in"):
+            return float(value[:-2].strip()) * inch  # 1pt == 1/72inch
+        if value.endswith("pt"):
+            return float(value[:-2].strip())
+        if value.endswith("pc"):
+            return float(value[:-2].strip()) * 12.0  # 1pc == 12pt
+        if value.endswith("px"):
+            # XXX W3C says, use 96pdi
+            # http://www.w3.org/TR/CSS21/syndata.html#length-units
+            return float(value[:-2].strip()) * DPI96
+        if value in {"none", "0", "0.0", "auto"}:
+            return 0.0
+        if value.endswith("%"):
+            # 1% = (relative * 1) / 100. Outside the `if relative:` block
+            # below: with no base to be a percentage of the answer is 0.0
+            # either way, but reaching float("100%") logged "getSize: Not a
+            # float '100%'", which reads like a stylesheet error and is not one.
+            return (relative * float(value[:-1].strip())) / 100.0
+        if relative:
+            if value.endswith("rem"):  # XXX
+                # 1rem = 1 * fontSize
+                return float(value[:-3].strip()) * relative
+            if value.endswith("em"):  # XXX
+                # 1em = 1 * fontSize
+                return float(value[:-2].strip()) * relative
+            if value.endswith("ex"):  # XXX
+                # 1ex = 1/2 fontSize
+                return float(value[:-2].strip()) * (relative / 2.0)
+            if value in {"normal", "inherit"}:
+                return relative
+            if value in RELATIVE_SIZE_TABLE:
+                if base:
+                    return max(MIN_FONT_SIZE, base * RELATIVE_SIZE_TABLE[value])
+                return max(MIN_FONT_SIZE, relative * RELATIVE_SIZE_TABLE[value])
+            if value in ABSOLUTE_SIZE_TABLE:
+                if base:
+                    return max(MIN_FONT_SIZE, base * ABSOLUTE_SIZE_TABLE[value])
+                return max(MIN_FONT_SIZE, relative * ABSOLUTE_SIZE_TABLE[value])
+            return max(MIN_FONT_SIZE, relative * float(value))
+        try:
+            value = float(value)
+        except ValueError:
+            log.warning("getSize: Not a float %r", value)
+            return default  # value = 0
+        return max(0, value)
+    except Exception as exc:
+        # One line at warning level, the traceback at debug. A stylesheet with
+        # a handful of lengths this function cannot read -- a calc(), say --
+        # used to bury the log under a ten-line traceback for each one, which
+        # made the warnings that mattered impossible to find.
+        log.warning(
+            "getSize: cannot read %r, using %r (%s)",
+            original,
+            default,
+            type(exc).__name__,
+        )
+        log.debug("getSize %r %r", original, relative, exc_info=True)
+        return default
+
+
+@Memoized
+def getCoords(x, y, w, h, pagesize):
+    """
+    As a stupid programmer I like to use the upper left
+    corner of the document as the 0,0 coords therefore
+    we need to do some fancy calculations.
+    """
+    # ~ print pagesize
+    ax, ay = pagesize
+    if x < 0:
+        x = ax + x
+    if y < 0:
+        y = ay + y
+    if w is not None and h is not None:
+        if w <= 0:
+            w = ax - x + w
+        if h <= 0:
+            h = ay - y + h
+        return x, (ay - y - h), w, h
+    return x, (ay - y)
+
+
+@Memoized
+def getBox(box, pagesize):
+    """
+    Parse sizes by corners in the form:
+    <X-Left> <Y-Upper> <Width> <Height>
+    The last to values with negative values are interpreted as offsets form
+    the right and lower border.
+    """
+    box = str(box).split()
+    if len(box) != 4:
+        msg = "box not defined right way"
+        raise RuntimeError(msg)
+    x, y, w, h = (getSize(pos) for pos in box)
+    return getCoords(x, y, w, h, pagesize)
+
+
+#: Keywords background-position accepts, as a fraction of the free space.
+BACKGROUND_POSITION_KEYWORDS: dict[str, float] = {
+    "left": 0.0,
+    "top": 0.0,
+    "center": 0.5,
+    "middle": 0.5,
+    "right": 1.0,
+    "bottom": 1.0,
+}
+
+
+def getBackgroundOffset(value, free: float, font_size: float) -> float:
+    """
+    One axis of background-position, in points from the box's near edge.
+
+    CSS 2.1 14.2.1: a percentage places the same point of the image against
+    the same point of the box, so 100% is not "one box away" but "flush with
+    the far edge" -- which is why it is a fraction of the space left over
+    rather than of the box.
+    """
+    text = str(value).strip().lower()
+    if text in BACKGROUND_POSITION_KEYWORDS:
+        return free * BACKGROUND_POSITION_KEYWORDS[text]
+    if text.endswith("%"):
+        try:
+            return free * float(text[:-1]) / 100.0
+        except ValueError:
+            return 0.0
+    return getSize(text, font_size)
+
+
+#: ImageReaders, keyed by the file they were built from. A background is
+#: painted once per paragraph and a tiled one is drawn many times over, so
+#: decoding the file each time would be paid on every page.
+_background_image_readers: dict[str, object] = {}
+
+
+def getBackgroundImageReader(file_object):
+    """An ImageReader for a background image file, or None if unusable."""
+    if file_object is None or file_object.notFound():
+        return None
+
+    key = str(file_object.uri)
+    if key in _background_image_readers:
+        return _background_image_readers[key]
+
+    from reportlab.lib.utils import ImageReader
+
+    from xhtml2pdf.config.resources import ResourceAccessError, current_policy
+
+    try:
+        data = file_object.getData()
+        reader = ImageReader(BytesIO(data)) if data else None
+        if reader is not None:
+            width, height = reader.getSize()
+            current_policy().check_image_pixels(width, height, key)
+            # Decoded now, once: a truncated or corrupt file left to the
+            # drawing raised from inside ReportLab and ended the document.
+            reader.getRGBData()
+    except ResourceAccessError as e:
+        log.warning("Blocked by the resource policy: %s", e)
+        reader = None
+    except (OSError, SyntaxError) as e:
+        log.warning("Cannot decode background image %r: %s", key[:120], e)
+        reader = None
+    except Exception:
+        log.warning("Could not read background image %r", key, exc_info=True)
+        reader = None
+
+    _background_image_readers[key] = reader
+    return reader
+
+
+def getBackgroundImageSize(reader) -> tuple[float, float]:
+    """The image's natural size in points, reading its pixels at 96dpi."""
+    try:
+        width, height = reader.getSize()
+    except Exception:
+        return (0.0, 0.0)
+    return (width * DPI96, height * DPI96)
+
+
+def drawBackgroundImage(
+    canvas,
+    reader,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    natural: tuple[float, float],
+    repeat: str = "repeat",
+    position: str = "0% 0%",
+    font_size: float = DEFAULT_FONT_SIZE,
+) -> None:
+    """
+    Paint a CSS background image into a box, clipped to it.
+
+    Only what CSS 2.1 14.2 describes: the image at its natural size, placed by
+    background-position and tiled along whichever axes background-repeat
+    allows. No background-size, so nothing is ever scaled.
+    """
+    image_width, image_height = natural
+    if image_width <= 0 or image_height <= 0:
+        return
+
+    repeat = str(repeat).strip().lower()
+    tile_x = repeat in {"repeat", "repeat-x"}
+    tile_y = repeat in {"repeat", "repeat-y"}
+
+    parts = str(position).strip().lower().split()
+    if not parts:
+        parts = ["0%"]
+    if len(parts) == 1:
+        # CSS 2.1: a single value sets the horizontal position and centres
+        # the other axis.
+        parts = [parts[0], "center"]
+
+    offset_x = getBackgroundOffset(parts[0], width - image_width, font_size)
+    # The PDF origin is the bottom-left corner and CSS measures from the top,
+    # so the vertical offset is taken from the top edge and turned around.
+    offset_y = getBackgroundOffset(parts[1], height - image_height, font_size)
+
+    start_x = x + offset_x
+    start_y = y + height - image_height - offset_y
+
+    # A tiled axis has to start left of, or above, the box so the run of tiles
+    # covers it from the edge rather than from the placed image.
+    if tile_x:
+        while start_x > x:
+            start_x -= image_width
+    if tile_y:
+        while start_y + image_height < y + height:
+            start_y += image_height
+
+    canvas.saveState()
+    path = canvas.beginPath()
+    path.rect(x, y, width, height)
+    canvas.clipPath(path, stroke=0, fill=0)
+
+    tile_y_position = start_y
+    while True:
+        tile_x_position = start_x
+        while True:
+            canvas.drawImage(
+                reader,
+                tile_x_position,
+                tile_y_position,
+                image_width,
+                image_height,
+                mask="auto",
+            )
+            if not tile_x:
+                break
+            tile_x_position += image_width
+            if tile_x_position >= x + width:
+                break
+        if not tile_y:
+            break
+        tile_y_position -= image_height
+        if tile_y_position + image_height <= y:
+            break
+
+    canvas.restoreState()
+
+
+def getFrameDimensions(
+    data, page_width: float, page_height: float, font_size: float = DEFAULT_FONT_SIZE
+) -> tuple[float, float, float, float]:
+    """
+    Calculate dimensions of a frame.
+
+    Returns left, top, width and height of the frame in points.
+
+    font_size is the base for relative lengths. Without it `@page { margin:
+    2em }` resolved to nothing at all: getSize returns its default for a
+    relative unit when it is given no base, so the margin silently became 0.
+    """
+
+    def size(value, percent_of: float) -> float:
+        """
+        Resolve one length of the page box.
+
+        A percentage here is a fraction of the page, per CSS 2.1 10.2 and
+        10.5: the page box is the containing block. getSize would read it
+        against the font size instead, which is the right answer for a font
+        size and the wrong one for geometry.
+        """
+        if isinstance(value, list | tuple):
+            value = "".join(value)
+        if isinstance(value, str) and value.strip().endswith("%"):
+            try:
+                return float(value.strip()[:-1]) * percent_of / 100.0
+            except ValueError:
+                log.warning("Not a percentage: %r", value)
+                return 0.0
+        return getSize(value, font_size)
+
+    def horizontal(value) -> float:
+        return size(value, page_width)
+
+    def vertical(value) -> float:
+        return size(value, page_height)
+
+    box = data.get("-pdf-frame-box", [])
+    if len(box) == 4:
+        # left, top, width, height
+        return (
+            horizontal(box[0]),
+            vertical(box[1]),
+            horizontal(box[2]),
+            vertical(box[3]),
+        )
+    # Margins are folded in before the declared size is honoured, not after.
+    # The frame is derived from the four edge offsets below, so a size has to
+    # be turned into the offset it implies; doing that first and then adding
+    # the margin would push the opposite edge and leave a frame that is
+    # margin-narrower than what was asked for.
+    top = vertical(data.get("top", 0)) + vertical(data.get("margin-top", 0))
+    left = horizontal(data.get("left", 0)) + horizontal(data.get("margin-left", 0))
+    bottom = vertical(data.get("bottom", 0)) + vertical(data.get("margin-bottom", 0))
+    right = horizontal(data.get("right", 0)) + horizontal(data.get("margin-right", 0))
+
+    # A declared height fixes one edge relative to the other. Which edge moves
+    # depends on which one was given: with `bottom` the frame grows upwards,
+    # otherwise it grows down from `top`, whose default of 0 is what makes
+    # `@page { height: 6cm }` mean a 6cm area at the top of the page rather
+    # than -- as it did before -- the whole page.
+    if "height" in data:
+        height = vertical(data["height"])
+        if "bottom" in data and "top" not in data:
+            top = page_height - (bottom + height)
+        else:
+            bottom = page_height - (top + height)
+    if "width" in data:
+        width = horizontal(data["width"])
+        if "right" in data and "left" not in data:
+            left = page_width - (right + width)
+        else:
+            right = page_width - (left + width)
+
+    width = page_width - (left + right)
+    height = page_height - (top + bottom)
+    return left, top, width, height
+
+
+@Memoized
+def getPos(position, pagesize):
+    """Pair of coordinates."""
+    position = str(position).split()
+    if len(position) != 2:
+        msg = "position not defined right way"
+        raise RuntimeError(msg)
+    x, y = (getSize(pos) for pos in position)
+    return getCoords(x, y, None, None, pagesize)
+
+
+def getBool(s):
+    """Is it a boolean?."""
+    return str(s).lower() in {"y", "yes", "1", "true"}
+
+
+def getFloat(s):
+    with contextlib.suppress(Exception):
+        return float(s)
+
+
+#: The named fill patterns a table of contents can draw between an entry and
+#: its page number, mapped to the string that is repeated to draw them. The
+#: names are LibreOffice's ("carácter de relleno": none, dots, dashes, lines).
+#: `dots` is a solid run rather than ReportLab's spaced " . " default, because
+#: that is what a printed table of contents looks like.
+TOC_LEADERS: dict[str, str] = {
+    "none": "",
+    "space": " ",
+    "dots": ".",
+    "dashes": "-",
+    "line": "_",
+}
+
+
+def getTocLeader(value) -> str:
+    """
+    The string a table of contents repeats to fill the gap before a page number.
+
+    One of the names in TOC_LEADERS, or any other string to repeat as it is,
+    so a document can ask for a fill the names do not cover::
+
+        -pdf-toc-leader: dots;
+        -pdf-toc-leader: "\u00b7 ";
+
+    Anything unrecognised is the fill rather than an error: the CSS engine has
+    already stripped the quotes by the time this runs, so a pattern and a
+    misspelt keyword arrive looking exactly alike, and refusing both would
+    make the quoted form unreachable. A typo shows up as itself on the page.
+    """
+    raw = str(value)
+    # A quoted value should not reach here, but an inline style might not go
+    # through the same parsing, so unwrap one rather than fill with quotes.
+    stripped = raw.strip()
+    if len(stripped) > 1 and stripped[0] == stripped[-1] and stripped[0] in {'"', "'"}:
+        return stripped[1:-1]
+    named = TOC_LEADERS.get(stripped.lower())
+    # Returned unstripped: a pattern's own spacing is the point of writing
+    # one, and "\u00b7 " must not come back as "\u00b7".
+    return raw if named is None else named
+
+
+def getTocName(value) -> str:
+    """
+    The name that binds an entry to one table of contents.
+
+    Read from both sides of the binding -- ``<pdf:toc name="Figures">`` and
+    ``-pdf-toc-name: figures`` -- so that the two cannot fail to meet over a
+    capital letter or a stray space. There is no diagnostic for a name that
+    almost matches: the entry simply goes nowhere.
+    """
+    if value is None:
+        return ""
+    stripped = str(value).strip()
+    # As in getTocLeader: the CSS engine strips the quotes, an inline style
+    # may not, and a name is never meant to contain them.
+    if len(stripped) > 1 and stripped[0] == stripped[-1] and stripped[0] in {'"', "'"}:
+        stripped = stripped[1:-1].strip()
+    return stripped.lower()
+
+
+def getTocNameClass(name: str) -> str:
+    """
+    The class ``addTOC`` adds to a named table of contents, for author CSS.
+
+    ``figures`` becomes ``idx-figures``, so a stylesheet can reach one index
+    of several with ``pdftoc.idx-figures.pdftoclevel0``. Anything a selector
+    cannot carry collapses to a dash, which keeps a name with a space in it
+    styleable rather than silently unreachable.
+    """
+    slug = re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-")
+    return f"idx-{slug}" if slug else ""
+
+
+#: The modes reportlab's KeepInFrame understands. "shrink" is the fallback
+#: everywhere xhtml2pdf reads one, because keeping the content is the least
+#: surprising answer to content that is a little too big for its box.
+KEEP_IN_FRAME_MODES: frozenset[str] = frozenset(
+    {"shrink", "error", "overflow", "truncate"}
+)
+
+
+def getKeepInFrameMode(value, default: str = "shrink") -> str:
+    """
+    Read a -pdf-keep-in-frame-mode declaration.
+
+    Anything reportlab would not recognise falls back to ``default`` rather
+    than reaching KeepInFrame, which raises on an unknown mode.
+    """
+    mode = str(value).strip().lower()
+    return mode if mode in KEEP_IN_FRAME_MODES else default
+
+
+ALIGNMENTS = {
+    "left": TA_LEFT,
+    "center": TA_CENTER,
+    "middle": TA_CENTER,
+    "right": TA_RIGHT,
+    "justify": TA_JUSTIFY,
+}
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ Flexbox values
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class CSSLength(NamedTuple):
+    """
+    A CSS length that remembers whether it was a keyword.
+
+    getSize answers 0.0 for "auto", "none" and "0" alike, which is the one
+    distinction flexbox cannot do without: an item whose flex-basis is 0
+    starts from nothing, one whose basis is auto starts from its content, and
+    a max-width of none is no limit at all.
+    """
+
+    kind: str  #: "auto", "none", "content", "percent" or "length"
+    value: float = 0.0
+
+    def resolve(self, basis: float | None = None) -> float | None:
+        """Points, or None when the length is indefinite in this context."""
+        if self.kind == "length":
+            return self.value
+        if self.kind == "percent":
+            return None if basis is None else basis * self.value / 100.0
+        return None
+
+    @property
+    def is_definite(self) -> bool:
+        return self.kind in {"length", "percent"}
+
+
+AUTO = CSSLength("auto")
+NONE_LENGTH = CSSLength("none")
+CONTENT = CSSLength("content")
+
+#: Values already reported, so a stylesheet that repeats one bad value does
+#: not fill the log with a line per element.
+_value_warned: set[tuple[str, str]] = set()
+
+
+def _warn_value(property_name: str, value: str, message: str) -> None:
+    key = (property_name, value)
+    if key in _value_warned:
+        return
+    _value_warned.add(key)
+    log.warning("%s: %r %s", property_name, value, message)
+
+
+def _getLength(
+    value, font_size: float, *, name: str, keywords: dict, default: CSSLength
+) -> CSSLength:
+    text = "".join(str(part) for part in toList(value)).strip().lower()
+    if text in keywords:
+        return keywords[text]
+    if text.endswith("%"):
+        try:
+            return CSSLength("percent", float(text[:-1]))
+        except ValueError:
+            _warn_value(name, text, "is not a length; using its initial value")
+            return default
+    if not text or text.startswith("calc(") or text[0].isalpha():
+        _warn_value(name, text, "is not a length; using its initial value")
+        return default
+    return CSSLength("length", getSize(text, font_size))
+
+
+def getLengthOrAuto(value, font_size: float = 0.0) -> CSSLength:
+    """A width, height, gap or min-/max- size: a length, a percentage, auto or none."""
+    return _getLength(
+        value,
+        font_size,
+        name="length",
+        keywords={"auto": AUTO, "none": NONE_LENGTH, "normal": AUTO},
+        default=AUTO,
+    )
+
+
+def getFlexBasis(value, font_size: float = 0.0) -> CSSLength:
+    """flex-basis: a length, a percentage, auto or content."""
+    return _getLength(
+        value,
+        font_size,
+        name="flex-basis",
+        keywords={"auto": AUTO, "content": CONTENT},
+        default=AUTO,
+    )
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ border-radius
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+ZERO_LENGTH = CSSLength("length", 0.0)
+
+
+class CornerRadius(NamedTuple):
+    """
+    One corner's border-*-radius: a horizontal and a vertical radius.
+
+    Kept unresolved because CSS resolves a percentage against the border
+    box -- the horizontal radius against its width, the vertical one
+    against its height -- and the box is only known when it is drawn.
+    """
+
+    h: CSSLength
+    v: CSSLength
+
+    def resolve(self, width: float, height: float) -> tuple[float, float]:
+        """(rx, ry) in points; a corner with either radius 0 is square."""
+        rx = max(self.h.resolve(width) or 0.0, 0.0)
+        ry = max(self.v.resolve(height) or 0.0, 0.0)
+        return (rx, ry) if rx > 0 and ry > 0 else (0.0, 0.0)
+
+
+#: The initial value of every corner. Painters test it by identity to keep
+#: the square-box path, and its output, exactly as it was.
+NO_RADIUS = CornerRadius(ZERO_LENGTH, ZERO_LENGTH)
+
+#: The corners in the order the border-radius shorthand lists them. The frag
+#: and style attribute of each is f"border{corner}Radius".
+RADIUS_CORNERS = ("TopLeft", "TopRight", "BottomRight", "BottomLeft")
+
+#: The CSS longhand of each corner, in the same order.
+RADIUS_PROPERTIES = (
+    "border-top-left-radius",
+    "border-top-right-radius",
+    "border-bottom-right-radius",
+    "border-bottom-left-radius",
+)
+
+_RADIUS_UNITS = ("px", "pt", "pc", "cm", "mm", "in", "rem", "em", "ex", "%")
+
+
+def isRadiusPart(part) -> bool:
+    """
+    Whether one parsed value can be a radius: 0, or a non-negative length
+    or percentage. The parser hands a length over as a (number, unit) tuple;
+    the `/` of the shorthand, calc() and keywords are something else.
+    """
+    if isinstance(part, str):
+        return part.strip() == "0"
+    if type(part) is not tuple or len(part) != 2:
+        return False
+    number, unit = part
+    if not isinstance(number, str) or str(unit).lower() not in _RADIUS_UNITS:
+        return False
+    try:
+        return float(number) >= 0
+    except ValueError:
+        return False
+
+
+def getBorderRadius(value, font_size: float = 0.0) -> CornerRadius:
+    """
+    A border-*-radius longhand: one radius for both axes, or two.
+
+    getSize is no use here: it resolves a percentage against the font size.
+    """
+    parts = toList(value, cast_tuple=False)
+    if not 1 <= len(parts) <= 2 or not all(isRadiusPart(part) for part in parts):
+        _warn_value("border-radius", str(value), "is not a radius; using 0")
+        return NO_RADIUS
+    h, v = (
+        _getLength(
+            part, font_size, name="border-radius", keywords={}, default=ZERO_LENGTH
+        )
+        for part in (parts[0], parts[-1])
+    )
+    return CornerRadius(h, v)
+
+
+def getNumber(value, default: float = 0.0) -> float:
+    """A bare CSS <number>; flex-grow and flex-shrink."""
+    text = "".join(str(part) for part in toList(value)).strip()
+    try:
+        return float(text)
+    except ValueError:
+        _warn_value("number", text, "is not a number; using its initial value")
+        return default
+
+
+def getInt(value, default: int = 0) -> int:
+    """A bare CSS <integer>; order."""
+    text = "".join(str(part) for part in toList(value)).strip()
+    try:
+        return int(text)
+    except ValueError:
+        _warn_value("integer", text, "is not an integer; using its initial value")
+        return default
+
+
+def _keyword_converter(name: str, table: dict[str, str], default: str, approximate=()):
+    """
+    A converter for a property whose value is one of a fixed set of keywords.
+
+    Aliases map onto the keyword this library acts on (start is flex-start).
+    A value in `approximate` is accepted with a warning: it is drawn as
+    something else, and the author should hear that once.
+    """
+
+    def convert(value) -> str:
+        text = " ".join(str(part) for part in toList(value)).strip().lower()
+        if text in table:
+            if text in approximate:
+                _warn_value(name, text, f"is drawn as {table[text]}")
+            return table[text]
+        _warn_value(name, text, f"is not supported; using {default}")
+        return default
+
+    convert.__name__ = convert.__qualname__ = name
+    return convert
+
+
+getFlexDirection = _keyword_converter(
+    "flex-direction",
+    {k: k for k in ("row", "row-reverse", "column", "column-reverse")},
+    "row",
+)
+
+getOverflow = _keyword_converter(
+    "overflow",
+    {
+        "visible": "visible",
+        "hidden": "hidden",
+        "clip": "hidden",
+        "scroll": "hidden",
+        "auto": "hidden",
+    },
+    "visible",
+)
+
+getTextOverflow = _keyword_converter(
+    "text-overflow", {"clip": "clip", "ellipsis": "ellipsis"}, "clip"
+)
+
+getFlexWrap = _keyword_converter(
+    "flex-wrap", {k: k for k in ("nowrap", "wrap", "wrap-reverse")}, "nowrap"
+)
+
+getFlexJustify = _keyword_converter(
+    "justify-content",
+    {
+        "flex-start": "flex-start",
+        "start": "flex-start",
+        "left": "flex-start",
+        "normal": "flex-start",
+        "stretch": "flex-start",
+        "flex-end": "flex-end",
+        "end": "flex-end",
+        "right": "flex-end",
+        "center": "center",
+        "space-between": "space-between",
+        "space-around": "space-around",
+        "space-evenly": "space-evenly",
+    },
+    "flex-start",
+)
+
+#: align-items, align-self and align-content share one vocabulary. auto is
+#: only meaningful on align-self and the space-* values on align-content;
+#: neither does harm on the others, so one table serves all three.
+getFlexAlign = _keyword_converter(
+    "align",
+    {
+        "auto": "auto",
+        "normal": "stretch",
+        "stretch": "stretch",
+        "flex-start": "flex-start",
+        "start": "flex-start",
+        "self-start": "flex-start",
+        "flex-end": "flex-end",
+        "end": "flex-end",
+        "self-end": "flex-end",
+        "center": "center",
+        "baseline": "baseline",
+        "first baseline": "baseline",
+        "last baseline": "flex-end",
+        "space-between": "space-between",
+        "space-around": "space-around",
+        "space-evenly": "space-evenly",
+    },
+    "stretch",
+    approximate=("last baseline",),
+)
+
+
+class Display:
+    """
+    What pisaLoop does with an element, resolved from its display property.
+
+    Not every CSS value is its own mode here. The ones this library lays out
+    are block, inline, inline-block, flex and none; the rest map onto the
+    nearest of those, which is at least a box of the right kind. Before this
+    the property was compared with "block" and "none" and nothing else, so
+    display: table on a div did not even make it a block.
+    """
+
+    BLOCK = "block"
+    INLINE = "inline"
+    INLINE_BLOCK = "inline-block"
+    FLEX = "flex"
+    NONE = "none"
+
+
+_DISPLAY_TABLE: dict[str, str] = {
+    "block": Display.BLOCK,
+    "inline": Display.INLINE,
+    "inline-block": Display.INLINE_BLOCK,
+    "flex": Display.FLEX,
+    "inline-flex": Display.FLEX,
+    "none": Display.NONE,
+    # Block-level things this library does not lay out as such. A table is
+    # still a table when it is a <table>; the tag decides that, not display.
+    "flow-root": Display.BLOCK,
+    "list-item": Display.BLOCK,
+    "table": Display.BLOCK,
+    "inline-table": Display.BLOCK,
+    "table-row": Display.BLOCK,
+    "table-cell": Display.BLOCK,
+    "table-row-group": Display.BLOCK,
+    "table-header-group": Display.BLOCK,
+    "table-footer-group": Display.BLOCK,
+    "table-caption": Display.BLOCK,
+    "grid": Display.BLOCK,
+    "inline-grid": Display.BLOCK,
+    # The element's own box goes away and its children stay: for a flow of
+    # text that is what inline already does.
+    "contents": Display.INLINE,
+}
+
+
+def getDisplay(value, default: str = Display.INLINE) -> str:
+    """One of the Display modes, from a display value."""
+    text = "".join(str(part) for part in toList(value)).strip().lower()
+    if text in _DISPLAY_TABLE:
+        return _DISPLAY_TABLE[text]
+    _warn_value("display", text, f"is not supported; treated as {default}")
+    return default
+
+
+def getAlign(value, default=TA_LEFT):
+    return ALIGNMENTS.get(str(value).lower(), default)
+
+
+_rx_datauri = re.compile(
+    r"^data:(?P<mime>[a-z]+/[a-z]+);base64,(?P<data>.*)$", re.MULTILINE | re.DOTALL
+)
+
+COLOR_BY_NAME = {
+    "activeborder": Color(212, 208, 200),
+    "activecaption": Color(10, 36, 106),
+    "aliceblue": Color(0.941176, 0.972549, 1),
+    "antiquewhite": Color(0.980392, 0.921569, 0.843137),
+    "appworkspace": Color(128, 128, 128),
+    "aqua": Color(0, 1, 1),
+    "aquamarine": Color(0.498039, 1, 0.831373),
+    "azure": Color(0.941176, 1, 1),
+    "background": Color(58, 110, 165),
+    "beige": Color(0.960784, 0.960784, 0.862745),
+    "bisque": Color(1, 0.894118, 0.768627),
+    "black": Color(0, 0, 0),
+    "blanchedalmond": Color(1, 0.921569, 0.803922),
+    "blue": Color(0, 0, 1),
+    "blueviolet": Color(0.541176, 0.168627, 0.886275),
+    "brown": Color(0.647059, 0.164706, 0.164706),
+    "burlywood": Color(0.870588, 0.721569, 0.529412),
+    "buttonface": Color(212, 208, 200),
+    "buttonhighlight": Color(255, 255, 255),
+    "buttonshadow": Color(128, 128, 128),
+    "buttontext": Color(0, 0, 0),
+    "cadetblue": Color(0.372549, 0.619608, 0.627451),
+    "captiontext": Color(255, 255, 255),
+    "chartreuse": Color(0.498039, 1, 0),
+    "chocolate": Color(0.823529, 0.411765, 0.117647),
+    "coral": Color(1, 0.498039, 0.313725),
+    "cornflowerblue": Color(0.392157, 0.584314, 0.929412),
+    "cornsilk": Color(1, 0.972549, 0.862745),
+    "crimson": Color(0.862745, 0.078431, 0.235294),
+    "cyan": Color(0, 1, 1),
+    "darkblue": Color(0, 0, 0.545098),
+    "darkcyan": Color(0, 0.545098, 0.545098),
+    "darkgoldenrod": Color(0.721569, 0.52549, 0.043137),
+    "darkgray": Color(0.662745, 0.662745, 0.662745),
+    "darkgreen": Color(0, 0.392157, 0),
+    "darkgrey": Color(0.662745, 0.662745, 0.662745),
+    "darkkhaki": Color(0.741176, 0.717647, 0.419608),
+    "darkmagenta": Color(0.545098, 0, 0.545098),
+    "darkolivegreen": Color(0.333333, 0.419608, 0.184314),
+    "darkorange": Color(1, 0.54902, 0),
+    "darkorchid": Color(0.6, 0.196078, 0.8),
+    "darkred": Color(0.545098, 0, 0),
+    "darksalmon": Color(0.913725, 0.588235, 0.478431),
+    "darkseagreen": Color(0.560784, 0.737255, 0.560784),
+    "darkslateblue": Color(0.282353, 0.239216, 0.545098),
+    "darkslategray": Color(0.184314, 0.309804, 0.309804),
+    "darkslategrey": Color(0.184314, 0.309804, 0.309804),
+    "darkturquoise": Color(0, 0.807843, 0.819608),
+    "darkviolet": Color(0.580392, 0, 0.827451),
+    "deeppink": Color(1, 0.078431, 0.576471),
+    "deepskyblue": Color(0, 0.74902, 1),
+    "dimgray": Color(0.411765, 0.411765, 0.411765),
+    "dimgrey": Color(0.411765, 0.411765, 0.411765),
+    "dodgerblue": Color(0.117647, 0.564706, 1),
+    "firebrick": Color(0.698039, 0.133333, 0.133333),
+    "floralwhite": Color(1, 0.980392, 0.941176),
+    "forestgreen": Color(0.133333, 0.545098, 0.133333),
+    "fuchsia": Color(1, 0, 1),
+    "gainsboro": Color(0.862745, 0.862745, 0.862745),
+    "ghostwhite": Color(0.972549, 0.972549, 1),
+    "gold": Color(1, 0.843137, 0),
+    "goldenrod": Color(0.854902, 0.647059, 0.12549),
+    "gray": Color(0.501961, 0.501961, 0.501961),
+    "graytext": Color(128, 128, 128),
+    "green": Color(0, 0.501961, 0),
+    "greenyellow": Color(0.678431, 1, 0.184314),
+    "grey": Color(0.501961, 0.501961, 0.501961),
+    "highlight": Color(10, 36, 106),
+    "highlighttext": Color(255, 255, 255),
+    "honeydew": Color(0.941176, 1, 0.941176),
+    "hotpink": Color(1, 0.411765, 0.705882),
+    "inactiveborder": Color(212, 208, 200),
+    "inactivecaption": Color(128, 128, 128),
+    "inactivecaptiontext": Color(212, 208, 200),
+    "indianred": Color(0.803922, 0.360784, 0.360784),
+    "indigo": Color(0.294118, 0, 0.509804),
+    "infobackground": Color(255, 255, 225),
+    "infotext": Color(0, 0, 0),
+    "ivory": Color(1, 1, 0.941176),
+    "khaki": Color(0.941176, 0.901961, 0.54902),
+    "lavender": Color(0.901961, 0.901961, 0.980392),
+    "lavenderblush": Color(1, 0.941176, 0.960784),
+    "lawngreen": Color(0.486275, 0.988235, 0),
+    "lemonchiffon": Color(1, 0.980392, 0.803922),
+    "lightblue": Color(0.678431, 0.847059, 0.901961),
+    "lightcoral": Color(0.941176, 0.501961, 0.501961),
+    "lightcyan": Color(0.878431, 1, 1),
+    "lightgoldenrodyellow": Color(0.980392, 0.980392, 0.823529),
+    "lightgray": Color(0.827451, 0.827451, 0.827451),
+    "lightgreen": Color(0.564706, 0.933333, 0.564706),
+    "lightgrey": Color(0.827451, 0.827451, 0.827451),
+    "lightpink": Color(1, 0.713725, 0.756863),
+    "lightsalmon": Color(1, 0.627451, 0.478431),
+    "lightseagreen": Color(0.12549, 0.698039, 0.666667),
+    "lightskyblue": Color(0.529412, 0.807843, 0.980392),
+    "lightslategray": Color(0.466667, 0.533333, 0.6),
+    "lightslategrey": Color(0.466667, 0.533333, 0.6),
+    "lightsteelblue": Color(0.690196, 0.768627, 0.870588),
+    "lightyellow": Color(1, 1, 0.878431),
+    "lime": Color(0, 1, 0),
+    "limegreen": Color(0.196078, 0.803922, 0.196078),
+    "linen": Color(0.980392, 0.941176, 0.901961),
+    "magenta": Color(1, 0, 1),
+    "maroon": Color(0.501961, 0, 0),
+    "mediumaquamarine": Color(0.4, 0.803922, 0.666667),
+    "mediumblue": Color(0, 0, 0.803922),
+    "mediumorchid": Color(0.729412, 0.333333, 0.827451),
+    "mediumpurple": Color(0.576471, 0.439216, 0.858824),
+    "mediumseagreen": Color(0.235294, 0.701961, 0.443137),
+    "mediumslateblue": Color(0.482353, 0.407843, 0.933333),
+    "mediumspringgreen": Color(0, 0.980392, 0.603922),
+    "mediumturquoise": Color(0.282353, 0.819608, 0.8),
+    "mediumvioletred": Color(0.780392, 0.082353, 0.521569),
+    "menu": Color(212, 208, 200),
+    "menutext": Color(0, 0, 0),
+    "midnightblue": Color(0.098039, 0.098039, 0.439216),
+    "mintcream": Color(0.960784, 1, 0.980392),
+    "mistyrose": Color(1, 0.894118, 0.882353),
+    "moccasin": Color(1, 0.894118, 0.709804),
+    "navajowhite": Color(1, 0.870588, 0.678431),
+    "navy": Color(0, 0, 0.501961),
+    "oldlace": Color(0.992157, 0.960784, 0.901961),
+    "olive": Color(0.501961, 0.501961, 0),
+    "olivedrab": Color(0.419608, 0.556863, 0.137255),
+    "orange": Color(1, 0.647059, 0),
+    "orangered": Color(1, 0.270588, 0),
+    "orchid": Color(0.854902, 0.439216, 0.839216),
+    "palegoldenrod": Color(0.933333, 0.909804, 0.666667),
+    "palegreen": Color(0.596078, 0.984314, 0.596078),
+    "paleturquoise": Color(0.686275, 0.933333, 0.933333),
+    "palevioletred": Color(0.858824, 0.439216, 0.576471),
+    "papayawhip": Color(1, 0.937255, 0.835294),
+    "peachpuff": Color(1, 0.854902, 0.72549),
+    "peru": Color(0.803922, 0.521569, 0.247059),
+    "pink": Color(1, 0.752941, 0.796078),
+    "plum": Color(0.866667, 0.627451, 0.866667),
+    "powderblue": Color(0.690196, 0.878431, 0.901961),
+    "purple": Color(0.501961, 0, 0.501961),
+    "red": Color(1, 0, 0),
+    "rosybrown": Color(0.737255, 0.560784, 0.560784),
+    "royalblue": Color(0.254902, 0.411765, 0.882353),
+    "saddlebrown": Color(0.545098, 0.270588, 0.07451),
+    "salmon": Color(0.980392, 0.501961, 0.447059),
+    "sandybrown": Color(0.956863, 0.643137, 0.376471),
+    "scrollbar": Color(212, 208, 200),
+    "seagreen": Color(0.180392, 0.545098, 0.341176),
+    "seashell": Color(1, 0.960784, 0.933333),
+    "sienna": Color(0.627451, 0.321569, 0.176471),
+    "silver": Color(0.752941, 0.752941, 0.752941),
+    "skyblue": Color(0.529412, 0.807843, 0.921569),
+    "slateblue": Color(0.415686, 0.352941, 0.803922),
+    "slategray": Color(0.439216, 0.501961, 0.564706),
+    "slategrey": Color(0.439216, 0.501961, 0.564706),
+    "snow": Color(1, 0.980392, 0.980392),
+    "springgreen": Color(0, 1, 0.498039),
+    "steelblue": Color(0.27451, 0.509804, 0.705882),
+    "tan": Color(0.823529, 0.705882, 0.54902),
+    "teal": Color(0, 0.501961, 0.501961),
+    "thistle": Color(0.847059, 0.74902, 0.847059),
+    "threeddarkshadow": Color(64, 64, 64),
+    "threedface": Color(212, 208, 200),
+    "threedhighlight": Color(255, 255, 255),
+    "threedlightshadow": Color(212, 208, 200),
+    "threedshadow": Color(128, 128, 128),
+    "tomato": Color(1, 0.388235, 0.278431),
+    "turquoise": Color(0.25098, 0.878431, 0.815686),
+    "violet": Color(0.933333, 0.509804, 0.933333),
+    "wheat": Color(0.960784, 0.870588, 0.701961),
+    "white": Color(1, 1, 1),
+    "whitesmoke": Color(0.960784, 0.960784, 0.960784),
+    "window": Color(255, 255, 255),
+    "windowframe": Color(0, 0, 0),
+    "windowtext": Color(0, 0, 0),
+    "yellow": Color(1, 1, 0),
+    "yellowgreen": Color(0.603922, 0.803922, 0.196078),
+}
+
+
+def get_default_asian_font():
+    lower_font_list = []
+    upper_font_list = []
+
+    font_dict = copy(reportlab.pdfbase._cidfontdata.defaultUnicodeEncodings)
+    fonts = font_dict.keys()
+
+    for font in fonts:
+        upper_font_list.append(font)
+        lower_font_list.append(font.lower())
+    return {lower_font_list[i]: upper_font_list[i] for i in range(len(lower_font_list))}
+
+
+#: The CMap a CJK face is written with where ReportLab's table names the
+#: wrong one. ReportLab pairs MSung-Light, an Adobe-CNS1 face, with
+#: UniGB-UCS2-H, the Unicode CMap of Adobe-GB1; a viewer that checks the pair,
+#: as Poppler does, drops the font and shows none of its text.
+CID_CMAPS: dict[str, str] = {"MSung-Light": "UniCNS-UCS2-H"}
+
+
+def set_asian_fonts(fontname):
+    """Register one of ReportLab's CJK faces, if that is what this name is."""
+    font_dict = copy(reportlab.pdfbase._cidfontdata.defaultUnicodeEncodings)
+    fonts = font_dict.keys()
+    if fontname in fonts:
+        font = UnicodeCIDFont(fontname)
+        cmap = CID_CMAPS.get(fontname)
+        if cmap and font.encodingName != cmap:
+            # The text is written as UTF-16 whatever the CMap, so only the
+            # name the font dictionary carries changes.
+            font.encodingName = cmap
+            font.encoding = CIDEncoding(cmap)
+        pdfmetrics.registerFont(font)
+        return
+    # Reached only from getFontName, which looked the name up in the CJK
+    # table first, so a miss here means ReportLab and that table disagree.
+    # It used to be a silent no-op and the document drew with a font that
+    # had never been registered.
+    _warn_value(
+        "font-family",
+        str(fontname),
+        f"is not one of ReportLab's CJK faces ({', '.join(sorted(fonts))})",
+    )
+
+
+def detect_language(name):
+    """
+    The RTL language this name stands for, or None.
+
+    Lowercased because DEFAULT_LANGUAGE_LIST is, while the name comes
+    straight from the markup: <pdf:language name="Arabic"/> reshaped
+    nothing, and was excluded from /Lang for being a language name, so it
+    did neither job.
+    """
+    asian_language_list = xhtml2pdf.default.DEFAULT_LANGUAGE_LIST
+    name = str(name).strip().lower() if name else ""
+    if name in asian_language_list:
+        return name
+    return None
+
+
+#: The blocks whose characters are written right to left: Hebrew, Arabic,
+#: Syriac, Thaana, NKo, and the presentation forms of the first two. A run of
+#: these inside a left-to-right paragraph is still laid out right to left,
+#: which is the whole point of the bidirectional algorithm and the reason it
+#: cannot be run only on documents that declare a direction.
+_RTL_CHARS = re.compile(
+    r"[\u0590-\u05ff\u0600-\u06ff\u0700-\u074f\u0750-\u077f"
+    r"\u0780-\u07bf\u07c0-\u07ff\ufb1d-\ufdff\ufe70-\ufeff]"
+)
+
+
+def shape_frag_text(frag_text, font_name=None):
+    """
+    `frag_text` with its Arabic letters joined, or None if it has none.
+
+    Only reshaped, never reordered: the text stays in the order it was
+    written, and each line is put in the order it is drawn in when it is
+    drawn (Paragraph.displayLines).
+
+    Reshaping is skipped when the font cannot draw what it produces.
+    arabic_reshaper writes Arabic Presentation Forms, and a font built for
+    OpenType shaping -- which is most of them -- carries the base Arabic
+    block and no presentation forms at all, so reshaping turned readable
+    letters into empty boxes. Unjoined letters are a poor second best; a row
+    of boxes is not a best at all.
+    """
+    if not _RTL_CHARS.search(frag_text):
+        return None
+    return _reshape_for(frag_text, font_name)
+
+
+#: A reshaper that joins letters but writes no ligatures. Ligatures are where
+#: fonts differ most: DejaVu carries 141 presentation forms and not the Allah
+#: ligature, so one word of a paragraph would otherwise cost the joining of
+#: all of it.
+_plain_reshaper = arabic_reshaper.ArabicReshaper(
+    configuration={"support_ligatures": False}
+)
+
+
+def _reshape_for(text: str, font_name: str | None) -> str:
+    """
+    `text` joined as far as `font_name` can draw it.
+
+    Three answers, best first: the full reshaping, the same without
+    ligatures, and the letters as they were written. Unjoined Arabic reads
+    poorly; a row of empty boxes does not read at all, which is what a font
+    built for OpenType shaping gives for a presentation form it never
+    carried.
+    """
+    shaped = arabic_reshaper.reshape(text)
+    if font_name is None or _drawable(shaped, font_name):
+        return shaped
+    without_ligatures = _plain_reshaper.reshape(text)
+    if _drawable(without_ligatures, font_name):
+        return without_ligatures
+    return text if _drawable(text, font_name) else shaped
+
+
+def _drawable(text: str, font_name: str) -> bool:
+    """Whether every character of `text` has a glyph in `font_name`."""
+    return all(font_has_glyph(font_name, char) for char in text)
+
+
+class ImageWarning(Exception):  # noqa: N818
+    pass
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ Which characters a face can actually draw
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#: Codepoints each registered face can draw, built on first use. Keyed by the
+#: ReportLab font name, which is what a frag carries.
+_font_coverage: dict[str, frozenset[int] | None] = {}
+
+
+#: The two base-14 faces with an encoding of their own, and ReportLab's codec
+#: for it. Their glyph names -- "a1" to "a191" in ZapfDingbats -- are not in
+#: the Adobe glyph list, so read by name ZapfDingbats covered only the space
+#: and every dingbat was reported missing. The codec is what ReportLab itself
+#: encodes their text with.
+_SYMBOLIC_CODECS: dict[str, str] = {
+    "SymbolEncoding": "symbol",
+    "ZapfDingbatsEncoding": "zapfdingbats",
+}
+
+
+def _codec_coverage(codec: str) -> frozenset[int]:
+    """
+    Every codepoint `codec` can encode.
+
+    Decoding its 256 codes finds one codepoint per glyph, but a glyph can be
+    reached from more than one: Symbol's mu decodes to the micro sign and
+    encodes from the Greek letter too. Those others are in the same Unicode
+    blocks, so every codepoint of the blocks the decoded ones touch is tried.
+    """
+    decoded: set[int] = set()
+    for code in range(256):
+        with contextlib.suppress(UnicodeDecodeError):
+            decoded.update(ord(char) for char in bytes([code]).decode(codec))
+    codepoints = set(decoded)
+    for block in {cp >> 8 for cp in decoded}:
+        for cp in range(block << 8, (block + 1) << 8):
+            if cp not in codepoints and not 0xD800 <= cp < 0xE000:
+                with contextlib.suppress(UnicodeEncodeError):
+                    chr(cp).encode(codec)
+                    codepoints.add(cp)
+    return frozenset(codepoints)
+
+
+def _coverage(font_name: str) -> frozenset[int] | None:
+    """
+    Every codepoint `font_name` has a glyph for, or None if it cannot be told.
+
+    Two kinds of font answer differently. An embedded TrueType face knows its
+    own cmap, so the question is exact. A base-14 Type 1 face draws through an
+    8-bit encoding, and what it can show is whatever that encoding's 256 slots
+    name -- which is why Helvetica has a glyph for "š" but not for "ě", the
+    difference the Czech bug report came down to.
+
+    A CID font answers None: its coverage is not a table this can read, and
+    None means "do not second-guess this one".
+    """
+    if font_name in _font_coverage:
+        return _font_coverage[font_name]
+
+    coverage: frozenset[int] | None = None
+    try:
+        font = pdfmetrics.getFont(font_name)
+    except Exception:
+        font = None
+
+    face = getattr(font, "face", None)
+    char_to_glyph = getattr(face, "charToGlyph", None)
+    if char_to_glyph is not None:
+        coverage = frozenset(char_to_glyph)
+    elif getattr(font, "encName", None) in _SYMBOLIC_CODECS:
+        coverage = _codec_coverage(_SYMBOLIC_CODECS[font.encName])
+    else:
+        vector = getattr(getattr(font, "encoding", None), "vector", None)
+        if vector is not None:
+            coverage = frozenset(
+                _glyphname2unicode[glyph]
+                for glyph in vector
+                if glyph and glyph in _glyphname2unicode
+            )
+
+    _font_coverage[font_name] = coverage
+    return coverage
+
+
+def font_has_glyph(font_name: str, char: str) -> bool:
+    """
+    Whether `font_name` can draw `char`.
+
+    True when it cannot be told, so a face whose coverage is unreadable is
+    never passed over: the worst this may do is leave a character where it
+    already was.
+    """
+    coverage = _coverage(font_name)
+    return coverage is None or ord(char) in coverage
+
+
+def split_by_coverage(text: str, font_names: Sequence[str]) -> list[tuple[str, str]]:
+    """
+    Cut `text` into the longest runs one face can draw, in declared order.
+
+    This is what a font-family list means in CSS: not "the first of these
+    that exists" but "for each character, the first of these that has it".
+    Returns (run, font name) pairs covering `text` in order.
+
+    A character no face on the list has stays with the first one, which is
+    where it would have been anyway; the caller is the one that reports it.
+    """
+    if not text or len(font_names) < 2:
+        return [(text, font_names[0])] if text and font_names else []
+
+    first = font_names[0]
+    # Nearly always the first face has every character, and a set answers
+    # that in one call where the loop below asks once per character.
+    coverage = _coverage(first)
+    if coverage is None or coverage.issuperset(map(ord, text)):
+        return [(text, first)]
+    runs: list[tuple[str, str]] = []
+    start = 0
+    current = None
+    for index, char in enumerate(text):
+        chosen = first
+        # A space has no shape, so let it stay with the run it is in rather
+        # than cutting one in two and pulling the following word's face back
+        # to the start of the line.
+        if not char.isspace():
+            for name in font_names:
+                if font_has_glyph(name, char):
+                    chosen = name
+                    break
+        elif current is not None:
+            chosen = current
+        if current is None:
+            current = chosen
+        elif chosen != current:
+            runs.append((text[start:index], current))
+            start, current = index, chosen
+    runs.append((text[start:], current or first))
+    return runs

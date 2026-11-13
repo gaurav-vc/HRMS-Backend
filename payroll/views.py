@@ -170,37 +170,56 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def execute(self, request, pk=None):
         user = request.user
-        if user.is_superuser:
-            return Response({'error': 'Super admin does not have permission to run site payroll.'}, status=403)
         emp = getattr(user, 'employee_profile', None)
         if not emp and user.email:
             from employees.models import Employee
             emp = Employee.objects.filter(email__iexact=user.email).first()
 
         can_run = False
-        if emp and emp.dynamic_role and emp.dynamic_role.permissions:
+        if user.is_superuser:
+            can_run = True
+        elif emp and emp.dynamic_role and emp.dynamic_role.permissions:
             perms = emp.dynamic_role.permissions
             if (perms.get('can_run_payroll') in [True, 'true', 'True', 1, '1'] or
-                perms.get('can_process_payroll') in [True, 'true', 'True', 1, '1']):
+                perms.get('can_process_payroll') in [True, 'true', 'True', 1, '1'] or
+                perms.get('can_approve_payroll') in [True, 'true', 'True', 1, '1']):
                 can_run = True
 
         if not can_run:
             return Response({'error': 'Permission denied. You do not have permission to run payroll.'}, status=403)
 
+        from django.db import transaction
+        from payroll.models import PayrollRun, SalaryStructure
+        from .service import PayrollService
+        import logging
+        logger = logging.getLogger('hrms.payroll')
+
         try:
-            run = self.get_object()
-            overrides = request.data.get('overrides')
-            include_variable_bonus = request.data.get('include_variable_bonus', False)
-            include_leaves_encashment = request.data.get('include_leaves_encashment', False)
-            
-            if run.status in ['Frozen', 'Disbursed']:
-                if overrides:
-                    PayrollService.file_arrears(run.id, overrides)
-                return Response({'status': 'success', 'run_status': run.status, 'msg': 'Arrears processed'})
+            with transaction.atomic():
+                run = PayrollRun.objects.select_for_update().filter(pk=pk).first()
+                if not run:
+                    return Response({'status': 'error', 'detail': 'Payroll run not found.'}, status=404)
+
+                if run.status == 'Processing':
+                    return Response({'status': 'error', 'detail': 'Payroll run is currently being processed by another task. Please wait.'}, status=400)
+
+                overrides = request.data.get('overrides')
+                include_variable_bonus = request.data.get('include_variable_bonus', False)
+                include_leaves_encashment = request.data.get('include_leaves_encashment', False)
+
+                if run.status in ['Frozen', 'Disbursed']:
+                    if overrides:
+                        PayrollService.file_arrears(run.id, overrides)
+                    return Response({'status': 'success', 'run_status': run.status, 'msg': 'Arrears processed'})
+
+                # Mark as Processing inside the atomic lock to prevent duplicate race conditions
+                run.status = 'Processing'
+                if hasattr(request, 'user') and request.user.is_authenticated:
+                    run.maker = request.user
+                run.save(update_fields=['status', 'maker'] if run.maker else ['status'])
 
             # Dynamic resolution of active salary structure for any unassigned employees
             from employees.models import Employee
-            from payroll.models import SalaryStructure
             from django.db.models import Q
             active_employees = Employee.objects.filter(
                 Q(entity=run.entity) | Q(branch__entity=run.entity) | Q(site__branch__entity=run.entity),
@@ -216,15 +235,15 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                         e.save(update_fields=['salary_structure'])
                 
             run = PayrollService.execute_run(run.id, overrides=overrides, include_variable_bonus=include_variable_bonus, include_leaves_encashment=include_leaves_encashment)
-            if hasattr(request, 'user') and request.user.is_authenticated:
-                run.maker = request.user
-                run.save()
             
             return Response({'status': 'success', 'run_status': run.status, 'msg': 'Engine started in background'})
         except Exception as e:
-            import traceback
-            tb = traceback.format_exc()
-            return Response({'status': 'error', 'message': f"CRASH: {str(e)} | Trace: {tb}"}, status=400)
+            logger.exception(f"Payroll execution failed for run {pk}: {str(e)}")
+            try:
+                PayrollRun.objects.filter(pk=pk, status='Processing').update(status='Draft')
+            except Exception:
+                pass
+            return Response({'status': 'error', 'detail': f"Payroll calculation failed: {str(e)}"}, status=400)
 
     @action(detail=False, methods=['post', 'get'])
     def validate_prerequisites(self, request):
@@ -419,20 +438,18 @@ class LoanViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     queryset = Loan.objects.all()
     serializer_class = LoanSerializer
 
-from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from djangorestframework_camel_case.parser import CamelCaseMultiPartParser, CamelCaseFormParser, CamelCaseJSONParser
 
 class ReimbursementViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Reimbursements'
     queryset = Reimbursement.objects.all()
     serializer_class = ReimbursementSerializer
-    parser_classes = (MultiPartParser, FormParser, JSONParser)
+    parser_classes = (CamelCaseMultiPartParser, CamelCaseFormParser, CamelCaseJSONParser)
 
 class SalarySlipAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        if request.user.is_superuser:
-            return Response({'error': 'Super admin does not have employee payslips'}, status=403)
         try:
             period = request.query_params.get('period')
             from .models import Payslip
@@ -440,13 +457,16 @@ class SalarySlipAPIView(APIView):
             from authentication.permissions import isolate_queryset
             
             can_view_confidential = False
-            emp_profile = getattr(user, 'employee_profile', None)
-            if emp_profile:
-                if emp_profile.dynamic_role and emp_profile.dynamic_role.permissions:
-                    perms = emp_profile.dynamic_role.permissions
-                    can_view_confidential = perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1'] or perms.get('can_view_confidential') in [True, 'true', 'True', 1, '1']
-                elif emp_profile.role in ['admin', 'org_admin'] or getattr(emp_profile, 'is_admin', False):
-                    can_view_confidential = True
+            if user.is_superuser:
+                can_view_confidential = True
+            else:
+                emp_profile = getattr(user, 'employee_profile', None)
+                if emp_profile:
+                    if emp_profile.dynamic_role and emp_profile.dynamic_role.permissions:
+                        perms = emp_profile.dynamic_role.permissions
+                        can_view_confidential = perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1'] or perms.get('can_view_confidential') in [True, 'true', 'True', 1, '1']
+                    elif emp_profile.role in ['admin', 'org_admin'] or getattr(emp_profile, 'is_admin', False):
+                        can_view_confidential = True
             
             # Determine all periods where payroll has been run or payslips exist
             from payroll.models import PayrollRun
@@ -611,18 +631,20 @@ class SalarySlipAPIView(APIView):
                 slip_net = float(slip.net)
                 
                 # Synchronize snapshot Overtime Allowance if OT was recalculated
-                ot_lines = slip.lines.filter(rule__name__icontains='overtime')
-                if ot_lines.exists() or 'Overtime Allowance' in components:
-                    old_ot_amt = sum(float(l.amount) for l in ot_lines) if ot_lines.exists() else float(components.get('Overtime Allowance', 0))
+                ot_lines = slip.lines.filter(rule__name__icontains='overtime') if slip.id else None
+                if (ot_lines is not None and ot_lines.exists()) or 'Overtime Allowance' in components:
+                    old_ot_amt = sum(float(l.amount) for l in ot_lines) if (ot_lines is not None and ot_lines.exists()) else float(components.get('Overtime Allowance', 0))
                     if total_ot_hours == 0:
-                        ot_lines.delete()
+                        if ot_lines is not None:
+                            ot_lines.delete()
                         components.pop('Overtime Allowance', None)
                         components.pop('Overtime Pay', None)
                         components.pop('Overtime', None)
                         if old_ot_amt > 0:
                             slip_gross = max(0.0, slip_gross - old_ot_amt)
                             slip_net = max(0.0, slip_net - old_ot_amt)
-                            Payslip.objects.filter(id=slip.id).update(gross=slip_gross, net=slip_net)
+                            if slip.id:
+                                Payslip.objects.filter(id=slip.id).update(gross=slip_gross, net=slip_net)
                     else:
                         basic_amt = 0.0
                         for c_name, c_val in components.items():
@@ -655,12 +677,14 @@ class SalarySlipAPIView(APIView):
                         hourly_rate = (basic_amt / float(calc_days or 30)) / day_hours
                         new_ot_amt = round(hourly_rate * ot_mult * total_ot_hours, 2)
                         if abs(new_ot_amt - old_ot_amt) > 0.01:
-                            ot_lines.update(amount=new_ot_amt)
+                            if ot_lines is not None:
+                                ot_lines.update(amount=new_ot_amt)
                             components['Overtime Allowance'] = new_ot_amt
                             diff = new_ot_amt - old_ot_amt
                             slip_gross = max(0.0, slip_gross + diff)
                             slip_net = max(0.0, slip_net + diff)
-                            Payslip.objects.filter(id=slip.id).update(gross=slip_gross, net=slip_net)
+                            if slip.id:
+                                Payslip.objects.filter(id=slip.id).update(gross=slip_gross, net=slip_net)
 
                 for k in list(components.keys()):
                     components[k] = float(components[k])
@@ -1226,11 +1250,9 @@ class PayrollPreviewAPIView(APIView):
 
 from .models import Form16Document
 from .serializers import Form16DocumentSerializer
-from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
-
 class Form16DocumentViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
-    parser_classes = (MultiPartParser, FormParser, JSONParser)
+    parser_classes = (CamelCaseMultiPartParser, CamelCaseFormParser, CamelCaseJSONParser)
     queryset = Form16Document.objects.all().order_by('-uploaded_at')
     serializer_class = Form16DocumentSerializer
 
@@ -1239,9 +1261,9 @@ class Form16DocumentViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         user = self.request.user
         emp = getattr(user, 'employee_profile', None)
         
-        # Super admin cannot view site employee Form 16s
+        # Super admin and org admins can view all Form 16 documents
         if user.is_superuser:
-            return qs.none()
+            return qs
             
         if emp and emp.role in ['org_admin', 'admin']:
             return qs
@@ -1335,7 +1357,7 @@ class ImportCTCTemplateView(APIView):
 class ImportCTCAPIView(APIView):
     rbac_module = 'Import CTC'
     permission_classes = [IsAuthenticated]
-    parser_classes = [MultiPartParser]
+    parser_classes = [CamelCaseMultiPartParser, CamelCaseFormParser, CamelCaseJSONParser]
 
     def post(self, request, *args, **kwargs):
         file = request.FILES.get('file')
@@ -1403,7 +1425,8 @@ class ImportCTCAPIView(APIView):
             struct_name = row.get('Salary Structure', '').strip()
             if struct_name:
                 from payroll.models import SalaryStructure
-                struct = SalaryStructure.objects.filter(name__iexact=struct_name).first()
+                struct_qs = isolate_queryset(SalaryStructure.objects.all(), request.user)
+                struct = struct_qs.filter(name__iexact=struct_name).first()
                 if struct:
                     emp.salary_structure = struct
                     updated_fields.append('salary_structure')

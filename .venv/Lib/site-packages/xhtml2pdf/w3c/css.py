@@ -1,0 +1,1586 @@
+# Copyright (C) 2002-2004  TechGame Networks, LLC.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the BSD style License as found in the
+# LICENSE file included with this distribution.
+#
+#  Modified by Dirk Holtwick <holtwick@web.de>, 2007-2008
+
+"""
+CSS-2.1 engine
+
+Primary classes:
+    * CSSElementInterfaceAbstract
+        Provide a concrete implementation for the XML element model used.
+
+    * CSSCascadeStrategy
+        Implements the CSS-2.1 engine's attribute lookup rules.
+
+    * CSSParser
+        Parses CSS source forms into usable results using CSSBuilder and
+        CSSMutableSelector.  You may want to override parseExternal()
+
+    * CSSBuilder (and CSSMutableSelector)
+        A concrete implementation for cssParser.CSSBuilderAbstract (and
+        cssParser.CSSSelectorAbstract) to provide usable results to
+        CSSParser requests.
+
+Dependencies:
+    sets, cssParser, re (via cssParser)
+"""
+from __future__ import annotations
+
+import contextvars
+import copy
+import itertools
+import re
+from abc import abstractmethod
+from operator import itemgetter
+from pathlib import Path
+from typing import ClassVar, NamedTuple
+
+from xhtml2pdf.w3c import cssParser, cssSpecial
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ To replace any for with list comprehension
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+def stopIter(value):
+    raise StopIteration(*value)
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ Constants / Variables / Etc.
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+CSSParseError = cssParser.CSSParseError
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ Definitions
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class CSSElementInterfaceAbstract:
+    @abstractmethod
+    def getAttr(self, name, default=NotImplemented):
+        raise NotImplementedError
+
+    def getIdAttr(self):
+        return self.getAttr("id", "")
+
+    def getClassAttr(self):
+        return self.getAttr("class", "")
+
+    @abstractmethod
+    def getInlineStyle(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def matchesNode(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def inPseudoState(self, name, params=()):
+        raise NotImplementedError
+
+    @abstractmethod
+    def iterXMLParents(self):
+        """Results must be compatible with CSSElementInterfaceAbstract."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def getPreviousSibling(self):
+        """Results must be compatible with CSSElementInterfaceAbstract."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def iterPrecedingSiblings(self):
+        """Results must be compatible with CSSElementInterfaceAbstract."""
+        raise NotImplementedError
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class CSSCascadeStrategy:
+    author = None
+    user = None
+    userAgenr = None
+
+    def __init__(self, author=None, user=None, userAgent=None) -> None:
+        if author is not None:
+            self.author = author
+        if user is not None:
+            self.user = user
+        if userAgent is not None:
+            self.userAgenr = userAgent
+        self.propertyNames = self._collectPropertyNames()
+
+    def _collectPropertyNames(self) -> frozenset:
+        """
+        Every property name any of these rulesets declares.
+
+        Searching for a name no rule mentions can only come back empty, and
+        that search walks five rulesets and every selector in them. The
+        rulesets are complete by the time a cascade is built -- mergeStyles is
+        called while the stylesheet is being assembled, and copyWithUpdate
+        builds a new instance -- so this cannot go stale.
+        """
+        names: set[str] = set()
+        for level in (self.userAgenr, self.user, self.author):
+            if level is None:
+                continue
+            for ruleset in level:
+                for declarations in ruleset.values():
+                    names.update(declarations)
+        return frozenset(names)
+
+    def hasPseudoRules(self, pseudo: str) -> bool:
+        """
+        Whether any rule of the cascade is for that pseudo-element.
+
+        Asked twice for every element, and the rulesets are complete by the
+        time a cascade is built (see _collectPropertyNames), so the answer
+        is kept.
+        """
+        known = self.__dict__.setdefault("_pseudoRules", {})
+        if pseudo not in known:
+            known[pseudo] = any(
+                ruleset.hasPseudoRules(pseudo)
+                for level in (self.userAgenr, self.user, self.author)
+                if level is not None
+                for ruleset in level
+            )
+        return known[pseudo]
+
+    def copyWithUpdate(self, author=None, user=None, userAgent=None):
+        if author is None:
+            author = self.author
+        if user is None:
+            user = self.user
+        if userAgent is None:
+            userAgent = self.userAgenr
+        return type(self)(author, user, userAgent)
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def iterCSSRulesets(self, inline=None):
+        if self.userAgenr is not None:
+            yield self.userAgenr[0]
+            yield self.userAgenr[1]
+
+        if self.user is not None:
+            yield self.user[0]
+
+        if self.author is not None:
+            yield self.author[0]
+            yield self.author[1]
+
+        if inline:
+            yield inline[0]
+            yield inline[1]
+
+        if self.user is not None:
+            yield self.user[1]
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def findStyleFor(self, element, attrName, default=NotImplemented):
+        """
+        Attempts to find the style setting for attrName in the CSSRulesets.
+
+        Note: This method does not attempt to resolve rules that return
+        "inherited", "default", or values that have units (including "%").
+        This is left up to the client app to re-query the CSS in order to
+        implement these semantics.
+        """
+        # An inline style is consulted by the caller after this returns, so
+        # skipping the search here cannot lose one.
+        rule = (
+            self.findCSSRulesFor(element, attrName)
+            if attrName in self.propertyNames
+            else []
+        )
+        return self._extractStyleForRule(rule, attrName, default)
+
+    def findStylesForEach(self, element, attrNames, default=NotImplemented):
+        """
+        The winning value of each of attrNames, as (name, value) pairs.
+
+        Note: This method does not attempt to resolve rules that return
+        "inherited", "default", or values that have units (including "%").
+        This is left up to the client app to re-query the CSS in order to
+        implement these semantics.
+        """
+        resolved = self.findStylesForElement(element, attrNames)
+        return [
+            (
+                attrName,
+                (
+                    resolved[attrName]
+                    if attrName in resolved
+                    else self._noStyleFound(attrName, default)
+                ),
+            )
+            for attrName in attrNames
+        ]
+
+    def _levels(self, element):
+        """
+        The rulesets that apply to `element`, weakest first.
+
+        A pair's index 1 holds its !important declarations. Which level a rule
+        came from is what separates rules of equal specificity, so it is
+        carried into the sort key -- relying on a stable sort to keep it would
+        lose the !important user declarations at the end, whose selectors were
+        written early and so sort early by source order.
+
+        Every way of reading this cascade goes through here, so the order is
+        defined once rather than once per method.
+        """
+        inline = element.getInlineStyle()
+
+        levels = []
+        if self.userAgenr is not None:
+            levels += [self.userAgenr[0], self.userAgenr[1]]
+        if self.user is not None:
+            levels.append(self.user[0])
+        if self.author is not None:
+            levels += [self.author[0], self.author[1]]
+        if inline:
+            levels += [inline[0], inline[1]]
+        if self.user is not None:
+            levels.append(self.user[1])
+        return levels
+
+    def findCSSRulesFor(self, element, attrName):
+        decorated = []
+        for level, ruleset in enumerate(self._levels(element)):
+            for rule in ruleset.findCSSRuleFor(element, attrName):
+                selector = rule[0]
+                key = (selector.specificity(), level, selector.order)
+                decorated.append((key, rule))
+
+        decorated.sort(key=itemgetter(0))
+        return [rule for _key, rule in decorated]
+
+    def findStylesForElement(self, element, attrNames):
+        """
+        The winning value of every name in attrNames, in one pass.
+
+        Each candidate selector is evaluated once and the rules it brings are
+        spread across whichever of the wanted names they declare, rather than
+        walking the whole cascade once per name.
+
+        The winner is the same (specificity, level, order) key findCSSRulesFor
+        sorts by. Keeping the maximum is equivalent to sorting and taking the
+        last, because `order` is unique per selector and so the key is a total
+        order.
+
+        A name no rule gives a value to is absent from the result, which is how
+        the caller tells "nothing said anything" from "something said None".
+        """
+        wanted = self.propertyNames.intersection(attrNames)
+        if not wanted:
+            return {}
+
+        best: dict[str, tuple[tuple, object]] = {}
+        for level, ruleset in enumerate(self._levels(element)):
+            for selector, declarations in ruleset.findMatchingRules(element):
+                declared = wanted.intersection(declarations)
+                if not declared:
+                    continue
+                key = (selector.specificity(), level, selector.order)
+                for name in declared:
+                    previous = best.get(name)
+                    if previous is None or previous[0] < key:
+                        best[name] = (key, declarations[name])
+        return {name: value for name, (_key, value) in best.items()}
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    @staticmethod
+    def _noStyleFound(attrName, default=NotImplemented):
+        if default is not NotImplemented:
+            return default
+        msg = f"Could not find style for '{attrName}'"
+        raise LookupError(msg)
+
+    @classmethod
+    def _extractStyleForRule(cls, rule, attrName, default=NotImplemented):
+        if rule:
+            # rule is packed in a list to differentiate from "no rule" vs "rule
+            # whose value evaluates as False"
+            style = rule[-1][1]
+            return style[attrName]
+        return cls._noStyleFound(attrName, default)
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ CSS Selectors
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+#: an+b, the argument of :nth-child() and its relatives. CSS Selectors 3 6.6.5.
+_NTH_PATTERN = re.compile(r"^(?:([+-]?\d*)n)?\s*([+-]?\s*\d+)?$")
+
+
+def _flatten_params(params) -> str:
+    """
+    The argument of a functional pseudo-class, as one string.
+
+    The parser hands it over already broken into terms, and how it breaks it
+    depends on the spelling: "odd" arrives as ("odd",), "2n+1" as
+    (("2", "n"), "+", "1"), "-n + 3" as ("-n", "+", "3"). Reassembling and
+    matching one pattern is steadier than reading each of those shapes.
+    """
+    parts = []
+    for param in params:
+        if isinstance(param, tuple | list):
+            parts.append(_flatten_params(param))
+        else:
+            parts.append(str(param))
+    return "".join(parts).replace(" ", "").lower()
+
+
+def _parse_nth(params) -> tuple[int, int] | None:
+    """Turn an an+b argument into (a, b), or None if it is not one."""
+    text = _flatten_params(params)
+    if text == "odd":
+        return (2, 1)
+    if text == "even":
+        return (2, 0)
+
+    match = _NTH_PATTERN.match(text)
+    if not match or not text:
+        return None
+    coefficient, constant = match.groups()
+    if coefficient is None:
+        # A plain number: b on its own, matching one position.
+        return (0, int(constant)) if constant else None
+    if coefficient in {"", "+"}:
+        a = 1
+    elif coefficient == "-":
+        a = -1
+    else:
+        a = int(coefficient)
+    return (a, int(constant) if constant else 0)
+
+
+def _matches_nth(index: int, a: int, b: int) -> bool:
+    """Whether a 1-based position satisfies an+b for some whole n >= 0."""
+    if a == 0:
+        return index == b
+    offset = index - b
+    return offset % a == 0 and offset // a >= 0
+
+
+#: The element a :has() is being matched for, which the anchor its arguments
+#: are read against (cssParser.HAS_ANCHOR) matches. Unset, it matches nothing.
+_scope: contextvars.ContextVar = contextvars.ContextVar("css_scope", default=None)
+
+#: Pseudo-elements. They count as an element in specificity, where a
+#: pseudo-class counts as a class. Only those in GENERATED_PSEUDO_ELEMENTS
+#: ever match; nothing lays out ::first-line or ::first-letter.
+PSEUDO_ELEMENTS = frozenset(
+    {
+        "before",
+        "after",
+        "first-line",
+        "first-letter",
+        "marker",
+        "placeholder",
+        "selection",
+    }
+)
+
+
+#: The pseudo-elements whose content is generated: a selector naming one
+#: matches only when the style of that pseudo-element is asked for, written
+#: with one colon (CSS 2) or two.
+GENERATED_PSEUDO_ELEMENTS = frozenset({"before", "after"})
+
+
+def _pseudoElementOf(qualifiers) -> str | None:
+    """The generated pseudo-element these qualifiers of a subject name, if any."""
+    for qualifier in qualifiers:
+        if (
+            isinstance(qualifier, CSSSelectorPseudoQualifier)
+            and qualifier.name in GENERATED_PSEUDO_ELEMENTS
+        ):
+            return qualifier.name
+    return None
+
+
+#: Hands out a source-order number to each selector as it is built. Parsing
+#: runs in document order, and the user agent stylesheet is parsed before the
+#: document's own, so a later number means later in the cascade.
+_selector_order = itertools.count()
+
+
+class CSSSelectorBase:
+    inline = False
+    _hash = None
+    _specificity = None
+
+    def __init__(self, completeName="*") -> None:
+        if not isinstance(completeName, tuple):
+            completeName = (None, "*", completeName)
+        self.completeName = completeName
+        self.order = next(_selector_order)
+
+    def sortKey(self):
+        """
+        How two rules that both match an element are ordered.
+
+        CSS 2.1 6.4.1: specificity decides, and where that ties the rule
+        written later wins. Rules used to be sorted by
+        (specificity, fullName, qualifiers) instead, which for equal
+        specificity is alphabetical order of the tag and its qualifiers -- so
+        `.alpha` beat `.zebra` no matter which was written last.
+        """
+        return (self.specificity(), self.order)
+
+    def _updateHash(self):
+        self._hash = hash((self.fullName, self.specificity(), self.qualifiers))
+
+    def __hash__(self):
+        if self._hash is None:
+            return object.__hash__(self)
+        return self._hash
+
+    @property
+    def nsPrefix(self):
+        return self.completeName[0]
+
+    @property
+    def name(self):
+        return self.completeName[2]
+
+    @property
+    def namespace(self):
+        return self.completeName[1]
+
+    @property
+    def fullName(self):
+        return self.completeName[1:3]
+
+    def __repr__(self) -> str:
+        strArgs = (type(self).__name__, *self.specificity(), self.asString())
+        return "<%s %d:%d:%d:%d %s >" % strArgs
+
+    def __str__(self) -> str:
+        return self.asString()
+
+    def _as_comparison_key(self):
+        return (self.specificity(), self.fullName, self.qualifiers)
+
+    def __eq__(self, other):
+        return self._as_comparison_key() == other._as_comparison_key()
+
+    def __lt__(self, other):
+        return self._as_comparison_key() < other._as_comparison_key()
+
+    def specificity(self):
+        if self._specificity is None:
+            self._specificity = self._calcSpecificity()
+        return self._specificity
+
+    def _calcSpecificity(self):
+        """
+        Selectors 4, 17: ids, then classes, attributes and pseudo-classes,
+        then types and pseudo-elements. A pseudo-class used to count as a
+        type, so p:first-child lost to .x p, which it ties.
+        """
+        hashCount = 0
+        qualifierCount = 0
+        elementCount = int(self.name != "*")
+        for qualifier in self.qualifiers:
+            if qualifier.isHash():
+                hashCount += 1
+            elif qualifier.isClass() or qualifier.isAttr():
+                qualifierCount += 1
+            elif isinstance(qualifier, CSSSelectorLogicalQualifier):
+                h, q, e = qualifier.specificity()
+                hashCount += h
+                qualifierCount += q
+                elementCount += e
+            elif qualifier.isPseudo():
+                if qualifier.name in PSEUDO_ELEMENTS:
+                    elementCount += 1
+                else:
+                    qualifierCount += 1
+            elif qualifier.isCombiner():
+                i, h, q, e = qualifier.selector.specificity()
+                hashCount += h
+                qualifierCount += q
+                elementCount += e
+        return self.inline, hashCount, qualifierCount, elementCount
+
+    def matches(self, element=None):
+        if element is None:
+            return False
+
+        # with  CSSDOMElementInterface.matchesNode(self, (namespace, tagName)) replacement:
+        if self.fullName[1] not in {"*", element.domElement.tagName}:
+            return False
+        if self.nsPrefix == "":  # noqa: PLC1901 -- None, no prefix, is not this
+            # "|p": an element in no namespace (CSS Namespaces 3). This used
+            # to be read as any namespace, the same as "*|p".
+            if element.domElement.namespaceURI:
+                return False
+        elif (
+            self.fullName[0] not in {None, "", "*"}
+            and self.fullName[0] != element.domElement.namespaceURI
+        ):
+            return False
+
+        return all(qualifier.matches(element) for qualifier in self.qualifiers)
+
+    def asString(self):
+        result = []
+        if self.nsPrefix is not None:
+            result.append(f"{self.nsPrefix}|{self.name}")
+        else:
+            result.append(self.name)
+
+        for q in self.qualifiers:
+            if q.isCombiner():
+                result.insert(0, q.asString())
+            else:
+                result.append(q.asString())
+        return "".join(result)
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class CSSInlineSelector(CSSSelectorBase):
+    inline = True
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class CSSMutableSelector(CSSSelectorBase, cssParser.CSSSelectorAbstract):
+    qualifiers: ClassVar[list] = []
+
+    def asImmutable(self):
+        return CSSImmutableSelector(
+            self.completeName, [q.asImmutable() for q in self.qualifiers]
+        )
+
+    @staticmethod
+    def combineSelectors(selectorA, op, selectorB):
+        selectorB.addCombination(op, selectorA)
+        return selectorB
+
+    def addCombination(self, op, other):
+        self._addQualifier(CSSSelectorCombinationQualifier(op, other))
+
+    def addHashId(self, hashId):
+        self._addQualifier(CSSSelectorHashQualifier(hashId))
+
+    def addClass(self, class_):
+        self._addQualifier(CSSSelectorClassQualifier(class_))
+
+    def addAttribute(self, attrName):
+        self._addQualifier(CSSSelectorAttributeQualifier(attrName))
+
+    def addAttributeOperation(self, attrName, op, attr_value, flag=None):
+        self._addQualifier(
+            CSSSelectorAttributeQualifier(attrName, op, attr_value, flag=flag)
+        )
+
+    def addPseudo(self, name):
+        self._addQualifier(CSSSelectorPseudoQualifier(name))
+
+    def addPseudoFunction(self, name, params):
+        self._addQualifier(CSSSelectorPseudoQualifier(name, params))
+
+    def addLogicalPseudo(self, name, selectors, nth=None):
+        if nth is not None:
+            parsed = _parse_nth((nth,))
+            if parsed is None:
+                msg = f"Invalid An+B in :{name}()"
+                raise cssParser.CSSParseError(msg, nth)
+            nth = parsed
+        self._addQualifier(CSSSelectorLogicalQualifier(name, selectors, nth))
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def _addQualifier(self, qualifier):
+        if self.qualifiers:
+            self.qualifiers.append(qualifier)
+        else:
+            self.qualifiers = [qualifier]
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class CSSImmutableSelector(CSSSelectorBase):
+    def __init__(self, completeName="*", qualifiers=()) -> None:
+        # print completeName, qualifiers
+        self.qualifiers = tuple(qualifiers)
+        super().__init__(completeName)
+        self._updateHash()
+
+    @classmethod
+    def fromSelector(cls, selector):
+        immutable = cls(selector.completeName, selector.qualifiers)
+        # Keep where the rule was written, rather than when this copy was made.
+        immutable.order = selector.order
+        return immutable
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ CSS Selector Qualifiers -- see CSSImmutableSelector
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class CSSSelectorQualifierBase:
+    @staticmethod
+    def isHash():
+        return False
+
+    @staticmethod
+    def isClass():
+        return False
+
+    @staticmethod
+    def isAttr():
+        return False
+
+    @staticmethod
+    def isPseudo():
+        return False
+
+    @staticmethod
+    def isCombiner():
+        return False
+
+    def asImmutable(self):
+        return self
+
+    @abstractmethod
+    def asString(self):
+        raise NotImplementedError
+
+    def __str__(self) -> str:
+        return self.asString()
+
+
+class CSSSelectorHashQualifier(CSSSelectorQualifierBase):
+    def __init__(self, hashId) -> None:
+        self.hashId = hashId
+
+    @staticmethod
+    def isHash():
+        return True
+
+    def __hash__(self):
+        return hash((self.hashId,))
+
+    def asString(self):
+        return f"#{self.hashId}"
+
+    def matches(self, element):
+        return element.getIdAttr() == self.hashId
+
+    def __eq__(self, other):
+        return self.hashId == other.hashId
+
+    def __lt__(self, other):
+        return self.hashId < other.hashId
+
+
+class CSSSelectorClassQualifier(CSSSelectorQualifierBase):
+    def __init__(self, classId) -> None:
+        self.classId = classId
+
+    @staticmethod
+    def isClass():
+        return True
+
+    def __hash__(self):
+        return hash((self.classId,))
+
+    def asString(self):
+        return f".{self.classId}"
+
+    def matches(self, element):
+        # return self.classId in element.getClassAttr().split()
+        attr_value = element.domElement.attributes.get("class")
+        if attr_value is not None:
+            return self.classId in attr_value.value.split()
+        return False
+
+    def __eq__(self, other):
+        return self.classId == other.classId
+
+    def __lt__(self, other):
+        return self.classId < other.classId
+
+
+#: HTML 4.2.6 ("case-sensitivity of selectors"): on an HTML element, these
+#: attributes' values are matched ignoring ASCII case unless the selector says
+#: "s", so [type=text] selects <input type="TEXT"> as in a browser.
+HTML_CASE_INSENSITIVE_ATTRIBUTES = frozenset(
+    [
+        "accept",
+        "accept-charset",
+        "align",
+        "alink",
+        "axis",
+        "bgcolor",
+        "charset",
+        "checked",
+        "clear",
+        "codetype",
+        "color",
+        "compact",
+        "declare",
+        "defer",
+        "dir",
+        "direction",
+        "disabled",
+        "enctype",
+        "face",
+        "frame",
+        "hreflang",
+        "http-equiv",
+        "lang",
+        "language",
+        "link",
+        "media",
+        "method",
+        "multiple",
+        "nohref",
+        "noresize",
+        "noshade",
+        "nowrap",
+        "readonly",
+        "rel",
+        "rev",
+        "rules",
+        "scope",
+        "scrolling",
+        "selected",
+        "shape",
+        "target",
+        "text",
+        "type",
+        "valign",
+        "valuetype",
+        "vlink",
+    ]
+)
+#: The namespace html5lib puts HTML elements in; SVG and MathML are elsewhere.
+XHTML_NAMESPACE = "http://www.w3.org/1999/xhtml"
+
+
+class CSSSelectorAttributeQualifier(CSSSelectorQualifierBase):
+    name, op, value = None, None, NotImplemented
+    #: "i" to compare ignoring case, as [type=text i]; "s" or None with it.
+    flag = None
+
+    def __init__(
+        self, attrName, op=None, attr_value=NotImplemented, *, flag=None
+    ) -> None:
+        self.name = attrName
+        if op is not self.op:
+            self.op = op
+        if attr_value is not self.value:
+            self.value = attr_value
+        self.flag = flag
+
+    @staticmethod
+    def isAttr():
+        return True
+
+    def __hash__(self):
+        return hash((self.name, self.op, self.value, self.flag))
+
+    def asString(self):
+        if self.value is NotImplemented:
+            return f"[{self.name}]"
+        flag = f" {self.flag}" if self.flag else ""
+        return f"[{self.name}{self.op}{self.value}{flag}]"
+
+    def matches(self, element):
+        if self.op is None:
+            return element.getAttr(self.name, NotImplemented) != NotImplemented
+        value = element.getAttr(self.name, None)
+        if value is None:
+            return False
+        expected = self.value
+        if self._ignoresCase(element):
+            value, expected = value.casefold(), expected.casefold()
+        if self.op == "=":
+            return value == expected
+        if self.op == "~=":
+            return expected in value.split()
+        if self.op == "|=":
+            # The value or a prefix of it up to a "-": "en" matches "en-GB",
+            # but "GB" does not. This used to match any "-" separated part.
+            return value == expected or value.startswith(expected + "-")
+        # Selectors 3: an empty value matches nothing for these three.
+        if self.op == "^=":
+            return bool(expected) and value.startswith(expected)
+        if self.op == "$=":
+            return bool(expected) and value.endswith(expected)
+        if self.op == "*=":
+            return bool(expected) and expected in value
+        msg = f"Unknown operator {self.op!r} for {self!r}"
+        raise RuntimeError(msg)
+
+    def _ignoresCase(self, element):
+        if self.flag is not None:
+            return self.flag == "i"
+        return (
+            isinstance(self.name, str)
+            and self.name.lower() in HTML_CASE_INSENSITIVE_ATTRIBUTES
+            and element.domElement.namespaceURI in {None, XHTML_NAMESPACE}
+        )
+
+
+class CSSSelectorPseudoQualifier(CSSSelectorQualifierBase):
+    def __init__(self, attrName, params=()) -> None:
+        self.name = attrName
+        self.params = tuple(params)
+
+    @staticmethod
+    def isPseudo():
+        return True
+
+    def __hash__(self):
+        return hash((self.name, self.params))
+
+    def asString(self):
+        if not self.params:
+            return f":{self.name}"
+        return f":{self.name}({_flatten_params(self.params)})"
+
+    def matches(self, element):
+        if self.name in GENERATED_PSEUDO_ELEMENTS:
+            return getattr(element, "pseudoElement", None) == self.name
+        return element.inPseudoState(self.name, self.params)
+
+
+class CSSSelectorLogicalQualifier(CSSSelectorQualifierBase):
+    """
+    A pseudo-class whose argument is a list of selectors (Selectors 4):
+    :not(), :is(), :where(), :has(), and :nth-child() or :nth-last-child()
+    with "An+B of S", for which nth is (A, B). Before, their argument was
+    read as a value, failed, and took the whole rule with it.
+    """
+
+    def __init__(self, name, selectors, nth=None) -> None:
+        self.name = name
+        self.selectors = tuple(selectors)
+        self.nth = nth
+
+    @staticmethod
+    def isPseudo():
+        return True
+
+    def __hash__(self):
+        return hash((self.name, self.selectors, self.nth))
+
+    def asImmutable(self):
+        return type(self)(
+            self.name, [selector.asImmutable() for selector in self.selectors], self.nth
+        )
+
+    def asString(self):
+        arguments = ", ".join(selector.asString() for selector in self.selectors)
+        if self.nth is not None:
+            a, b = self.nth
+            arguments = f"{a}n{b:+d} of {arguments}"
+        return f":{self.name}({arguments})"
+
+    def specificity(self):
+        """
+        That of the most specific argument, and none at all for :where().
+        :nth-child(An+B of S) is a pseudo-class besides.
+        """
+        if self.name == "where" or not self.selectors:
+            best = (0, 0, 0)
+        else:
+            best = max(selector.specificity()[1:] for selector in self.selectors)
+        if self.name == "has":
+            # Each argument was read as ":-pdf-has-anchor > ...", and that
+            # pseudo-class is not the author's.
+            best = (best[0], best[1] - 1, best[2])
+        if self.nth is not None:
+            best = (best[0], best[1] + 1, best[2])
+        return best
+
+    def matches(self, element):
+        if self.name == "not":
+            return not any(selector.matches(element) for selector in self.selectors)
+        if self.name in {"is", "where"}:
+            return any(selector.matches(element) for selector in self.selectors)
+        if self.name == "has":
+            return self._hasMatch(element)
+        if self.nth is not None:
+            return self._nthMatch(element)
+        return False
+
+    @staticmethod
+    def _anchor(selector):
+        """The combinator next to the anchor of a :has() argument: " ", ">", "+" or "~"."""
+        op = " "
+        while True:
+            links = [
+                q
+                for q in selector.qualifiers
+                if isinstance(q, CSSSelectorCombinationQualifier)
+            ]
+            if not links:
+                return op
+            op, selector = links[0].op, links[0].selector
+
+    def _hasMatch(self, element):
+        # Only the element's descendants can match "img" or "> img", and only
+        # its following siblings and their descendants "+ p" or "~ p".
+        # Gathering both for every element made a long table quadratic.
+        anchors = {self._anchor(selector) for selector in self.selectors}
+        node = element.domElement
+        candidates = []
+        if anchors & {" ", ">"}:
+            candidates.extend(node.getElementsByTagName("*"))
+        if anchors & {"+", "~"}:
+            sibling = node.nextSibling
+            while sibling is not None:
+                if sibling.nodeType == sibling.ELEMENT_NODE:
+                    candidates.append(sibling)
+                    candidates.extend(sibling.getElementsByTagName("*"))
+                sibling = sibling.nextSibling
+        token = _scope.set(node)
+        try:
+            wrap = type(element)
+            return any(
+                selector.matches(wrap(candidate))
+                for candidate in candidates
+                for selector in self.selectors
+            )
+        finally:
+            _scope.reset(token)
+
+    def _nthMatch(self, element):
+        if not any(selector.matches(element) for selector in self.selectors):
+            return False
+        wrap = type(element)
+        counted = [
+            sibling
+            for sibling in element._siblingElements(same_type=False)
+            if any(selector.matches(wrap(sibling)) for selector in self.selectors)
+        ]
+        index = counted.index(element.domElement) + 1
+        if self.name == "nth-last-child":
+            index = len(counted) - index + 1
+        return _matches_nth(index, *self.nth)
+
+
+class CSSSelectorCombinationQualifier(CSSSelectorQualifierBase):
+    def __init__(self, op, selector) -> None:
+        self.op = op
+        self.selector = selector
+
+    @staticmethod
+    def isCombiner():
+        return True
+
+    def __hash__(self):
+        return hash((self.op, self.selector))
+
+    def asImmutable(self):
+        return type(self)(self.op, self.selector.asImmutable())
+
+    def asString(self):
+        return f"{self.selector.asString()}{self.op}"
+
+    def matches(self, element):
+        op, selector = self.op, self.selector
+        if op == " ":
+            return any(selector.matches(parent) for parent in element.iterXMLParents())
+        if op == ">":
+            parent = next(element.iterXMLParents(), None)
+            if parent is None:
+                return False
+            return selector.matches(parent)
+        if op == "+":
+            return selector.matches(element.getPreviousSibling())
+        if op == "~":
+            return any(
+                selector.matches(sibling) for sibling in element.iterPrecedingSiblings()
+            )
+        return None
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ CSS Misc
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class CSSString(str):
+    """
+    A quoted string, which CSS tells apart from a keyword: in ``content``,
+    "none" is four letters to draw and none is nothing at all.
+    """
+
+    __slots__ = ()
+
+
+class CSSTerminalFunction:
+    #: The source it was written in (see CSSParser.sourceName), for the
+    #: warning that drops a function nothing can evaluate.
+    source: str | None = None
+
+    def __init__(self, name, params) -> None:
+        self.name = name
+        self.params = [
+            param if isinstance(param, str) else str(param) for param in params
+        ]
+
+    def __repr__(self) -> str:
+        return "<CSS function: {}({})>".format(self.name, ", ".join(self.params))
+
+
+class CSSTerminalOperator(tuple):
+    __slots__ = ()
+
+    def __new__(cls, *args):
+        return tuple.__new__(cls, args)
+
+    def __repr__(self) -> str:
+        return "op" + tuple.__repr__(self)
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ CSS Objects
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class CSSDeclarations(dict):  # noqa: PLW1641
+    def __eq__(self, other):
+        return False
+
+    def __lt__(self, other):
+        return False
+
+
+#: Shared empty bucket, so a miss does not allocate one per lookup.
+_NO_RULES: list = []
+
+
+def _bucketFor(selector):
+    """
+    The condition to file `selector` under, as (field of _RulesetIndex, key).
+
+    The most selective part of the selector that constrains the element it
+    applies to: an id, failing that a class, failing that a tag name. Only the
+    subject's own qualifiers count -- a combinator like `#main .x p` carries
+    `#main` as a constraint on an *ancestor*, so what it says about the element
+    itself is only `p`. (None, None) means nothing can be required in advance.
+
+    The tag is used exactly as written, without lowercasing, because that is
+    how CSSSelectorBase.matches compares it.
+    """
+    qualifiers = getattr(selector, "qualifiers", ())
+    for qualifier in qualifiers:
+        if qualifier.isHash():
+            return "byId", qualifier.hashId
+    for qualifier in qualifiers:
+        if qualifier.isClass():
+            return "byClass", qualifier.classId
+    name = getattr(selector, "name", "*")
+    if name != "*":
+        return "byTag", name
+    return None, None
+
+
+class _RulesetIndex(NamedTuple):
+    """
+    A ruleset's rules, filed under a condition the element has to meet.
+
+    A selector matches only an element that satisfies every part of it, so any
+    one part is enough to rule it out without evaluating it. An element is
+    then resolved against the rules in its own few buckets, plus `universal`
+    for the rules that can apply to anything, rather than against the whole
+    stylesheet.
+
+    `attrNames` is every property name the ruleset declares anywhere, which
+    answers the more common question -- does this stylesheet say anything at
+    all about `orphans`? -- without touching a bucket.
+    """
+
+    byId: dict[str, list]
+    byClass: dict[str, list]
+    byTag: dict[str, list]
+    universal: list
+    attrNames: frozenset[str]
+    #: The rules for a generated pseudo-element, by its name. Kept out of
+    #: the buckets above: an element never matches them, and the few there
+    #: are need no narrowing when its ::before is asked for.
+    pseudo: dict[str, list]
+
+
+class CSSRuleset(dict):
+    #: Rebuilt on demand after any change. See _buildIndex.
+    _index: _RulesetIndex | None = None
+
+    def _buildIndex(self) -> _RulesetIndex:
+        """
+        File every rule under a condition its element has to meet.
+
+        Read out of self.items() rather than accumulated as rules arrive: a
+        dict keeps the key object it was given first, so a selector written
+        twice keeps the source order of the first. Reading the mapping back
+        inherits that; watching insertions would not.
+        """
+        index = _RulesetIndex({}, {}, {}, [], frozenset(), {})
+        attrNames: set[str] = set()
+        for selector, declarations in self.items():
+            attrNames.update(declarations)
+            pseudo = _pseudoElementOf(getattr(selector, "qualifiers", ()))
+            if pseudo is not None:
+                index.pseudo.setdefault(pseudo, []).append((selector, declarations))
+                continue
+            kind, key = _bucketFor(selector)
+            if kind is None:
+                index.universal.append((selector, declarations))
+            else:
+                getattr(index, kind).setdefault(key, []).append(
+                    (selector, declarations)
+                )
+        index = index._replace(attrNames=frozenset(attrNames))
+        self._index = index
+        return index
+
+    def _candidatesFor(self, element):
+        """Every rule that could match `element`, and possibly some that cannot."""
+        index = self._index
+        if index is None:
+            index = self._buildIndex()
+
+        # A rule for h2::before styles that and never the h2 itself, and a
+        # rule for h2 never its ::before: each is only ever a candidate for
+        # its own kind of element.
+        pseudo = getattr(element, "pseudoElement", None)
+        if pseudo is not None:
+            return index.pseudo.get(pseudo, _NO_RULES)
+
+        # Gathered as buckets and flattened at the end. Appending to
+        # `candidates` instead would append to whichever bucket it started out
+        # as -- index.universal, which belongs to the index.
+        buckets = [index.universal]
+        if index.byTag:
+            buckets.append(index.byTag.get(element.domElement.tagName, _NO_RULES))
+        if index.byId:
+            buckets.append(index.byId.get(element.getIdAttr(), _NO_RULES))
+        if index.byClass:
+            attr = element.domElement.attributes.get("class")
+            if attr is not None:
+                for name in attr.value.split():
+                    bucket = index.byClass.get(name)
+                    if bucket:
+                        buckets.append(bucket)
+        if len(buckets) == 1:
+            return buckets[0]
+        return [rule for bucket in buckets for rule in bucket]
+
+    def findCSSRulesFor(self, element, attrName):
+        """
+        Every rule of this ruleset that gives `element` a value for `attrName`.
+
+        The index only narrows the field; selector.matches still decides. Nor
+        does the result depend on the order the candidates were gathered in:
+        sortKey is (specificity, order) and `order` is unique per selector, so
+        the sort below is total.
+        """
+        index = self._index
+        if index is None:
+            index = self._buildIndex()
+        if attrName not in index.attrNames:
+            return []
+
+        ruleResults = [
+            (nodeFilter, declarations)
+            for nodeFilter, declarations in self._candidatesFor(element)
+            if (attrName in declarations) and (nodeFilter.matches(element))
+        ]
+        ruleResults.sort(key=lambda rule: rule[0].sortKey())
+        return ruleResults
+
+    def findMatchingRules(self, element):
+        """
+        Every rule of this ruleset whose selector matches `element`.
+
+        Unsorted and unfiltered by property: the caller resolving a whole
+        element at once wants each matching rule exactly once, and does its
+        own ordering across the levels of the cascade.
+        """
+        return [
+            (nodeFilter, declarations)
+            for nodeFilter, declarations in self._candidatesFor(element)
+            if nodeFilter.matches(element)
+        ]
+
+    def hasPseudoRules(self, pseudo: str) -> bool:
+        """Whether any rule of this ruleset is for that pseudo-element."""
+        index = self._index
+        if index is None:
+            index = self._buildIndex()
+        return pseudo in index.pseudo
+
+    def findCSSRuleFor(self, element, attrName):
+        # rule is packed in a list to differentiate from "no rule" vs "rule
+        # whose value evaluates as False"
+        return self.findCSSRulesFor(element, attrName)[-1:]
+
+    def mergeStyles(self, styles):
+        """XXX Bugfix for use in PISA."""
+        for k, v in styles.items():
+            if self.get(k):
+                self[k] = copy.copy(self[k])
+                self[k].update(v)
+            else:
+                self[k] = v
+        # The update above reaches into a declarations dict this ruleset
+        # already holds, so what is declared changes without __setitem__ ever
+        # seeing it.
+        self._index = None
+
+    # Anything that changes the mapping invalidates the index.
+    def __setitem__(self, key, value) -> None:
+        self._index = None
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key) -> None:
+        self._index = None
+        super().__delitem__(key)
+
+    def update(self, *args, **kwargs) -> None:
+        self._index = None
+        super().update(*args, **kwargs)
+
+    def setdefault(self, key, default=None):
+        self._index = None
+        return super().setdefault(key, default)
+
+    def pop(self, *args):
+        self._index = None
+        return super().pop(*args)
+
+    def popitem(self):
+        self._index = None
+        return super().popitem()
+
+    def clear(self) -> None:
+        self._index = None
+        super().clear()
+
+
+class CSSInlineRuleset(CSSRuleset, CSSDeclarations):
+    # Keyed by property name rather than by selector, so both lookups are
+    # answered directly and the index is never built.
+    def findCSSRulesFor(self, element, attrName):
+        if attrName in self:
+            return [(CSSInlineSelector(), self)]
+        return []
+
+    def findMatchingRules(self, element):
+        return [(CSSInlineSelector(), self)] if self else []
+
+    def findCSSRuleFor(self, *args, **kw):
+        # rule is packed in a list to differentiate from "no rule" vs "rule
+        # whose value evaluates as False"
+        return self.findCSSRulesFor(*args, **kw)[-1:]
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ CSS Builder
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class CSSBuilder(cssParser.CSSBuilderAbstract):
+    RulesetFactory = CSSRuleset
+    SelectorFactory = CSSMutableSelector
+    MediumSetFactory = set
+    DeclarationsFactory = CSSDeclarations
+    TermFunctionFactory = CSSTerminalFunction
+    TermOperatorFactory = CSSTerminalOperator
+    xmlnsSynonyms: ClassVar[dict] = {}
+    mediumSet = None
+    trackImportance = True
+    charset = None
+
+    def __init__(self, mediumSet=mediumSet, trackImportance=trackImportance) -> None:
+        self.setMediumSet(mediumSet)
+        self.setTrackImportance(trackImportance=trackImportance)
+        #: The custom properties declared for :root or html so far, which is
+        #: all an at-rule's var() can refer to; see CSSParser._resolveRootVars.
+        self.rootCustomProperties: dict[str, str] = {}
+
+    def isValidMedium(self, mediums):
+        if not mediums:
+            return False
+        if "all" in mediums:
+            return True
+
+        mediums = self.MediumSetFactory(mediums)
+        return bool(self.getMediumSet().intersection(mediums))
+
+    def getMediumSet(self):
+        return self.mediumSet
+
+    def setMediumSet(self, mediumSet):
+        self.mediumSet = self.MediumSetFactory(mediumSet)
+
+    def updateMediumSet(self, mediumSet):
+        self.getMediumSet().update(mediumSet)
+
+    def getTrackImportance(self):
+        return self.trackImportance
+
+    def setTrackImportance(self, *, trackImportance=True):
+        self.trackImportance = trackImportance
+
+    # ~ helpers ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def _pushState(self):
+        _restoreState = self.__dict__
+        self.__dict__ = self.__dict__.copy()
+        self._restoreState = _restoreState
+        self.namespaces = {}
+
+    def _popState(self):
+        self.__dict__ = self._restoreState
+
+    def _declarations(self, declarations, DeclarationsFactory=None):
+        DeclarationsFactory = DeclarationsFactory or self.DeclarationsFactory
+        if self.trackImportance:
+            normal, important = [], []
+            for d in declarations:
+                if d[-1]:
+                    important.append(d[:-1])
+                else:
+                    normal.append(d[:-1])
+            return DeclarationsFactory(normal), DeclarationsFactory(important)
+        return DeclarationsFactory(declarations)
+
+    def _xmlnsGetSynonym(self, uri):
+        # Don't forget to substitute our namespace synonyms!
+        return self.xmlnsSynonyms.get(uri or None, uri) or None
+
+    # ~ css results ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def beginStylesheet(self):
+        self._pushState()
+
+    def endStylesheet(self):
+        self._popState()
+
+    def stylesheet(self, stylesheetElements, stylesheetImports):
+        # XXX Updated for PISA
+        if self.trackImportance:
+            normal, important = self.RulesetFactory(), self.RulesetFactory()
+            for normalStylesheet, importantStylesheet in stylesheetImports:
+                normal.mergeStyles(normalStylesheet)
+                important.mergeStyles(importantStylesheet)
+            for normalStyleElement, importantStyleElement in stylesheetElements:
+                normal.mergeStyles(normalStyleElement)
+                important.mergeStyles(importantStyleElement)
+            return normal, important
+        result = self.RulesetFactory()
+        for stylesheet in stylesheetImports:
+            result.mergeStyles(stylesheet)
+
+        for styleElement in stylesheetElements:
+            result.mergeStyles(styleElement)
+        return result
+
+    def beginInline(self):
+        self._pushState()
+
+    def endInline(self):
+        self._popState()
+
+    @staticmethod
+    def specialRules(declarations):
+        return cssSpecial.parseSpecialRules(declarations)
+
+    def inline(self, declarations):
+        declarations = self.specialRules(declarations)
+        return self._declarations(declarations, CSSInlineRuleset)
+
+    #: How a selector for the root element prints.
+    ROOT_SELECTORS = frozenset({":root", "*:root", "html"})
+
+    def ruleset(self, selectors, declarations):
+        if any(str(s).strip() in self.ROOT_SELECTORS for s in selectors):
+            for name, value, *_important in declarations:
+                if name.startswith("--"):
+                    self.rootCustomProperties[name] = value
+        # XXX Modified for pisa!
+        declarations = self.specialRules(declarations)
+        # XXX Modified for pisa!
+
+        if self.trackImportance:
+            normalDecl, importantDecl = self._declarations(declarations)
+            normal, important = self.RulesetFactory(), self.RulesetFactory()
+            for s in selectors:
+                s = s.asImmutable()
+                if normalDecl:
+                    normal[s] = normalDecl
+                if importantDecl:
+                    important[s] = importantDecl
+            return normal, important
+        declarations = self._declarations(declarations)
+        result = [(s.asImmutable(), declarations) for s in selectors]
+        return self.RulesetFactory(result)
+
+    # ~ css namespaces ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def resolveNamespacePrefix(self, nsPrefix, name):
+        if nsPrefix == "*":
+            return (nsPrefix, "*", name)
+        if nsPrefix and nsPrefix not in self.namespaces:
+            # CSS Namespaces 3: a prefix no @namespace declared makes the
+            # selector invalid, and with it the rule.
+            msg = f"Undeclared namespace prefix {nsPrefix!r}"
+            raise cssParser.CSSParseError(msg, name)
+        xmlns = self.namespaces.get(nsPrefix, None)
+        xmlns = self._xmlnsGetSynonym(xmlns)
+        return (nsPrefix, xmlns, name)
+
+    # ~ css @ directives ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def atCharset(self, charset):
+        self.charset = charset
+
+    def atImport(self, import_, mediums, cssParser):
+        if self.isValidMedium(mediums):
+            return cssParser.parseExternal(import_)
+        return None
+
+    def atNamespace(self, nsprefix, uri):
+        self.namespaces[nsprefix] = uri
+
+    def atMedia(self, mediums, ruleset):
+        if self.isValidMedium(mediums):
+            return ruleset
+        return None
+
+    def atPage(
+        self,
+        name: str,
+        pseudopage: str | None,
+        data: dict,
+        *,
+        isLandscape: bool,
+        pageBorder,
+    ):
+        """This is overridden by xhtml2pdf.context.pisaCSSBuilder."""
+        raise NotImplementedError
+
+    def atFontFace(self, declarations):
+        """This is overridden by xhtml2pdf.context.pisaCSSBuilder."""
+        return self.ruleset([self.selector("*")], declarations)
+
+    @staticmethod
+    def atIdent(_atIdent, _cssParser, src):
+        return src, NotImplemented
+
+    # ~ css selectors ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def selector(self, name):
+        return self.SelectorFactory(name)
+
+    def combineSelectors(self, selectorA, op, selectorB):
+        return self.SelectorFactory.combineSelectors(selectorA, op, selectorB)
+
+    # ~ css declarations ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    def property(self, name, value, *, important=False):
+        if self.trackImportance:
+            return (name, value, important)
+        return (name, value)
+
+    def combineTerms(self, termA, op, termB):
+        if op in {",", " "}:
+            if isinstance(termA, list):
+                termA.append(termB)
+                return termA
+            return [termA, termB]
+        if op is None and termB is None:
+            return [termA]
+        if isinstance(termA, list):
+            # Bind these "closer" than the list operators -- i.e. work on
+            # the (recursively) last element of the list
+            termA[-1] = self.combineTerms(termA[-1], op, termB)
+            return termA
+        return self.TermOperatorFactory(termA, op, termB)
+
+    @staticmethod
+    def termIdent(value):
+        return value
+
+    @staticmethod
+    def termNumber(value, units=None):
+        if units:
+            return value, units
+        return value
+
+    @staticmethod
+    def termRGB(value):
+        return value
+
+    @staticmethod
+    def termURI(value):
+        return value
+
+    @staticmethod
+    def termString(value):
+        return CSSString(value)
+
+    @staticmethod
+    def termUnicodeRange(value):
+        return value
+
+    def termFunction(self, name, value):
+        return self.TermFunctionFactory(name, value)
+
+    @staticmethod
+    def termUnknown(src):
+        return src, NotImplemented
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ CSS Parser -- finally!
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class CSSParser(cssParser.CSSParser):
+    CSSBuilderFactory = CSSBuilder
+
+    def __init__(self, cssBuilder=None, *, create=True, **kw) -> None:
+        if not cssBuilder and create:
+            assert cssBuilder is None
+            cssBuilder = self.createCSSBuilder(**kw)
+        super().__init__(cssBuilder)
+
+    def createCSSBuilder(self, **kw):
+        return self.CSSBuilderFactory(**kw)
+
+    def parseExternal(self, cssResourceName):
+        if Path(cssResourceName).is_file():
+            return self.parseFile(cssResourceName)
+        raise RuntimeError('Cannot resolve external CSS file: "%s"' % cssResourceName)

@@ -1,0 +1,529 @@
+# Copyright 2010 Dirk Holtwick, holtwick.it
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import io
+import logging
+import reprlib
+import threading
+import warnings
+from html import escape as html_escape
+
+import pypdf
+from reportlab.lib import pdfencrypt
+from reportlab.platypus.doctemplate import NextPageTemplate
+from reportlab.platypus.flowables import Spacer
+
+from xhtml2pdf.builders.inserts import insert_pages
+from xhtml2pdf.builders.pdfx import PDFXOptions, make_pdfx
+from xhtml2pdf.builders.position import PositionAnchor
+from xhtml2pdf.builders.preflight import scan, warn
+from xhtml2pdf.builders.watermarks import WaterMarks
+from xhtml2pdf.config.resources import (
+    active_policy,
+    default_policy,
+    render_budget,
+    use_policy,
+)
+from xhtml2pdf.context import pisaContext
+from xhtml2pdf.default import DEFAULT_CSS, DEFAULT_PAGE_NAME
+from xhtml2pdf.files import cleanFiles, pisaTempFile
+from xhtml2pdf.parser import pisaParser
+from xhtml2pdf.util import getBox, reset_caches
+from xhtml2pdf.xhtml2pdf_reportlab import PmlBaseDoc, PmlFrame, PmlPageTemplate
+
+log = logging.getLogger(__name__)
+
+_SHORT_REPR = reprlib.Repr()
+_SHORT_REPR.maxstring = 200
+_SHORT_REPR.maxother = 200
+
+
+def pisaErrorDocument(dest, c):
+    out = pisaTempFile(capacity=c.capacity)
+    out.write(
+        "<p style='background-color:red;'><strong>%d error(s) occurred:</strong><p>"
+        % c.err
+    )
+    for mode, line, msg, _ in c.log:
+        if mode == "error":
+            out.write("<pre>%s in line %d: %s</pre>" % (mode, line, html_escape(msg)))
+
+    out.write("<p><strong>%d warning(s) occurred:</strong><p>" % c.warn)
+    for mode, line, msg, _ in c.log:
+        if mode == "warning":
+            out.write("<p>%s in line %d: %s</p>" % (mode, line, html_escape(msg)))
+
+    return pisaDocument(out.getvalue(), dest, raise_exception=False)
+
+
+#: Held for the whole of a conversion; see pisaDocument.
+_RENDER_LOCK = threading.RLock()
+
+
+def pisaStory(
+    src,
+    path="",
+    link_callback=None,
+    debug=0,
+    default_css=None,
+    xhtml=False,  # noqa: FBT002
+    encoding=None,
+    context=None,
+    xml_output=None,
+    resource_policy=None,
+    **_kwargs,
+):
+    # Prepare Context
+    if not context:
+        context = pisaContext(path, debug=debug)
+        context.pathCallback = link_callback
+
+    # Use a default set of CSS definitions to get an expected output
+    if default_css is None:
+        default_css = DEFAULT_CSS
+
+    if resource_policy is not None:
+        context.resource_policy = resource_policy
+    if context.resource_policy is None:
+        context.resource_policy = active_policy() or default_policy(
+            context.pathDirectory
+        )
+
+    # Parse and fill the story. Everything the markup asks the renderer to
+    # fetch happens inside this block, including the paths that do not go
+    # through link_callback.
+    with (
+        _RENDER_LOCK,
+        use_policy(context.resource_policy),
+        render_budget(context.resource_policy),
+    ):
+        pisaParser(src, context, default_css, xhtml, encoding, xml_output)
+
+    # Avoid empty documents
+    if not context.story:
+        context.story = [Spacer(1, 1)]
+    else:
+        # Let the first block keep its top margin.
+        #
+        # ReportLab's Frame._add reads a flowable's spaceBefore only when the
+        # frame is not empty, so the first block of a document sat flush
+        # against the top of the frame where a browser pushes it down by its
+        # own margin. The margin is moved onto a spacer ahead of it, which
+        # gets the same result without keeping a copy of _add in step with
+        # ReportLab.
+        #
+        # Only the start of the story. Further pages begin with content
+        # carried over, and neither engine reintroduces a margin at a page
+        # break.
+        # A zero-size anchor of a positioned box is not the first block.
+        index = next(
+            (
+                i
+                for i, f in enumerate(context.story)
+                if not isinstance(f, PositionAnchor)
+            ),
+            0,
+        )
+        first = context.story[index]
+        style = getattr(first, "style", None)
+        space_before = getattr(style, "spaceBefore", 0) or 0
+        if space_before > 0:
+            style.spaceBefore = 0
+            context.story.insert(index, Spacer(1, space_before))
+
+    if context.indexing_story:
+        context.story.append(context.indexing_story)
+
+    # Remove anchors if they do not exist (because of a bug in Reportlab)
+    for frag, anchor in context.anchorFrag:
+        if anchor not in context.anchorName:
+            frag.link = None
+    return context
+
+
+def get_encrypt_instance(data):
+    if data is None:
+        return None
+
+    if isinstance(data, str):
+        return pdfencrypt.StandardEncryption(data)
+
+    return data
+
+
+def start_on_mirrored_pair(doc, templates, *, declared_body: bool) -> None:
+    """
+    Begin the document on the ``:left`` / ``:right`` pair, if that is all there is.
+
+    A stylesheet whose only page rules are ``@page :left`` and ``@page :right``
+    describes a mirrored document from its very first page. Nothing selected
+    those templates before: the cycle between them is built by
+    ``handle_nextPageTemplate``, which only runs for a <pdf:nextpage>, so the
+    document started on the synthetic body template and the mirrored rules were
+    never used -- silently.
+
+    Handing reportlab a list as the first template index is its own way of
+    saying "start on a cycle": ``handle_documentBegin`` turns it into the
+    PTCycle, which is also the one case ``PmlBaseDoc.beforeDocument`` leaves
+    alone between the passes of a multiBuild.
+    """
+    if declared_body:
+        # An explicit @page wins: it says where the document starts.
+        return
+
+    mirrored = [f"{DEFAULT_PAGE_NAME}_left", f"{DEFAULT_PAGE_NAME}_right"]
+    declared = {template.id for template in templates}
+    if declared.issuperset(mirrored):
+        # Names, not indexes: PmlBaseDoc.handle_nextPageTemplate resolves a
+        # list of template ids into the cycle.
+        doc._firstPageTemplateIndex = mirrored
+
+
+def start_on_leading_template(
+    doc, templates, story, *, declared_body: bool, body_named: bool = False
+) -> None:
+    """
+    Begin the document on the template a leading <pdf:nexttemplate> names.
+
+    A <pdf:nexttemplate> is reportlab's NextPageTemplate: it takes effect at
+    the next page break. Written before any content, as in
+
+        <body><pdf:nexttemplate name="cover"/><h1>Title</h1>
+
+    it came too late for the first page, which had already begun on the
+    synthetic body template -- 1cm margins -- so the template it named was
+    never used for the page it was written on (#455). When the stylesheet has
+    no unnamed @page, nothing else says what the first page is, and this is
+    taken to: the last of the leading ones names the first page's template,
+    and they are dropped from the story, having done their work.
+
+    With an unnamed @page the first page is that, as it always was, and a
+    leading <pdf:nexttemplate> keeps its reportlab meaning, "from the second
+    page on" -- a cover followed by the rest is written that way.
+
+    "@page body" is the unnamed @page by its own name, which reads as one
+    more named template: whoever wrote it next to "@page cover" and began
+    with <pdf:nexttemplate name="cover"/> is told why the cover is not the
+    first page.
+    """
+    leading = 0
+    name = None
+    while leading < len(story) and isinstance(story[leading], NextPageTemplate):
+        name = story[leading].action[1]
+        leading += 1
+    ids = [template.id for template in templates]
+    if not isinstance(name, str) or name not in ids:
+        return
+    if declared_body:
+        if body_named and name != DEFAULT_PAGE_NAME:
+            log.warning(
+                '<pdf:nexttemplate name="%s"/> before any content applies from'
+                ' the second page: "@page body" is the unnamed @page, which'
+                " the first page uses. Give that @page another name for the"
+                ' first page to be "%s".',
+                name,
+                name,
+            )
+        return
+    doc._firstPageTemplateIndex = ids.index(name)
+    del story[:leading]
+
+
+def pisaDocument(
+    src,
+    dest=None,
+    dest_bytes=False,  # noqa: FBT002
+    path="",
+    link_callback=None,
+    debug=0,
+    default_css=None,
+    xhtml=False,  # noqa: FBT002
+    encoding=None,
+    xml_output=None,
+    raise_exception=True,  # noqa: FBT002
+    capacity=100 * 1024,
+    context_meta=None,
+    encrypt=None,
+    signature=None,
+    show_error_as_pdf=False,  # noqa: FBT002
+    resource_policy=None,
+    pdfx=None,
+    **kwargs,
+):
+    if kwargs:
+        # These used to disappear into **_kwargs. Two of the callers passing
+        # them were this library's own CLI and its WSGI middleware.
+        warnings.warn(
+            f"pisaDocument does not take {', '.join(sorted(kwargs))}",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    if debug:
+        warnings.warn(
+            "debug does nothing; set the level of the xhtml2pdf logger instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    if encrypt and signature:
+        # The document is encrypted as it is built and signed after that, so
+        # the signer is handed a PDF it has no password for and fails with
+        # PdfKeyNotAvailableError several steps later. Said here, where the
+        # caller can see which two arguments are the problem.
+        msg = (
+            "encrypt and signature cannot be combined: the document is"
+            " encrypted before it is signed, and the signer cannot open it"
+        )
+        raise ValueError(msg)
+
+    if pdfx is not None:
+        if encrypt:
+            msg = "pdfx and encrypt cannot be combined: PDF/X forbids encryption"
+            raise ValueError(msg)
+        if signature:
+            msg = (
+                "pdfx and signature cannot be combined: signing adds a form"
+                " field and an annotation, which a PDF/X file leaves out"
+            )
+            raise ValueError(msg)
+        # Read and checked before the document is converted, so that a profile
+        # that cannot be used is said before the work rather than after it.
+        pdfx = PDFXOptions.from_argument(pdfx)
+
+    log.debug(
+        "pisaDocument options:\n  src = %r\n  dest = %r\n  path = %r\n  link_callback ="
+        " %r\n  xhtml = %r\n  context_meta = %r",
+        # The source may be the whole document, megabytes of it, and a debug
+        # log is no place to read it again.
+        _SHORT_REPR.repr(src),
+        dest,
+        path,
+        link_callback,
+        xhtml,
+        context_meta,
+    )
+
+    # One conversion at a time in a process. ReportLab keeps its fonts, the
+    # family + bold + italic map that picks a face and its caches in module
+    # globals, which a document fills in as it parses and reads back as it
+    # is drawn, and reset_caches() empties them when it is done: two at once
+    # draw with each other's fonts. The render is pure Python, so threads
+    # gain next to nothing from running two side by side. Taken outside the
+    # render budget, so that waiting for it does not count against the time
+    # a document may take.
+    with _RENDER_LOCK:
+        # Prepare simple context
+        context = pisaContext(path, capacity=capacity)
+
+        if context_meta is not None:
+            context.meta.update(context_meta)
+
+        context.pathCallback = link_callback
+        # Chosen here rather than in pisaStory so that the ReportLab build phase --
+        # where images are actually read -- runs under the same policy as the parse.
+        # pathDirectory, not path: `path` names the document, and its directory is
+        # what relative resources resolve against. A policy a caller put in force
+        # around the call is honoured before falling back to that default --
+        # otherwise `with use_policy(...)` around a build would do nothing.
+        context.resource_policy = (
+            resource_policy or active_policy() or default_policy(context.pathDirectory)
+        )
+
+        try:
+            with (
+                use_policy(context.resource_policy),
+                render_budget(context.resource_policy),
+            ):
+                return _build(
+                    src,
+                    context,
+                    dest=dest,
+                    dest_bytes=dest_bytes,
+                    path=path,
+                    link_callback=link_callback,
+                    default_css=default_css,
+                    xhtml=xhtml,
+                    encoding=encoding,
+                    xml_output=xml_output,
+                    encrypt=encrypt,
+                    signature=signature,
+                    pdfx=pdfx,
+                )
+        except Exception:
+            # raise_exception=False has always been the documented way to ask for
+            # a status object rather than an exception, and it was never read:
+            # the argument was marked unused and every failure propagated.
+            if raise_exception and not show_error_as_pdf:
+                raise
+            log.exception("Error while converting the document")
+            context.err += 1
+            if show_error_as_pdf:
+                # What pisaErrorDocument was written for. Nothing called it.
+                return pisaErrorDocument(
+                    dest if dest is not None else io.BytesIO(), context
+                )
+            return context
+        finally:
+            # Every resource read during the build registers a NamedTemporaryFile
+            # in a per-thread list, and a build which raised has registered as
+            # many as one which finished. In a finally for that reason: a render
+            # that skips these leaves a file descriptor and a deleted-but-open
+            # inode behind for the life of the thread, so documents that fail to
+            # convert walk a long-running server towards EMFILE.
+            cleanFiles()
+            reset_caches()
+
+
+def _build(
+    src,
+    context,
+    *,
+    dest,
+    dest_bytes,
+    path,
+    link_callback,
+    default_css,
+    xhtml,
+    encoding,
+    xml_output,
+    encrypt,
+    signature,
+    pdfx=None,
+):
+    """Convert the document; the caller decides what a failure means."""
+    # Build story
+    context = pisaStory(
+        src,
+        path,
+        link_callback,
+        0,
+        default_css,
+        xhtml,
+        encoding,
+        context=context,
+        xml_output=xml_output,
+    )
+
+    # Buffer PDF into memory
+    out = io.BytesIO()
+
+    doc = PmlBaseDoc(
+        out,
+        pagesize=context.pageSize,
+        author=context.meta["author"].strip(),
+        subject=context.meta["subject"].strip(),
+        keywords=[x.strip() for x in context.meta["keywords"].strip().split(",") if x],
+        title=context.meta["title"].strip(),
+        showBoundary=0,
+        encrypt=get_encrypt_instance(encrypt),
+        allowSplitting=1,
+        # ReportLab writes this to the catalog as /Lang, which is what a
+        # screen reader and PDF/UA read the document's language from.
+        lang=context.lang_tag or None,
+    )
+
+    # Prepare templates and their frames
+    declared_body = DEFAULT_PAGE_NAME in context.templateList
+    if declared_body:
+        body = context.templateList[DEFAULT_PAGE_NAME]
+        del context.templateList[DEFAULT_PAGE_NAME]
+    else:
+        x, y, w, h = getBox("1cm 1cm -1cm -1cm", context.pageSize)
+        body = PmlPageTemplate(
+            id="body",
+            frames=[
+                PmlFrame(
+                    x,
+                    y,
+                    w,
+                    h,
+                    id="body",
+                    leftPadding=0,
+                    rightPadding=0,
+                    bottomPadding=0,
+                    topPadding=0,
+                )
+            ],
+            pagesize=context.pageSize,
+        )
+
+    templates = [body, *list(context.templateList.values())]
+    if context.pageCanvasBackground is not None:
+        # CSS 2.1 14.2: body's background covers the canvas on every page
+        for template in templates:
+            template.canvasBackground = context.pageCanvasBackground
+    doc.addPageTemplates(templates)
+    doc.pisaPositioned = context.positioned
+    start_on_mirrored_pair(doc, templates, declared_body=declared_body)
+    start_on_leading_template(
+        doc,
+        templates,
+        context.story,
+        declared_body=declared_body,
+        body_named=context.bodyPageNamed,
+    )
+
+    # Use multibuild e.g. if a TOC has to be created
+    if context.multiBuild:
+        doc.multiBuild(context.story)
+    else:
+        doc.build(context.story)
+
+    inserted = insert_pages(doc, out)
+    if inserted is not None:
+        out = inserted
+
+    # Add watermarks
+    output = io.BytesIO()
+    output, has_bg = WaterMarks.process_doc(doc, out, output)
+
+    if not has_bg:
+        output = out
+    if pdfx is not None:
+        output = io.BytesIO(make_pdfx(output.getvalue(), pdfx))
+    elif any(template.bleed or template.marks for template in templates):
+        # A document with bleed or marks is going to a print shop.
+        warn(scan(pypdf.PdfReader(io.BytesIO(output.getvalue()))))
+    if signature:
+        try:
+            from xhtml2pdf.builders.signs import PDFSignature
+        except ImportError as e:
+            msg = (
+                "Signing a PDF needs pyHanko, which is not installed:"
+                " pip install 'xhtml2pdf[signing]'"
+            )
+            raise ImportError(msg) from e
+        signoutput = io.BytesIO()
+        do_ok = PDFSignature.sign(output, signoutput, signature)
+        if do_ok:
+            output = signoutput
+
+    # Get the resulting PDF and write it to the file object
+    # passed from the caller
+
+    # Get the resulting PDF and write it to the file object
+    # passed from the caller
+
+    if dest is None:
+        # No output file was passed - Let's use a pisaTempFile
+        dest = io.BytesIO()
+    context.dest = dest
+
+    data = output.getvalue()
+    context.dest.write(data)  # TODO: context.dest is a tempfile as well...
+
+    if dest_bytes:
+        return data
+
+    return context

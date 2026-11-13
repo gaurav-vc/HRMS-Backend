@@ -34,11 +34,11 @@ class CustomTokenObtainPairView(TokenObtainPairView):
             )
             raise e
 
-from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from djangorestframework_camel_case.parser import CamelCaseMultiPartParser, CamelCaseFormParser, CamelCaseJSONParser
 
 class UserProfileView(APIView):
     permission_classes = [IsAuthenticated]
-    parser_classes = (MultiPartParser, FormParser, JSONParser)
+    parser_classes = (CamelCaseMultiPartParser, CamelCaseFormParser, CamelCaseJSONParser)
     
     def get(self, request):
         serializer = UserProfileSerializer(request.user, context={'request': request})

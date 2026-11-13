@@ -274,37 +274,53 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         return qs
 
     def perform_create(self, serializer):
-        try:
-            employee = serializer.validated_data.get('employee')
-            if not employee and hasattr(self.request.user, 'employee_profile'):
-                employee = self.request.user.employee_profile
-                serializer.validated_data['employee'] = employee
-    
-            if not employee:
-                from rest_framework.exceptions import ValidationError
-                raise ValidationError({"detail": "Employee profile not found for this user."})
-    
-            # Calculate total days
-            start_date = serializer.validated_data.get('start_date')
-            end_date = serializer.validated_data.get('end_date')
-            # If the frontend passes a custom total_days (like 0.5 for half day), we can use it, else calculate
-            total_days_input = self.request.data.get('total_days')
-            if total_days_input:  # Checks for None and empty string ''
-                total_days = Decimal(str(total_days_input))
-            else:
-                employee = serializer.validated_data.get('employee')
-                site_id = employee.site_id if employee and employee.site else None
-                total_days = calculate_working_days(start_date, end_date, site_id=site_id)
-    
-            # Balance check
-            employee = serializer.validated_data.get('employee')
-            leave_type = serializer.validated_data.get('leave_type')
-            year = start_date.year
-    
-            from rest_framework.exceptions import ValidationError
-            balance = LeaveBalance.objects.filter(employee=employee, leave_type=leave_type, year=year).first()
+        from django.db import transaction
+        from rest_framework.exceptions import ValidationError
+        
+        employee = serializer.validated_data.get('employee')
+        if not employee and hasattr(self.request.user, 'employee_profile'):
+            employee = self.request.user.employee_profile
+            serializer.validated_data['employee'] = employee
+
+        if not employee:
+            raise ValidationError({"detail": "Employee profile not found for this user."})
+
+        start_date = serializer.validated_data.get('start_date')
+        end_date = serializer.validated_data.get('end_date')
+
+        if start_date and end_date and start_date > end_date:
+            raise ValidationError({"detail": "Start date must be before or equal to end date."})
+
+        # Overlapping leave check
+        overlap = LeaveRequest.objects.filter(
+            employee=employee,
+            status__in=['Pending', 'Approved'],
+            start_date__lte=end_date,
+            end_date__gte=start_date
+        ).exists()
+        if overlap:
+            raise ValidationError({"detail": "A leave request already exists covering this date range."})
+
+        # Calculate total days
+        total_days_input = self.request.data.get('total_days') or self.request.data.get('totalDays')
+        if total_days_input:
+            total_days = Decimal(str(total_days_input))
+        else:
+            site_id = employee.site_id if employee and employee.site else None
+            total_days = calculate_working_days(start_date, end_date, site_id=site_id)
+
+        if total_days <= Decimal('0'):
+            raise ValidationError({"detail": "Leave duration must be greater than 0 working days."})
+
+        leave_type = serializer.validated_data.get('leave_type')
+        year = start_date.year
+
+        with transaction.atomic():
+            balance = LeaveBalance.objects.select_for_update().filter(
+                employee=employee, leave_type=leave_type, year=year
+            ).first()
+
             if not balance:
-                # Auto-create balance for testing/convenience
                 entitlement = leave_type.annual_entitlement
                 config = LeavePolicyConfiguration.get_settings()
                 if entitlement == config.standard_annual_leaves and employee and employee.doj:
@@ -322,80 +338,67 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                     used_days=0,
                     remaining_days=entitlement
                 )
-    
+
             is_unpaid = (leave_type.annual_entitlement == 0)
             if not is_unpaid and balance.remaining_days < total_days:
                 raise ValidationError({"detail": f"Insufficient leave balance. You have {balance.remaining_days} days remaining."})
-    
-            # Apply Leave Policy Restrictions
+
             config = LeavePolicyConfiguration.get_settings()
             salary_deduction_days = Decimal('0.0')
-    
-            if total_days > config.max_consecutive_leaves:
-                # Check if it falls within the exception month
-                if start_date.month != config.exception_month:
-                    salary_deduction_days = total_days - Decimal(config.max_consecutive_leaves)
-                    # Ensure they don't use up remaining_days for unpaid leave
-                    # (The unpaid days shouldn't deduct from paid balance, but for now we just record it)
-                    # Actually, if total_days is 8 and max is 3, 5 are unpaid. 
-                    # So we only deduct 3 from their actual paid balance in the approve step.
-                    
-            # Optional: verify if tenured or not
-            if employee and employee.doj:
-                doj = employee.doj
-                try:
-                    five_years_later = doj.replace(year=doj.year + config.tenured_years_threshold)
-                except ValueError:
-                    five_years_later = doj.replace(year=doj.year + config.tenured_years_threshold, day=28)
-                
-                is_tenured = (start_date.year > five_years_later.year) or \
-                             (start_date.year == five_years_later.year and start_date.month > five_years_later.month)
-                # You can use `is_tenured` to automatically upgrade their leave allocations here if desired.
-    
+
+            if total_days > config.max_consecutive_leaves and start_date.month != config.exception_month:
+                salary_deduction_days = total_days - Decimal(config.max_consecutive_leaves)
+
             organization = getattr(employee, 'entity', None)
             site = getattr(employee, 'site', None)
-            serializer.save(employee=employee, organization=organization, site=site, total_days=total_days, salary_deduction_days=salary_deduction_days, status='Pending')
-        except Exception as e:
-            import traceback
-            trace = traceback.format_exc()
-            from rest_framework.exceptions import APIException
-            class CustomAPIException(APIException):
-                status_code = 400
-                default_detail = trace
-            raise CustomAPIException(trace)
+            serializer.save(
+                employee=employee,
+                organization=organization,
+                site=site,
+                total_days=total_days,
+                salary_deduction_days=salary_deduction_days,
+                status='Pending'
+            )
 
-    @action(detail=True, methods=['patch'])
+    @action(detail=True, methods=['patch', 'post'])
     def approve(self, request, pk=None):
         from authentication.permissions import user_can_approve
+        from django.db import transaction
         if not user_can_approve(request.user, module='Leave Requests'):
             return Response({"detail": "Permission denied. You do not have permission to approve leave requests."}, status=status.HTTP_403_FORBIDDEN)
 
-        leave_req = self.get_object()
-        if leave_req.status != 'Pending':
-            return Response({"detail": "Only pending requests can be approved."}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            leave_req = LeaveRequest.objects.select_for_update().filter(pk=pk).first()
+            if not leave_req:
+                return Response({"detail": "Leave request not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        # Deduct balance only after approval
-        year = leave_req.start_date.year
-        balance = LeaveBalance.objects.filter(
-            employee=leave_req.employee, 
-            leave_type=leave_req.leave_type, 
-            year=year
-        ).first()
+            if leave_req.status != 'Pending':
+                return Response({"detail": "Only pending requests can be approved."}, status=status.HTTP_400_BAD_REQUEST)
 
-        if not balance or balance.remaining_days < (leave_req.total_days - leave_req.salary_deduction_days):
-            return Response({"detail": "Insufficient leave balance to approve this request."}, status=status.HTTP_400_BAD_REQUEST)
+            year = leave_req.start_date.year
+            balance = LeaveBalance.objects.select_for_update().filter(
+                employee=leave_req.employee, 
+                leave_type=leave_req.leave_type, 
+                year=year
+            ).first()
 
-        # Only deduct the paid portion
-        paid_days = leave_req.total_days - leave_req.salary_deduction_days
-        balance.used_days += paid_days
-        balance.remaining_days -= paid_days
-        balance.save()
+            paid_days = leave_req.total_days - leave_req.salary_deduction_days
+            is_unpaid = (leave_req.leave_type.annual_entitlement == 0)
 
-        leave_req.status = 'Approved'
-        leave_req.manager_comments = request.data.get('manager_comments', '')
-        leave_req.approved_at = timezone.now()
-        leave_req.approved_by = "Manager" # In real app, request.user
-        leave_req.save()
+            if not is_unpaid and (not balance or balance.remaining_days < paid_days):
+                return Response({"detail": "Insufficient leave balance to approve this request."}, status=status.HTTP_400_BAD_REQUEST)
+
+            if balance and not is_unpaid:
+                balance.used_days += paid_days
+                balance.remaining_days -= paid_days
+                balance.save()
+
+            leave_req.status = 'Approved'
+            leave_req.manager_comments = request.data.get('manager_comments', '')
+            leave_req.approved_at = timezone.now()
+            user_display = f"{request.user.first_name} {request.user.last_name}".strip() or request.user.username
+            leave_req.approved_by = user_display
+            leave_req.save()
 
         if leave_req.employee and leave_req.employee.email:
             send_leave_email_async(
@@ -411,19 +414,24 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
 
         return Response(self.get_serializer(leave_req).data)
 
-    @action(detail=True, methods=['patch'])
+    @action(detail=True, methods=['patch', 'post'])
     def reject(self, request, pk=None):
         from authentication.permissions import user_can_approve
+        from django.db import transaction
         if not user_can_approve(request.user, module='Leave Requests'):
             return Response({"detail": "Permission denied. You do not have permission to reject leave requests."}, status=status.HTTP_403_FORBIDDEN)
 
-        leave_req = self.get_object()
-        if leave_req.status != 'Pending':
-            return Response({"detail": "Only pending requests can be rejected."}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            leave_req = LeaveRequest.objects.select_for_update().filter(pk=pk).first()
+            if not leave_req:
+                return Response({"detail": "Leave request not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        leave_req.status = 'Rejected'
-        leave_req.manager_comments = request.data.get('manager_comments', '')
-        leave_req.save()
+            if leave_req.status != 'Pending':
+                return Response({"detail": "Only pending requests can be rejected."}, status=status.HTTP_400_BAD_REQUEST)
+
+            leave_req.status = 'Rejected'
+            leave_req.manager_comments = request.data.get('manager_comments', '')
+            leave_req.save()
 
         if leave_req.employee and leave_req.employee.email:
             send_leave_email_async(
@@ -436,6 +444,45 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 reason=leave_req.reason,
                 manager_comments=leave_req.manager_comments
             )
+
+        return Response(self.get_serializer(leave_req).data)
+
+    @action(detail=True, methods=['patch', 'post'])
+    def cancel(self, request, pk=None):
+        from django.db import transaction
+        leave_req = self.get_object()
+        
+        emp = getattr(request.user, 'employee_profile', None)
+        can_cancel = bool(
+            request.user.is_superuser or
+            (emp and (emp == leave_req.employee or emp.role in ('super_admin', 'org_admin', 'admin', 'hr')))
+        )
+        if not can_cancel:
+            return Response({"detail": "You do not have permission to cancel this leave request."}, status=status.HTTP_403_FORBIDDEN)
+
+        if leave_req.status in ['Cancelled', 'Rejected']:
+            return Response({"detail": f"Leave request is already {leave_req.status.lower()}."}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            leave_req = LeaveRequest.objects.select_for_update().get(pk=pk)
+            
+            # If it was Approved, refund the deducted balance atomically
+            if leave_req.status == 'Approved':
+                year = leave_req.start_date.year
+                balance = LeaveBalance.objects.select_for_update().filter(
+                    employee=leave_req.employee,
+                    leave_type=leave_req.leave_type,
+                    year=year
+                ).first()
+                if balance:
+                    paid_days = leave_req.total_days - leave_req.salary_deduction_days
+                    balance.used_days = max(Decimal('0'), balance.used_days - paid_days)
+                    balance.remaining_days = balance.allocated_days - balance.used_days
+                    balance.save()
+
+            leave_req.status = 'Cancelled'
+            leave_req.manager_comments = request.data.get('manager_comments', leave_req.manager_comments)
+            leave_req.save()
 
         return Response(self.get_serializer(leave_req).data)
 

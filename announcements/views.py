@@ -3,17 +3,19 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from djangorestframework_camel_case.parser import CamelCaseMultiPartParser, CamelCaseFormParser, CamelCaseJSONParser
 from django.db.models import Q
 from django.core.mail import send_mail
 from django.conf import settings
 from .models import Announcement, AnnouncementReceipt
 from .serializers import AnnouncementSerializer
 from employees.models import Employee
+from authentication.permissions import DataIsolationMixin, isolate_queryset
 
-class AnnouncementViewSet(viewsets.ModelViewSet):
+class AnnouncementViewSet(DataIsolationMixin, viewsets.ModelViewSet):
+    rbac_module = 'Announcements'
     permission_classes = [IsAuthenticated]
-    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    parser_classes = [CamelCaseMultiPartParser, CamelCaseFormParser, CamelCaseJSONParser]
     serializer_class = AnnouncementSerializer
 
     def _get_employee(self, user):
@@ -179,24 +181,34 @@ class AnnouncementViewSet(viewsets.ModelViewSet):
     def _dispatch_announcements(self, announcement):
         from employees.models import Notification
 
-        # 1. Resolve target active employees
+        # 1. Resolve target active employees bounded strictly to tenant
         target_employees = set()
+        user_for_isolation = announcement.created_by
         if announcement.audience_type == 'EVERYONE':
             if announcement.entity:
                 qs = Employee.objects.filter(entity=announcement.entity, status='Active')
             else:
                 qs = Employee.objects.filter(status='Active')
+            if user_for_isolation:
+                qs = isolate_queryset(qs, user_for_isolation)
             target_employees.update(qs)
         elif announcement.audience_type == 'ROLE' and hasattr(announcement, 'target_roles'):
             roles = announcement.target_roles.all()
             qs = Employee.objects.filter(dynamic_role__in=roles, status='Active')
+            if user_for_isolation:
+                qs = isolate_queryset(qs, user_for_isolation)
             target_employees.update(qs)
         elif announcement.audience_type == 'DEPARTMENT':
             depts = announcement.target_departments.all()
             qs = Employee.objects.filter(department__in=depts, status='Active')
+            if user_for_isolation:
+                qs = isolate_queryset(qs, user_for_isolation)
             target_employees.update(qs)
         elif announcement.audience_type == 'INDIVIDUAL':
-            target_employees.update(announcement.target_employees.filter(status='Active'))
+            qs = announcement.target_employees.filter(status='Active')
+            if user_for_isolation:
+                qs = isolate_queryset(qs, user_for_isolation)
+            target_employees.update(qs)
 
         # Also include the creator in notification feed if they are an active employee
         creator_emp = self._get_employee(announcement.created_by) if announcement.created_by else None

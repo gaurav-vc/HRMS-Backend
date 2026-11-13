@@ -79,7 +79,7 @@ from .gps_service import VelocityCheckService
 from .webauthn_service import WebAuthnService
 from .qr_service import CryptographicQRService
 from .models import EnrollmentAudit, ConsentLog, ManualOverrideRequest
-from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from djangorestframework_camel_case.parser import CamelCaseMultiPartParser, CamelCaseFormParser, CamelCaseJSONParser
 
 import threading
 from django.core.mail import EmailMultiAlternatives
@@ -257,7 +257,7 @@ def evaluate_punctuality_slabs(employee, punch_time, shift_start_dt):
 
 
 class AttendanceViewSet(viewsets.ViewSet):
-    parser_classes = (MultiPartParser, FormParser, JSONParser)
+    parser_classes = (CamelCaseMultiPartParser, CamelCaseFormParser, CamelCaseJSONParser)
     
     @action(detail=False, methods=['get'])
     @permission_classes([AllowAny])
@@ -849,14 +849,18 @@ class AttendanceViewSet(viewsets.ViewSet):
                             if not is_possible:
                                 return Response({"error": travel_msg}, status=400)
 
-            # Wave 7: Cryptographic QR Token Validation & Replay Defense (COMMENTED FOR DEMO)
+            # Dynamic QR Token Validation & Replay Defense
             if qr_token:
                 qr_site_matched = False
+                matched_token_obj = None
                 for s in valid_sites:
                     try:
                         token_obj = DynamicQRToken.objects.get(site=s, token=qr_token)
+                        if token_obj.expires_at and token_obj.expires_at < timezone.now():
+                            return Response({"error": "Rejected: QR Code has expired. Please refresh the QR screen."}, status=400)
                         qr_site_matched = True
                         matched_site = s
+                        matched_token_obj = token_obj
                         break
                     except DynamicQRToken.DoesNotExist:
                         continue
@@ -864,7 +868,7 @@ class AttendanceViewSet(viewsets.ViewSet):
                 if not qr_site_matched:
                     return Response({"error": "Rejected: Invalid QR Token for any of your assigned sites."}, status=400)
                 
-                # We still keep the employee-specific replay defense just in case
+                # Employee-specific replay defense
                 if PunchLog.objects.filter(employee=employee, qr_token=qr_token).exists():
                     return Response({"error": "Rejected: QR Token replay detected for this employee."}, status=400)
                 

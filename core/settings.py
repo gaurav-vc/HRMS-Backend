@@ -25,7 +25,7 @@ SECRET_KEY = 'django-insecure-c7m1+o@2)oqv^wgugjr1w@v#mkjv_=y-ca7=by!safx0eqc+#u
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['hrms.lotusdevelopers.com', 'hrms.vibecopilot.ai', 'hrms.vibesandbox.live', '127.0.0.1', 'localhost']
+ALLOWED_HOSTS = ['hrms.lotusdevelopers.com', 'hrms.vibecopilot.ai', 'hrms.vibesandbox.live', '127.0.0.1', 'localhost', 'testserver']
 
 
 # Application definition
@@ -63,6 +63,7 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'core.middleware.ApiTelemetryMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
 ]
 
@@ -159,7 +160,24 @@ REST_FRAMEWORK = {
     ),
     'DEFAULT_PARSER_CLASSES': (
         'djangorestframework_camel_case.parser.CamelCaseJSONParser',
+        'djangorestframework_camel_case.parser.CamelCaseMultiPartParser',
+        'djangorestframework_camel_case.parser.CamelCaseFormParser',
     ),
+    'EXCEPTION_HANDLER': 'core.exceptions.custom_exception_handler',
+    'DATE_INPUT_FORMATS': [
+        'iso-8601',
+        '%Y-%m-%d',
+        '%d-%m-%Y',
+        '%d/%m/%Y',
+        '%Y/%m/%d',
+    ],
+    'DATETIME_INPUT_FORMATS': [
+        'iso-8601',
+        '%Y-%m-%d %H:%M:%S',
+        '%Y-%m-%d %H:%M',
+        '%d-%m-%Y %H:%M:%S',
+        '%d-%m-%Y %H:%M',
+    ],
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
 }
 

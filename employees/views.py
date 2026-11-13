@@ -2,7 +2,7 @@ import csv
 import io
 from rest_framework import viewsets, exceptions, status
 from rest_framework.decorators import action
-from rest_framework.parsers import MultiPartParser, FormParser
+from djangorestframework_camel_case.parser import CamelCaseMultiPartParser, CamelCaseFormParser, CamelCaseJSONParser
 from rest_framework.response import Response
 from django.contrib.auth.models import User
 from django.core.mail import send_mail
@@ -20,13 +20,18 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     serializer_class = EmployeeSerializer
     permission_classes = [IsAuthenticated]
 
-    @action(detail=False, methods=['POST'], parser_classes=[MultiPartParser])
+    @action(detail=False, methods=['POST'], parser_classes=[CamelCaseMultiPartParser, CamelCaseFormParser])
     def bulk_import(self, request):
         file_obj = request.FILES.get('file')
         if not file_obj:
             return Response({"error": "No file uploaded"}, status=status.HTTP_400_BAD_REQUEST)
         
         try:
+            import secrets
+            from django.db import transaction
+            from authentication.permissions import isolate_queryset
+            from organisation.models import Entity, Department, Designation, Branch, Site
+            
             decoded_file = file_obj.read().decode('utf-8')
             io_string = io.StringIO(decoded_file)
             reader = csv.DictReader(io_string)
@@ -34,128 +39,133 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             success_count = 0
             errors = []
             
-            for row in reader:
-                first_name = row.get('First Name', '').strip()
-                last_name = row.get('Last Name', '').strip()
-                email = row.get('Email', '').strip()
-                code = row.get('Employee Code', '').strip()
-                phone = row.get('Phone', '').replace('\t', '').strip()
-                gender = row.get('Gender', 'Male').strip()
-                address = row.get('Address', '').strip()
-                
-                if not code or (not email and not phone):
-                    errors.append(f"Row {reader.line_num}: Employee Code and at least Email or Phone are required")
-                    continue
+            # Isolated querysets ensuring strict tenant boundary on foreign entity lookups
+            ent_qs = isolate_queryset(Entity.objects.all(), request.user)
+            dept_qs = isolate_queryset(Department.objects.all(), request.user)
+            desg_qs = isolate_queryset(Designation.objects.all(), request.user)
+            branch_qs = isolate_queryset(Branch.objects.all(), request.user)
+            site_qs = isolate_queryset(Site.objects.all(), request.user)
+            manager_qs = isolate_queryset(Employee.objects.all(), request.user)
+
+            caller_emp = getattr(request.user, 'employee_profile', None)
+            default_org = caller_emp.organization if caller_emp else None
+            default_ent = caller_emp.entity if caller_emp else None
+            default_site = caller_emp.site if caller_emp else None
+            default_branch = caller_emp.branch if caller_emp else None
+
+            with transaction.atomic():
+                for row in reader:
+                    first_name = row.get('First Name', '').strip()
+                    last_name = row.get('Last Name', '').strip()
+                    email = row.get('Email', '').strip()
+                    code = row.get('Employee Code', '').strip()
+                    phone = row.get('Phone', '').replace('\t', '').strip()
+                    gender = row.get('Gender', 'Male').strip()
+                    address = row.get('Address', '').strip()
                     
-                username = email if email else phone.replace(' ', '').replace('-', '').replace('\t', '')
-                if User.objects.filter(username=username).exists() or (email and User.objects.filter(email=email).exists()):
-                    errors.append(f"Row {reader.line_num}: User {username} already exists")
-                    continue
-                
-                # Fetch related models
-                from organisation.models import Entity, Department, Designation, Branch, Site
-                
-                entity_name = row.get('Entity', '').strip()
-                dept_name = row.get('Department', '').strip()
-                desg_name = row.get('Designation', '').strip()
-                branch_name = row.get('Branch', '').strip()
-                site_name = row.get('Site', '').strip()
-                manager_val = row.get('Reporting Manager', '').strip()
-                
-                ent = Entity.objects.filter(code__iexact=entity_name).first() or Entity.objects.filter(name__iexact=entity_name).first() if entity_name and entity_name.lower() != 'none' else None
-                dept = Department.objects.filter(name__iexact=dept_name).first() if dept_name and dept_name.lower() != 'none' else None
-                desg = Designation.objects.filter(title__iexact=desg_name).first() if desg_name and desg_name.lower() != 'none' else None
-                branch = Branch.objects.filter(name__iexact=branch_name).first() if branch_name and branch_name.lower() != 'none' else None
-                site = Site.objects.filter(name__iexact=site_name).first() if site_name and site_name.lower() != 'none' else None
-                
-                manager = None
-                if manager_val and manager_val.lower() != 'none':
-                    manager = Employee.objects.filter(code__iexact=manager_val).first() or Employee.objects.filter(email__iexact=manager_val).first()
-                
-                # Organization fallback
-                org = None
-                if not ent and hasattr(request.user, 'employee_profile'):
-                    org = request.user.employee_profile.organization
-                    ent = request.user.employee_profile.entity
-                elif ent:
-                    org = ent.organization
+                    if not code or (not email and not phone):
+                        errors.append(f"Row {reader.line_num}: Employee Code and at least Email or Phone are required")
+                        continue
+                        
+                    username = email if email else phone.replace(' ', '').replace('-', '').replace('\t', '')
+                    if User.objects.filter(username=username).exists() or (email and User.objects.filter(email=email).exists()):
+                        errors.append(f"Row {reader.line_num}: User {username} already exists")
+                        continue
+                    
+                    entity_name = row.get('Entity', '').strip()
+                    dept_name = row.get('Department', '').strip()
+                    desg_name = row.get('Designation', '').strip()
+                    branch_name = row.get('Branch', '').strip()
+                    site_name = row.get('Site', '').strip()
+                    manager_val = row.get('Reporting Manager', '').strip()
+                    
+                    ent = ent_qs.filter(code__iexact=entity_name).first() or ent_qs.filter(name__iexact=entity_name).first() if entity_name and entity_name.lower() != 'none' else default_ent
+                    dept = dept_qs.filter(name__iexact=dept_name).first() if dept_name and dept_name.lower() != 'none' else None
+                    desg = desg_qs.filter(title__iexact=desg_name).first() if desg_name and desg_name.lower() != 'none' else None
+                    branch = branch_qs.filter(name__iexact=branch_name).first() if branch_name and branch_name.lower() != 'none' else default_branch
+                    site = site_qs.filter(name__iexact=site_name).first() if site_name and site_name.lower() != 'none' else default_site
+                    
+                    manager = None
+                    if manager_val and manager_val.lower() != 'none':
+                        manager = manager_qs.filter(code__iexact=manager_val).first() or manager_qs.filter(email__iexact=manager_val).first()
+                    
+                    # Organization resolution bounded to tenant
+                    org = ent.organization if ent else default_org
 
-                # Dates (dd-mm-yyyy)
-                def parse_date(ds):
-                    if not ds: return None
+                    # Dates (dd-mm-yyyy)
+                    def parse_date(ds):
+                        if not ds: return None
+                        try:
+                            from datetime import datetime
+                            return datetime.strptime(ds, '%d-%m-%Y').strftime('%Y-%m-%d')
+                        except Exception:
+                            return ds
+
+                    dob = parse_date(row.get('Date of Birth', '').strip())
+                    doj = parse_date(row.get('Date of Joining', '').strip())
+                    status = row.get('Status', 'Active').strip() or 'Active'
+
+                    # 1. Create User with cryptographically random temporary password
+                    temp_password = secrets.token_urlsafe(12)
+                    user = User.objects.create_user(
+                        username=username,
+                        email=email or '',
+                        password=temp_password,
+                        first_name=first_name,
+                        last_name=last_name
+                    )
+                    
+                    # 2. Create Employee
+                    emp = Employee.objects.create(
+                        user=user,
+                        first_name=first_name,
+                        last_name=last_name,
+                        email=email or None,
+                        code=code,
+                        phone=phone,
+                        gender=gender,
+                        address=address,
+                        dob=dob,
+                        doj=doj,
+                        status=status,
+                        organization=org,
+                        entity=ent,
+                        department=dept,
+                        designation=desg,
+                        branch=branch,
+                        site=site,
+                        manager=manager,
+                        pan=row.get('PAN', '').strip(),
+                        aadhaar=row.get('Aadhaar', '').replace('\t', '').strip(),
+                        uan=row.get('UAN', '').replace('\t', '').strip(),
+                        esi=row.get('ESI No.', '').replace('\t', '').strip(),
+                        bank_name=row.get('Bank Name', '').strip(),
+                        bank_account=row.get('Bank Account No.', '').replace('\t', '').strip(),
+                        ifsc=row.get('IFSC Code', '').strip()
+                    )
+                    
+                    # 3. Create Org Engine Node
                     try:
-                        from datetime import datetime
-                        return datetime.strptime(ds, '%d-%m-%Y').strftime('%Y-%m-%d')
-                    except Exception:
-                        return ds
-
-                dob = parse_date(row.get('Date of Birth', '').strip())
-                doj = parse_date(row.get('Date of Joining', '').strip())
-                status = row.get('Status', 'Active').strip() or 'Active'
-
-                # 1. Create User
-                user = User.objects.create_user(
-                    username=username,
-                    email=email or '',
-                    password="Password123!",
-                    first_name=first_name,
-                    last_name=last_name
-                )
-                
-                # 2. Create Employee
-                emp = Employee.objects.create(
-                    user=user,
-                    first_name=first_name,
-                    last_name=last_name,
-                    email=email or None,
-                    code=code,
-                    phone=phone,
-                    gender=gender,
-                    address=address,
-                    dob=dob,
-                    doj=doj,
-                    status=status,
-                    organization=org,
-                    entity=ent,
-                    department=dept,
-                    designation=desg,
-                    branch=branch,
-                    site=site,
-                    manager=manager,
-                    pan=row.get('PAN', '').strip(),
-                    aadhaar=row.get('Aadhaar', '').replace('\t', '').strip(),
-                    uan=row.get('UAN', '').replace('\t', '').strip(),
-                    esi=row.get('ESI No.', '').replace('\t', '').strip(),
-                    bank_name=row.get('Bank Name', '').strip(),
-                    bank_account=row.get('Bank Account No.', '').replace('\t', '').strip(),
-                    ifsc=row.get('IFSC Code', '').strip()
-                )
-                
-                # Notify HR/Admin
-                from .models import Notification
-                
-                # 3. Create Org Engine Node (Only if they have a role, which they don't during bulk import usually, but just in case)
-                try:
-                    from org_engine.models import OrganizationNode, OrganizationNodeType
-                    if emp.dynamic_role:
-                        emp_type, _ = OrganizationNodeType.objects.get_or_create(name='Employee')
-                        parent_node = OrganizationNode.objects.filter(name=emp.dynamic_role.name, node_type__name='Role').first()
-                        if parent_node:
-                            OrganizationNode.objects.create(
-                                name=f"{first_name} {last_name}",
-                                node_type=emp_type,
-                                parent=parent_node,
-                                tenant_id=1
-                            )
-                except Exception as e:
-                    print(f"Failed to create Org Engine node during bulk import: {e}")
-                success_count += 1
-                
+                        from org_engine.models import OrganizationNode, OrganizationNodeType
+                        if emp.dynamic_role:
+                            emp_type, _ = OrganizationNodeType.objects.get_or_create(name='Employee')
+                            parent_node = OrganizationNode.objects.filter(name=emp.dynamic_role.name, node_type__name='Role').first()
+                            if parent_node:
+                                OrganizationNode.objects.create(
+                                    name=f"{first_name} {last_name}",
+                                    node_type=emp_type,
+                                    parent=parent_node,
+                                    tenant_id=org.id if org else 1
+                                )
+                    except Exception as e:
+                        print(f"Failed to create Org Engine node during bulk import: {e}")
+                    success_count += 1
+                    
             return Response({"success": success_count, "errors": errors})
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-    @action(detail=True, methods=['POST'], parser_classes=[MultiPartParser, FormParser])
+    @action(detail=True, methods=['POST'], parser_classes=[CamelCaseMultiPartParser, CamelCaseFormParser])
     def update_photo(self, request, pk=None):
         """
         Updates an employee's profile photo with strict site-level data isolation.
@@ -796,7 +806,7 @@ class EmployeeDocumentViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Documents'
     queryset = EmployeeDocument.objects.all()
     serializer_class = EmployeeDocumentSerializer
-    parser_classes = [MultiPartParser]
+    parser_classes = [CamelCaseMultiPartParser, CamelCaseFormParser, CamelCaseJSONParser]
     
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -954,14 +964,12 @@ class NotificationViewSet(viewsets.ViewSet):
 from .models import OfferLetter, OfferTemplate
 from .serializers import OfferLetterSerializer, OfferTemplateSerializer
 
-from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
-
 class OfferTemplateViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Offer Templates'
     queryset = OfferTemplate.objects.all()
     serializer_class = OfferTemplateSerializer
     permission_classes = [IsAuthenticated]
-    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    parser_classes = [CamelCaseMultiPartParser, CamelCaseFormParser, CamelCaseJSONParser]
 
 class OfferLetterViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Offer Letters'

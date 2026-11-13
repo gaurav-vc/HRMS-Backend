@@ -1,0 +1,1960 @@
+# Copyright 2010 Dirk Holtwick, holtwick.it
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from __future__ import annotations
+
+import copy
+import logging
+import re
+import xml.dom.minidom
+from typing import NamedTuple
+from xml.dom import Node
+
+import html5lib
+from html5lib import treebuilders
+from reportlab.lib.colors import Color
+from reportlab.platypus.doctemplate import FrameBreak, NextPageTemplate
+from reportlab.platypus.flowables import KeepInFrame, KeepTogether, PageBreak, Spacer
+
+from xhtml2pdf.builders.block import (
+    BlockBoxData,
+    block_box_style,
+    bottom_aligned,
+    collapse_margins,
+    declared_height,
+    declared_width,
+)
+from xhtml2pdf.builders.flex import (
+    BoxStyle,
+    FlexData,
+    InlineBoxData,
+    clear_box,
+    inline_box_markers,
+)
+from xhtml2pdf.builders.position import (
+    PositionedBoxData,
+    close_relative_container,
+    open_relative_container,
+    read_offsets,
+    read_position,
+    shift_story,
+)
+from xhtml2pdf.config.resources import RenderLimitError, check_deadline, current_policy
+from xhtml2pdf.default import (
+    BOOL,
+    BOX,
+    COLOR,
+    FILE,
+    FONT,
+    INT,
+    MUST,
+    POS,
+    SIZE,
+    STRING,
+    TAGS,
+)
+from xhtml2pdf.files import pisaTempFile
+from xhtml2pdf.properties import (
+    FRAG_BLOCK_GROUPS,
+    LOOP_GROUPS,
+    PROPERTY_NAMES,
+    SUPPORTED_PROPERTIES,
+    CSSAttrs,
+    UniformGroup,
+    apply_uniform_groups,
+    compact_frag,
+    reset_non_inherited,
+)
+
+# TODO: Why do we need to import these Tags here? They aren't uses in this file or any other file,
+#  but if we don't import them, the tests fail. Very strange (fbernhart)
+from xhtml2pdf.tables import (  # noqa: F401
+    TableData,
+    pisaTagTABLE,
+    pisaTagTBODY,
+    pisaTagTD,
+    pisaTagTFOOT,
+    pisaTagTH,
+    pisaTagTHEAD,
+    pisaTagTR,
+)
+from xhtml2pdf.tags import (  # noqa: F401
+    pisaTag,
+    pisaTagA,
+    pisaTagBODY,
+    pisaTagBR,
+    pisaTagCANVAS,
+    pisaTagDIV,
+    pisaTagFONT,
+    pisaTagH1,
+    pisaTagH2,
+    pisaTagH3,
+    pisaTagH4,
+    pisaTagH5,
+    pisaTagH6,
+    pisaTagHR,
+    pisaTagHTML,
+    pisaTagIMG,
+    pisaTagINPUT,
+    pisaTagLI,
+    pisaTagMETA,
+    pisaTagOL,
+    pisaTagP,
+    pisaTagPDFBARCODE,
+    pisaTagPDFFONT,
+    pisaTagPDFFRAME,
+    pisaTagPDFINSERTPDF,
+    pisaTagPDFLANGUAGE,
+    pisaTagPDFNEXTFRAME,
+    pisaTagPDFNEXTPAGE,
+    pisaTagPDFNEXTTEMPLATE,
+    pisaTagPDFPAGECOUNT,
+    pisaTagPDFPAGENUMBER,
+    pisaTagPDFRESETPAGENUMBER,
+    pisaTagPDFSPACER,
+    pisaTagPDFTEMPLATE,
+    pisaTagPDFTOC,
+    pisaTagSELECT,
+    pisaTagSTYLE,
+    pisaTagSUB,
+    pisaTagSUP,
+    pisaTagTEXTAREA,
+    pisaTagTITLE,
+    pisaTagUL,
+)
+from xhtml2pdf.util import (
+    NO_RADIUS,
+    RADIUS_CORNERS,
+    RADIUS_PROPERTIES,
+    Display,
+    getAlign,
+    getBox,
+    getColor,
+    getDisplay,
+    getKeepInFrameMode,
+    getLengthOrAuto,
+    getPos,
+    getSize,
+    roundedBox,
+    toList,
+)
+from xhtml2pdf.w3c import cssDOMElementInterface
+from xhtml2pdf.w3c.css import (
+    CSSSelectorAttributeQualifier,
+    CSSSelectorLogicalQualifier,
+    CSSTerminalFunction,
+)
+from xhtml2pdf.w3c.css_variables import CSSPendingValue, InvalidVarError, substituteFrom
+from xhtml2pdf.w3c.generated_content import parse_content
+from xhtml2pdf.xhtml2pdf_reportlab import PmlLeftPageBreak, PmlRightPageBreak
+
+log = logging.getLogger(__name__)
+
+rxhttpstrip = re.compile(r"https?://[^/]+(.*)", re.MULTILINE | re.IGNORECASE)
+
+
+class AttrContainer(dict):
+    def __getattr__(self, name):
+        try:
+            return dict.__getattr__(self, name)
+        except Exception:
+            return self[name]
+
+
+def pisaGetAttributes(c, tag, attributes):
+    attrs = {}
+    if attributes:
+        for k, v in attributes.items():
+            try:
+                # XXX no Unicode! Reportlab fails with template names
+                attrs[str(k)] = str(v)
+            except Exception as e:  # noqa: PERF203
+                log.debug(
+                    "%s during string conversion for %s=%s", e, k, v, exc_info=True
+                )
+                attrs[k] = v
+
+    nattrs = {}
+    if tag in TAGS:
+        block, adef = TAGS[tag]
+        adef["id"] = STRING
+
+        for k, v in adef.items():
+            nattrs[k] = None
+            # print k, v
+            # defaults, wenn vorhanden
+            if isinstance(v, tuple):
+                if v[1] == MUST and k not in attrs:
+                    log.warning(c.warning("Attribute '%s' must be set!", k))
+                    nattrs[k] = None
+                    continue
+                nv = attrs.get(k, v[1])
+                dfl = v[1]
+                v = v[0]
+            else:
+                nv = attrs.get(k)
+                dfl = None
+
+            if nv is not None:
+                if isinstance(v, list):
+                    nv = nv.strip().lower()
+                    if nv not in v:
+                        # ~ raise PML_EXCEPTION, "attribute '%s' of wrong value, allowed is one of: %s" % (k, repr(v))
+                        log.warning(
+                            c.warning(
+                                "Attribute '%s' of wrong value, allowed is one of: %s",
+                                k,
+                                repr(v),
+                            )
+                        )
+                        nv = dfl
+
+                elif v == BOOL:
+                    nv = nv.strip().lower()
+                    nv = nv in {"1", "y", "yes", "true", str(k)}
+
+                elif v == SIZE:
+                    try:
+                        nv = getSize(nv)
+                    except Exception:
+                        log.warning(c.warning("Attribute '%s' expects a size value", k))
+
+                elif v == BOX:
+                    nv = getBox(nv, c.pageSize)
+
+                elif v == POS:
+                    nv = getPos(nv, c.pageSize)
+
+                elif v == INT:
+                    try:
+                        nv = int(nv)
+                    except ValueError:
+                        log.warning(c.warning("Attribute '%s' expects an integer", k))
+                        nv = None if dfl is None else int(dfl)
+
+                elif v == COLOR:
+                    nv = getColor(nv)
+
+                elif v == FILE:
+                    nv = c.getFile(nv)
+
+                elif v == FONT:
+                    nv = c.getFontName(nv)
+
+                nattrs[k] = nv
+
+    return AttrContainer(nattrs)
+
+
+#: Kept as an alias: this has always been a public name in this module, and a
+#: caller may be importing it. The list itself lives in xhtml2pdf.properties,
+#: where each property carries its group, its consumer and -- where the mapping
+#: is uniform -- the frag attribute and converter that apply it.
+attrNames = PROPERTY_NAMES
+
+#: The name the library's own stylesheet is parsed under, which declares
+#: properties for the author's benefit and is never warned about.
+DEFAULT_CSS_SOURCE = "the default CSS"
+
+
+def warnUnsupportedProperties(declaredBySource: dict[str, set[str]]) -> None:
+    """
+    Say once per source which declared properties this library will not act on.
+
+    CSSCollect asks the cascade only for the names in attrNames, so anything
+    else is parsed, cascaded, stored in the ruleset and then quietly ignored,
+    with not even a debug line to say so. Naming them is the difference
+    between "xhtml2pdf renders my CSS wrong" and "xhtml2pdf does not
+    implement float"; naming where they are written, in a document with
+    several stylesheets, says which one to look in.
+    """
+    for source, declared in declaredBySource.items():
+        if source == DEFAULT_CSS_SOURCE:
+            continue
+        # A custom property is the author's own name, read through var().
+        unsupported = sorted(
+            name
+            for name in declared - SUPPORTED_PROPERTIES
+            if not name.startswith("--")
+        )
+        if unsupported:
+            log.warning(
+                "%s: Ignoring CSS properties xhtml2pdf does not implement: %s",
+                source,
+                ", ".join(unsupported),
+            )
+
+
+#: The CSS functions the rest of the library can actually read. `url()` never
+#: reaches here as a function -- the parser hands it over as a plain string --
+#: and getColor reads the arguments of rgb(), rgba(), cmyk() and device-cmyk()
+#: off the function object. Everything else is a value nothing downstream can
+#: evaluate.
+READABLE_CSS_FUNCTIONS: frozenset[str] = frozenset(
+    {"rgb", "rgba", "cmyk", "device-cmyk"}
+)
+
+#: The functions ``content`` reads besides those (w3c/generated_content.py).
+CONTENT_FUNCTIONS: frozenset[str] = frozenset({"counter", "counters", "attr"})
+
+
+def firstUnreadableFunction(value, name: str = "") -> CSSTerminalFunction | None:
+    """
+    Return the first CSS function in `value` this library cannot evaluate as
+    the value of the property `name`.
+    """
+    readable = READABLE_CSS_FUNCTIONS
+    if name == "content":
+        readable |= CONTENT_FUNCTIONS
+    parts = value if isinstance(value, list | tuple) else (value,)
+    return next(
+        (
+            part
+            for part in parts
+            if isinstance(part, CSSTerminalFunction)
+            and part.name.lower() not in readable
+        ),
+        None,
+    )
+
+
+def dropUnreadableFunctions(
+    cssAttrs, dropped: set[str], bySource: dict[str | None, set[str]] | None = None
+) -> None:
+    """
+    Discard declarations whose value is a CSS function we cannot evaluate.
+
+    A function reaches the cascade as a CSSTerminalFunction, which is neither a
+    string nor a sequence, and every consumer in CSS2Frag treats the value as
+    one or the other. `width: calc(100% - 20pt)` therefore raised TypeError and
+    `background-image: linear-gradient(...)` AttributeError, each of them
+    aborting the whole conversion -- for CSS that a browser renders without
+    complaint and that this library would otherwise have ignored.
+
+    Dropping the declaration puts those values back with everything else
+    xhtml2pdf does not implement: ignored, and named once so the author knows
+    which of their declarations did nothing.
+    """
+    unreadable = [
+        (name, function)
+        for name, value in cssAttrs.items()
+        if (function := firstUnreadableFunction(value, name)) is not None
+    ]
+    for name, function in unreadable:
+        del cssAttrs[name]
+        declaration = f"{name}: {function.name}()"
+        dropped.add(declaration)
+        if bySource is not None:
+            bySource.setdefault(function.source, set()).add(declaration)
+
+
+def warnDroppedFunctions(
+    dropped: set[str], bySource: dict[str | None, set[str]] | None = None
+) -> None:
+    """
+    Say once which declarations were dropped for holding a CSS function,
+    one line for each source they were written in when bySource says.
+    """
+    groups = bySource or ({None: dropped} if dropped else {})
+    for source, declarations in groups.items():
+        log.warning(
+            "%sIgnoring CSS declarations whose value xhtml2pdf cannot evaluate: %s",
+            f"{source}: " if source else "",
+            ", ".join(sorted(declarations)),
+        )
+
+
+def warnUnknownTocNames(context) -> None:
+    """Say once which entries named a table of contents that never appeared."""
+    unknown = context.tocNamesUsed - set(context.tocs)
+    if unknown:
+        log.warning(
+            "Ignoring -pdf-toc-name entries for tables of contents the"
+            " document never declares: %s",
+            ", ".join(sorted(unknown)),
+        )
+
+
+def parseStyleAttr(node, cssCascade) -> dict:
+    """The declarations of node's style attribute, warnings naming the element."""
+    parser = cssCascade.parser
+    sourceName = parser.sourceName
+    parser.sourceName = f"the style attribute of <{node.tagName.lower()}>"
+    try:
+        style = parser.parseInline(node.cssElement.getStyleAttr() or "")[0]
+        parser.noteDeclared(style)
+        return style
+    finally:
+        parser.sourceName = sourceName
+
+
+def getCSSAttr(self, cssCascade, attrName, default=NotImplemented):
+    if attrName in self.cssAttrs:
+        return self.cssAttrs[attrName]
+
+    try:
+        result = cssCascade.findStyleFor(self.cssElement, attrName, default)
+    except LookupError:
+        result = None
+
+    # XXX Workaround for inline styles
+    try:
+        style = self.cssStyle
+    except Exception:
+        style = self.cssStyle = parseStyleAttr(self, cssCascade)
+    if attrName in style:
+        result = style[attrName]
+
+    if result == "inherit":
+        if hasattr(self.parentNode, "getCSSAttr"):
+            # The parent's value. This used to fall through to the raise
+            # below, so "inherit" never took effect on any property.
+            result = self.parentNode.getCSSAttr(cssCascade, attrName, default)
+        elif default is not NotImplemented:
+            return default
+        else:
+            msg = f"Could not find inherited CSS attribute value for '{attrName}'"
+            raise LookupError(msg)
+
+    if result is not None:
+        self.cssAttrs[attrName] = result
+    return result
+
+
+# TODO: Monkeypatching standard lib should go away.
+xml.dom.minidom.Element.getCSSAttr = getCSSAttr  # type: ignore[attr-defined]
+
+
+def collectCSSAttrs(node, cssCascade, attrNames) -> None:
+    """
+    Resolve every name in attrNames for `node`, walking the cascade once.
+
+    The same thing getCSSAttr does one property at a time -- inline style over
+    the cascade, "inherit" sent up to the parent, a value kept only if there is
+    one -- but asking the cascade for every name at once, so each candidate
+    selector is evaluated once per element rather than once per property.
+
+    Names are resolved in the order given, which is the registry order, so that
+    node.cssAttrs is ordered the same way anything iterating it expects.
+    """
+    resolved = cssCascade.findStylesForElement(node.cssElement, attrNames)
+
+    # XXX Workaround for inline styles
+    try:
+        style = node.cssStyle
+    except AttributeError:
+        style = node.cssStyle = parseStyleAttr(node, cssCascade)
+
+    attrs = node.cssAttrs
+    for attrName in attrNames:
+        result = style[attrName] if attrName in style else resolved.get(attrName)
+        if result is None:
+            continue
+        if result == "inherit":
+            # Delegated to getCSSAttr, which resolves it against the parent
+            # and records the value in node.cssAttrs, so there is one account
+            # of inheritance. The root element has no parent to ask.
+            try:
+                node.getCSSAttr(cssCascade, attrName)
+            except LookupError as e:
+                log.debug("%r during CSS attr '%s'", e, attrName, exc_info=True)
+            continue
+        attrs[attrName] = result
+
+
+# Create an aliasing system.  Many sources use non-standard tags, because browsers allow
+# them to.  This allows us to map a nonstandard name to the standard one.
+nonStandardAttrNames = {"bgcolor": "background-color"}
+
+#: What the type attribute of a list means in CSS. HTML's "disk" is CSS's
+#: "disc", and the ordered forms name counter styles. The attribute was
+#: declared in TAGS and parsed, and then nothing ever read it: only
+#: list-style-type in a stylesheet did anything.
+LIST_STYLE_TYPES: dict[str, dict[str, str]] = {
+    "ol": {
+        "1": "decimal",
+        "a": "lower-alpha",
+        "A": "upper-alpha",
+        "i": "lower-roman",
+        "I": "upper-roman",
+    },
+    "ul": {"circle": "circle", "disk": "disc", "square": "square"},
+}
+
+
+def mapNonStandardAttrs(c, node, attrList):
+    for attr, standard in nonStandardAttrNames.items():
+        if attr in attrList and standard not in c:
+            c[standard] = attrList[attr]
+
+    styles = LIST_STYLE_TYPES.get(node.tagName)
+    # Only when it is written down: the attribute carries a default even when
+    # the author left it out, and the default stylesheet always sets
+    # list-style-type, so there is no telling a user agent rule from an author
+    # one. A type that was actually typed wins.
+    if styles and node.hasAttribute("type"):
+        # From the DOM and not from attrList: an attribute declared as a list
+        # of allowed values is lowercased when it is parsed, and the type of a
+        # list is case sensitive -- "a" and "A" are different counters.
+        style = styles.get(node.getAttribute("type").strip())
+        if style:
+            c["list-style-type"] = style
+
+    return c
+
+
+#: Pseudo-classes whose answer depends on where an element sits among its
+#: siblings, or on what it contains. Two siblings with the same tag, class,
+#: id and style can differ on these, so they must not share a cached result.
+POSITIONAL_PSEUDO_CLASSES: frozenset[str] = frozenset(
+    {
+        "empty",
+        "first-child",
+        "first-of-type",
+        "last-child",
+        "last-of-type",
+        "middle-child",
+        "not-first-child",
+        "not-last-child",
+        "not-middle-child",
+        "nth-child",
+        "nth-last-child",
+        "nth-last-of-type",
+        "nth-of-type",
+        "only-child",
+        "only-of-type",
+        # What the element contains: its descendants and later siblings, and
+        # the text of a textarea.
+        "has",
+        "placeholder-shown",
+    }
+)
+
+#: The attributes a pseudo-class reads on the element itself. Two siblings
+#: that differ in one of them must not share a cached result either.
+PSEUDO_CLASS_ATTRIBUTES: dict[str, frozenset[str]] = {
+    "lang": frozenset({"lang", "xml:lang"}),
+    "dir": frozenset({"dir"}),
+    "link": frozenset({"href"}),
+    "any-link": frozenset({"href"}),
+    "checked": frozenset({"checked", "selected", "type"}),
+    "default": frozenset({"checked", "selected", "type"}),
+    "disabled": frozenset({"disabled"}),
+    "enabled": frozenset({"disabled"}),
+    "required": frozenset({"required"}),
+    "optional": frozenset({"required"}),
+    "read-only": frozenset({"readonly", "disabled", "type"}),
+    "read-write": frozenset({"readonly", "disabled", "type"}),
+    "placeholder-shown": frozenset({"placeholder", "value", "type"}),
+}
+
+
+def iterSubjectQualifiers(selector):
+    """
+    Every constraint a selector puts on its subject: its own qualifiers, and
+    those of the arguments of :not(), :is(), :where() and "An+B of S", which
+    are about the same element.
+    """
+    for qualifier in getattr(selector, "qualifiers", ()):
+        yield qualifier
+        if (
+            isinstance(qualifier, CSSSelectorLogicalQualifier)
+            and qualifier.name != "has"
+        ):
+            for argument in qualifier.selectors:
+                yield from iterSubjectQualifiers(argument)
+
+
+def getPositionalTagNames(cssCascade) -> set[str]:
+    """
+    Tag names some rule selects by position, so their cache key needs one.
+
+    Only a constraint on the selector's own subject counts. In
+    `ul li:first-child div` the constraint is on the li, and two div siblings
+    under one li answer it the same way, so the div does not need a position
+    in its key. "*" means every tag does.
+
+    A sibling combinator counts as a position: in `h1 + p` whether a p matches
+    depends on what comes before it, and without the position every p after
+    the first was handed the first one's result -- `h1 + p` coloured each
+    paragraph after the heading, and `h1 ~ p` none of them.
+    """
+    names: set[str] = set()
+    for ruleset in cssCascade.iterCSSRulesets():
+        for selector in ruleset:
+            if any(
+                (qualifier.isPseudo() and qualifier.name in POSITIONAL_PSEUDO_CLASSES)
+                or getattr(qualifier, "op", None) in {"+", "~"}
+                for qualifier in iterSubjectQualifiers(selector)
+            ):
+                names.add(str(selector.name).lower())
+    return names
+
+
+def getAttributeSelectorNames(cssCascade) -> frozenset[str]:
+    """
+    Attribute names some rule's subject is selected by, as in input[type=text].
+
+    Their values go in the cache key. Without them two siblings that differ
+    only in such an attribute -- a text input next to a checkbox -- shared the
+    first one's result. Only the subject counts, as for positions: an
+    attribute on an ancestor is told apart by the parent in the key.
+    """
+    names: set[str] = set()
+    for ruleset in cssCascade.iterCSSRulesets():
+        for selector in ruleset:
+            for qualifier in iterSubjectQualifiers(selector):
+                # A namespaced attribute's name is a tuple; it is left out.
+                if isinstance(qualifier, CSSSelectorAttributeQualifier) and isinstance(
+                    qualifier.name, str
+                ):
+                    names.add(qualifier.name)
+                elif qualifier.isPseudo():
+                    names |= PSEUDO_CLASS_ATTRIBUTES.get(qualifier.name, frozenset())
+    return frozenset(names)
+
+
+def getElementPosition(node) -> int:
+    """This element's 0-based position among its element siblings."""
+    position = 0
+    sibling = node.previousSibling
+    while sibling is not None:
+        if sibling.nodeType == sibling.ELEMENT_NODE:
+            position += 1
+        sibling = sibling.previousSibling
+    return position
+
+
+class CSSAttrCacheKey(NamedTuple):
+    """
+    What makes two elements resolve to the same CSS properties.
+
+    A tuple rather than the "#"-joined string this used to be. That string was
+    ambiguous: id="x" with style="color:#fff" built exactly the same key as
+    id="x#color:" with style="fff", so two different elements shared one entry.
+    A tuple has no separator to confuse.
+
+    The parent is held as the node itself and not as id(node). Two nodes alive
+    at once cannot share an id, but a freed node's id can be handed to a later
+    one, and this cache used to outlive the document that filled it.
+    """
+
+    parent: object
+    tag: str
+    css_class: str
+    css_id: str
+    style: str
+    #: Only for tags some rule selects by position; see getPositionalTagNames.
+    position: int | None = None
+    #: The values of the attributes rules select by; see
+    #: getAttributeSelectorNames.
+    attributes: tuple = ()
+
+
+def getCSSAttrCacheKey(
+    node, positional_tags=frozenset(), attribute_names=frozenset()
+) -> CSSAttrCacheKey:
+    _cl = _id = _st = ""
+    for k, v in node.attributes.items():
+        if k == "class":
+            _cl = v
+        elif k == "id":
+            _id = v
+        elif k == "style":
+            _st = v
+
+    tag = node.tagName.lower()
+
+    # Where the element sits belongs in the key whenever a structural selector
+    # asks. Without it every sibling was handed the first one's result:
+    # li:nth-child(odd) coloured a whole list, td:empty coloured no cell, and
+    # DEFAULT_CSS's own `ul li div:first-child` applied to every div. It is
+    # left out otherwise because it makes the key unique per element, and with
+    # it in unconditionally the largest fixture in testrender renders half
+    # again as slowly.
+    positional = tag in positional_tags or "*" in positional_tags
+
+    return CSSAttrCacheKey(
+        parent=node.parentNode,
+        tag=tag,
+        css_class=_cl,
+        css_id=_id,
+        style=_st,
+        position=getElementPosition(node) if positional else None,
+        attributes=tuple(
+            (name, node.getAttribute(name) if node.hasAttribute(name) else None)
+            for name in sorted(attribute_names)
+        ),
+    )
+
+
+def customProperties(node, c) -> dict[str, str]:
+    """
+    The custom properties of node: every one its parent has, and its own
+    declarations over them, since custom properties are always inherited.
+
+    Worked out on demand and kept on the element. A parent's are usually
+    already there, but an element whose styles came from the cache never had
+    them worked out, so the walk goes up as far as it must.
+    """
+    chain = []
+    node_ = node
+    while (
+        node_ is not None
+        and node_.nodeType == Node.ELEMENT_NODE
+        and getattr(node_, "cssCustomProps", None) is None
+    ):
+        chain.append(node_)
+        node_ = node_.parentNode
+    inherited: dict[str, str] = {}
+    if node_ is not None and node_.nodeType == Node.ELEMENT_NODE:
+        inherited = node_.cssCustomProps
+
+    for element in reversed(chain):
+        own: dict[str, str] = {}
+        if c.cssCustomNames:
+            if getattr(element, "cssElement", None) is None:
+                element.cssElement = cssDOMElementInterface.CSSDOMElementInterface(
+                    element
+                )
+            own = c.cssCascade.findStylesForElement(
+                element.cssElement, c.cssCustomNames
+            )
+        style = getattr(element, "cssStyle", None)
+        if style is None:
+            style = element.cssStyle = parseStyleAttr(element, c.cssCascade)
+        own.update((k, v) for k, v in style.items() if k.startswith("--"))
+
+        props = inherited
+        if own:
+            props = dict(inherited)
+            for name, value in own.items():
+                keyword = str(value).strip().lower()
+                if keyword in {"initial", "unset"}:
+                    props.pop(name, None)
+                elif keyword != "inherit":
+                    props[name] = value
+        element.cssCustomProps = props
+        inherited = props
+    return node.cssCustomProps
+
+
+def resolvePendingValues(node, attrs, c) -> None:
+    """
+    Replace the var() in node's declarations with its custom properties, and
+    parse what comes out (#743).
+
+    A declaration whose var() resolves to nothing -- an undefined property
+    with no fallback, a cycle -- or to something its property cannot read is
+    dropped, which leaves the element with what it inherits or with the
+    initial value: what CSS calls invalid at computed-value time. It used to
+    be dropped whatever it said, with "cannot evaluate: var()".
+    """
+    pending = [
+        name for name, value in attrs.items() if isinstance(value, CSSPendingValue)
+    ]
+    if not pending:
+        return
+    props = customProperties(node, c)
+    for name in pending:
+        value = attrs[name]
+        declared = value.shorthand or name
+        try:
+            text = substituteFrom(value, props)
+        except InvalidVarError as exc:
+            _warnInvalidVar(c, declared, value, str(exc))
+            del attrs[name]
+            continue
+        parsed = _parseSubstituted(c, declared, text, value.source)
+        if name in parsed:
+            attrs[name] = parsed[name]
+        else:
+            del attrs[name]
+
+
+def _parseSubstituted(c, declared: str, text: str, source: str | None) -> dict:
+    """The longhands of `declared: text`, parsed once per document."""
+    key = (declared, text)
+    cached = c.cssVarCache.get(key)
+    if cached is None:
+        parser = c.cssCascade.parser
+        sourceName = parser.sourceName
+        parser.sourceName = ", ".join(filter(None, (source, f"var() in {declared}")))
+        try:
+            cached = parser.parseInline(f"{declared}: {text}")[0]
+        finally:
+            parser.sourceName = sourceName
+        c.cssVarCache[key] = cached
+    return cached
+
+
+def _warnInvalidVar(c, declared: str, value, reason: str) -> None:
+    key = (declared, str(value))
+    if key not in c.cssVarWarned:
+        c.cssVarWarned.add(key)
+        where = f"{value.source}: " if value.source else ""
+        log.warning("%sIgnoring %s: %s, as %s", where, declared, value, reason)
+
+
+def CSSCollect(node, c):
+    if c.css:
+        key = getCSSAttrCacheKey(node, c.cssPositionalTags, c.cssAttributeNames)
+        cached = c.cssAttrCache.get(key)
+        if cached is not None:
+            node.cssAttrs = resolveRootEm(cached, c)
+            return node.cssAttrs
+
+        node.cssElement = cssDOMElementInterface.CSSDOMElementInterface(node)
+        node.cssAttrs = CSSAttrs()
+        collectCSSAttrs(node, c.cssCascade, PROPERTY_NAMES)
+        resolvePendingValues(node, node.cssAttrs, c)
+
+        dropUnreadableFunctions(
+            node.cssAttrs, c.cssDroppedFunctions, c.cssDroppedFunctionSources
+        )
+
+        c.cssAttrCache[key] = node.cssAttrs
+        node.cssAttrs = resolveRootEm(node.cssAttrs, c)
+    return node.cssAttrs
+
+
+def CSSCollectPseudo(node, c, pseudo: str) -> CSSAttrs | None:
+    """
+    The CSS properties of the ::before or ::after of `node`, or None when it
+    has none: no rule is for it, or none gives it a ``content``.
+
+    Resolved through the same cascade as the element, with the element's
+    own style="" left out -- an inline style cannot name a pseudo-element.
+    Inherited properties come from the element's frag, which the
+    pseudo-element's is cloned from, so "inherit" needs nothing here.
+    """
+    if not c.css or not c.cssCascade.hasPseudoRules(pseudo):
+        return None
+    key = (getCSSAttrCacheKey(node, c.cssPositionalTags, c.cssAttributeNames), pseudo)
+    if key not in c.cssPseudoCache:
+        element = cssDOMElementInterface.CSSDOMElementInterface(node)
+        element.pseudoElement = pseudo
+        resolved = c.cssCascade.findStylesForElement(element, PROPERTY_NAMES)
+        attrs = CSSAttrs(
+            (name, resolved[name])
+            for name in PROPERTY_NAMES
+            if name in resolved and resolved[name] != "inherit"
+        )
+        resolvePendingValues(node, attrs, c)
+        dropUnreadableFunctions(
+            attrs, c.cssDroppedFunctions, c.cssDroppedFunctionSources
+        )
+        c.cssPseudoCache[key] = attrs if "content" in attrs else None
+    attrs = c.cssPseudoCache[key]
+    return None if attrs is None else resolveRootEm(attrs, c)
+
+
+def emitPseudo(node, context, pseudo: str, kw) -> None:
+    """
+    Add the text of the ::before or ::after of `node` where the walk is.
+
+    It goes through addFrag like the element's own text, in a frag of its
+    own styled by the pseudo-element's declarations: so it is part of the
+    paragraph's text, and a numbered heading's number reaches its table of
+    contents entry and its outline title. The pseudo-element is always
+    inline.
+    """
+    attrs = CSSCollectPseudo(node, context, pseudo)
+    if attrs is None:
+        return
+    items = parse_content(attrs["content"])
+    if items is None:
+        return
+    context.counters.apply(node, attrs)
+    text = context.counters.text(items, node)
+    if not text:
+        return
+    saved = context.cssAttr
+    context.pushFrag()
+    reset_non_inherited(context.frag)
+    context.cssAttr = attrs
+    try:
+        CSS2Frag(context, dict(kw), isBlock=False)
+    finally:
+        context.cssAttr = saved
+    context.addFrag(text)
+    context.pullFrag()
+
+
+#: 1rem inside the root element itself: the initial font size, `medium`.
+INITIAL_FONT_SIZE = 12.0
+
+
+def _resolveRootEm(value, root):
+    if isinstance(value, tuple) and len(value) == 2 and str(value[1]).lower() == "rem":
+        try:
+            return (f"{float(value[0]) * root:g}", "pt")
+        except ValueError:
+            return value
+    if isinstance(value, list):
+        return [_resolveRootEm(part, root) for part in value]
+    return value
+
+
+def resolveRootEm(attrs, c):
+    """
+    Resolve `rem` against the root element's font size.
+
+    getSize read a rem as an em, relative to the element's own font size,
+    so `2rem` under a 10px parent came out as 20px whatever <html> said.
+    The root's size is only known once <html> has been styled, which is
+    after the cascade, so the lengths are rewritten here in points; the
+    attrs the cache holds are left as written.
+    """
+    if not any(_resolveRootEm(value, 1.0) != value for value in attrs.values()):
+        return attrs
+    root = c.rootFontSize if c.rootFontSize is not None else INITIAL_FONT_SIZE
+    resolved = type(attrs)()
+    for name, value in attrs.items():
+        resolved[name] = _resolveRootEm(value, root)
+    return resolved
+
+
+def lower(sequence):
+    if isinstance(sequence, str):
+        return sequence.lower()
+    return sequence[0].lower()
+
+
+#: The colour of text written `color: transparent`: black with no ink.
+TRANSPARENT = Color(0, 0, 0, alpha=0)
+
+
+def CSS2Frag(c, kw, isBlock):
+    # COLORS
+    if "color" in c.cssAttr:
+        # `transparent` is a colour for text, one nothing shows through:
+        # getColor hands back the default for it, which is right for a
+        # background with nothing to paint and made the text black.
+        if str(c.cssAttr["color"]).strip().lower() == "transparent":
+            c.frag.textColor = TRANSPARENT
+        else:
+            c.frag.textColor = getColor(c.cssAttr["color"], "#000000")
+    if "background-color" in c.cssAttr:
+        c.frag.backColor = getColor(c.cssAttr["background-color"], "#ffffff")
+        # FONT SIZE, STYLE, WEIGHT
+    if "font-family" in c.cssAttr:
+        # The whole list, not only the winner: the families after the first
+        # are what a character the first one has no glyph for falls back to.
+        c.frag.fontFamilies = c.getFontNames(c.cssAttr["font-family"])
+        c.frag.fontName = c.getFontName(c.cssAttr["font-family"])
+    if "font-size" in c.cssAttr:
+        # XXX inherit
+        c.frag.fontSize = max(
+            getSize("".join(c.cssAttr["font-size"]), c.frag.fontSize, c.baseFontSize),
+            1.0,
+        )
+    if "line-height" in c.cssAttr:
+        leading = "".join(c.cssAttr["line-height"])
+        c.frag.leading = getSize(leading, c.frag.fontSize)
+        c.frag.leadingSource = leading
+    else:
+        c.frag.leading = getSize(c.frag.leadingSource, c.frag.fontSize)
+    if "letter-spacing" in c.cssAttr:
+        c.frag.letterSpacing = c.cssAttr["letter-spacing"]
+    if "word-spacing" in c.cssAttr:
+        c.frag.wordSpacing = c.cssAttr["word-spacing"]
+    if "text-transform" in c.cssAttr:
+        c.frag.textTransform = lower(c.cssAttr["text-transform"])
+    if "-pdf-line-spacing" in c.cssAttr:
+        c.frag.leadingSpace = getSize("".join(c.cssAttr["-pdf-line-spacing"]))
+        # print "line-spacing", c.cssAttr["-pdf-line-spacing"], c.frag.leading
+    if "font-weight" in c.cssAttr:
+        value = lower(c.cssAttr["font-weight"])
+        if value in {"bold", "bolder", "500", "600", "700", "800", "900"}:
+            c.frag.bold = 1
+        else:
+            c.frag.bold = 0
+    for value in toList(c.cssAttr.get("text-decoration", "")):
+        if "underline" in value:
+            c.frag.underline = 1
+        if "line-through" in value:
+            c.frag.strike = 1
+        if "none" in value:
+            c.frag.underline = 0
+            c.frag.strike = 0
+    if "font-style" in c.cssAttr:
+        value = lower(c.cssAttr["font-style"])
+        if value in {"italic", "oblique"}:
+            c.frag.italic = 1
+        else:
+            c.frag.italic = 0
+    if "white-space" in c.cssAttr:
+        # normal | pre | nowrap
+        c.frag.whiteSpace = str(c.cssAttr["white-space"]).lower()
+        # ALIGN & VALIGN
+    if "text-align" in c.cssAttr:
+        c.frag.alignment = getAlign(c.cssAttr["text-align"])
+    if "vertical-align" in c.cssAttr:
+        c.frag.vAlign = c.cssAttr["vertical-align"]
+        # HEIGHT & WIDTH
+    if "height" in c.cssAttr:
+        try:
+            # XXX Relative is not correct!
+            c.frag.height = "".join(toList(c.cssAttr["height"]))
+        except TypeError:
+            # sequence item 0: expected string, tuple found
+            c.frag.height = "".join(toList(c.cssAttr["height"][0]))
+        if c.frag.height == "auto":
+            c.frag.height = None
+    if "width" in c.cssAttr:
+        try:
+            # XXX Relative is not correct!
+            c.frag.width = "".join(toList(c.cssAttr["width"]))
+        except TypeError:
+            c.frag.width = "".join(toList(c.cssAttr["width"][0]))
+        if c.frag.width == "auto":
+            c.frag.width = None
+        # ZOOM
+    if "zoom" in c.cssAttr:
+        # XXX Relative is not correct!
+        zoom = "".join(toList(c.cssAttr["zoom"]))
+        if zoom.endswith("%"):
+            zoom = float(zoom[:-1]) / 100.0
+        c.frag.zoom = float(zoom)
+        # MARGINS & LIST INDENT, STYLE
+    if isBlock:
+        # Margins, indent, paddings and border widths, styles and colours: the
+        # properties whose whole consumption is a mapping onto a frag
+        # attribute through one converter. The pairs come from the registry
+        # rather than being repeated here, so a border side cannot be
+        # forgotten on one of the three lists and not the others.
+        apply_uniform_groups(c.frag, c.cssAttr, FRAG_BLOCK_GROUPS)
+
+        if "margin-left" in c.cssAttr:
+            c.frag.bulletIndent = kw["margin-left"]  # For lists
+            kw["margin-left"] += getSize(c.cssAttr["margin-left"], c.frag.fontSize)
+            c.frag.leftIndent = kw["margin-left"]
+        if "margin-right" in c.cssAttr:
+            c.frag.bulletRightIndent = kw["margin-right"]  # For right-to-left lists
+            kw["margin-right"] += getSize(c.cssAttr["margin-right"], c.frag.fontSize)
+            c.frag.rightIndent = kw["margin-right"]
+
+        if "background-image" in c.cssAttr:
+            # `none` is a keyword, not a filename.
+            image = c.cssAttr["background-image"]
+            c.frag.backgroundImage = (
+                None if str(image).strip().lower() == "none" else c.getFile(image)
+            )
+        if "background-repeat" in c.cssAttr:
+            c.frag.backgroundRepeat = lower(c.cssAttr["background-repeat"])
+        if "background-position" in c.cssAttr:
+            c.frag.backgroundPosition = " ".join(
+                str(part) for part in toList(c.cssAttr["background-position"])
+            )
+        if "list-style-type" in c.cssAttr:
+            c.frag.listStyleType = str(c.cssAttr["list-style-type"]).lower()
+        if "list-style-image" in c.cssAttr:
+            # `none` is a keyword, not a filename. It reaches here from the
+            # list-style shorthand, which sets both type and image.
+            image = c.cssAttr["list-style-image"]
+            c.frag.listStyleImage = (
+                None if str(image).strip().lower() == "none" else c.getFile(image)
+            )
+
+
+#: The declarations that give an inline element a box of its own. Written
+#: out in full so the registry check in the tests can see each name.
+_INLINE_BOX_PROPERTIES = (
+    "padding-left",
+    "padding-right",
+    "padding-top",
+    "padding-bottom",
+    "border-left-style",
+    "border-right-style",
+    "border-top-style",
+    "border-bottom-style",
+    "background-image",
+    "margin-left",
+    "margin-right",
+)
+
+
+#: Inline elements that are not text: an image or a barcode is one word of
+#: its own height, and a box drawn to the line's ascent and descent would
+#: not fit it. They keep ignoring padding, borders and side margins.
+_REPLACED_INLINE_TAGS = frozenset({"img", "br", "hr", "pdfbarcode"})
+
+
+def declaresInlineBox(context, tagName: str) -> bool:
+    if tagName in _REPLACED_INLINE_TAGS:
+        return False
+    cssAttr = context.cssAttr
+    # A radius makes a box of the element's own background colour, which
+    # otherwise is painted word by word: `border-radius: 1em` on a
+    # highlighted span is how a pill badge is written.
+    return any(name in cssAttr for name in _INLINE_BOX_PROPERTIES) or (
+        "background-color" in cssAttr
+        and any(name in cssAttr for name in RADIUS_PROPERTIES)
+    )
+
+
+#: Elements that never get a block box: the page itself, whose background
+#: is the canvas's, and a table and its parts, which draw their own.
+_NO_BLOCK_BOX_TAGS = frozenset(
+    {
+        "html",
+        "body",
+        "table",
+        "thead",
+        "tbody",
+        "tfoot",
+        "tr",
+        "td",
+        "th",
+        "hr",
+        "pdftoc",
+    }
+)
+
+#: Tags that put something other than text into a block's story, whatever
+#: their display: a table, a rule, a break, a spacer, an index, a chart.
+_BLOCK_CONTENT_TAGS = frozenset(
+    {
+        "table",
+        "hr",
+        "pdfnextpage",
+        "pdfnextframe",
+        "pdfnexttemplate",
+        "pdfspacer",
+        "pdftoc",
+        "canvas",
+    }
+)
+
+
+def isEmptyBlock(node) -> bool:
+    """Whether an element holds neither an element nor any text."""
+    for child in node.childNodes:
+        if child.nodeType == Node.ELEMENT_NODE:
+            return False
+        if child.nodeType == Node.TEXT_NODE and child.data.strip():
+            return False
+    return True
+
+
+def hasBlockContent(node, context) -> bool:
+    """
+    Whether an element holds a block, looking down through inline elements.
+
+    A block of text is one paragraph, which draws its own box; only a block
+    holding blocks needs a box drawn around them (BlockBox). Asked before
+    the children are visited, so it reads their display from the stylesheet
+    as pisaLoop will.
+    """
+    for child in node.childNodes:
+        if child.nodeType != Node.ELEMENT_NODE:
+            continue
+        tag = child.tagName.replace(":", "").lower()
+        if tag in {"style", "script"}:
+            continue
+        if tag in _BLOCK_CONTENT_TAGS:
+            return True
+        css = CSSCollect(child, context)
+        display = getDisplay(css.get("display", "inline"))
+        if display == Display.NONE or read_position(css) in {"absolute", "fixed"}:
+            continue
+        if display in {Display.BLOCK, Display.FLEX}:
+            return True
+        if display == Display.INLINE and hasBlockContent(child, context):
+            return True
+    return False
+
+
+#: The block groups that make an element's box: padding and borders, without
+#: the text-indent and vertical margins that travel with them for a block.
+_INLINE_BOX_GROUPS = tuple(
+    UniformGroup(group.convert, group.relative_to_font_size, pairs)
+    for group in FRAG_BLOCK_GROUPS
+    if (
+        pairs := tuple(
+            pair for pair in group.pairs if pair[0].startswith(("padding", "border"))
+        )
+    )
+)
+
+
+def _stripInlineBox(frag) -> None:
+    """Take the padding and borders off an inline element's frag again."""
+    for side in ("Left", "Right", "Top", "Bottom"):
+        setattr(frag, f"padding{side}", 0)
+        setattr(frag, f"border{side}Width", 0)
+        setattr(frag, f"border{side}Style", None)
+        setattr(frag, f"border{side}Color", None)
+    for corner in RADIUS_CORNERS:
+        setattr(frag, f"border{corner}Radius", NO_RADIUS)
+
+
+def inlineBoxMarkers(context):
+    """
+    The pair of frags that carry an inline element's box, or None.
+
+    CSS2Frag reads padding, borders and background images for blocks only.
+    An inline element that declares them gets them applied here, taken off
+    its frag again so that its text does not paint them, and carried by a
+    marker on either side of the content instead. A declaration that adds
+    up to nothing -- a reset such as `* { padding: 0 }` -- is no box: the
+    text goes on painting its own background colour, as before.
+    """
+    frag = context.frag
+    cssAttr = context.cssAttr
+    backColor = frag.backColor
+    apply_uniform_groups(frag, cssAttr, _INLINE_BOX_GROUPS)
+    style = BoxStyle(frag)
+    _stripInlineBox(frag)
+    # The frag is a clone of its parent's: only the element's own image counts.
+    style.backgroundImage = None
+    if "background-image" in cssAttr:
+        # `none` is a keyword, not a filename.
+        image = cssAttr["background-image"]
+        style.backgroundImage = (
+            None if str(image).strip().lower() == "none" else context.getFile(image)
+        )
+    if "background-repeat" in cssAttr:
+        style.backgroundRepeat = lower(cssAttr["background-repeat"])
+    if "background-position" in cssAttr:
+        style.backgroundPosition = " ".join(
+            str(part) for part in toList(cssAttr["background-position"])
+        )
+    size = frag.fontSize
+    margins = tuple(
+        (
+            getLengthOrAuto(cssAttr[name], size).resolve(None) or 0.0
+            if name in cssAttr
+            else 0.0
+        )
+        for name in ("margin-left", "margin-right")
+    )
+    rounded_color = (
+        "background-color" in cssAttr
+        and backColor
+        and roundedBox(style, 0.0, 0.0, 1.0, 1.0) is not None
+    )
+    if not (
+        style.horizontal
+        or style.vertical
+        or style.backgroundImage
+        or any(margins)
+        or rounded_color
+    ):
+        return None
+    # The box paints the background; the words inside it must not.
+    frag.backColor = None
+    style.backColor = backColor
+    return inline_box_markers(frag, style, margins)
+
+
+def pageBreakValue(cssAttr, side: str) -> str | None:
+    """
+    What `page-break-<side>` or `break-<side>` asks for, in CSS 2.1's words.
+
+    CSS Fragmentation 3 renamed the properties and some values: `page` is
+    `always`, `avoid-page` is `avoid`. The CSS 2.1 name wins when both are
+    declared.
+    """
+    for name in (f"page-break-{side}", f"break-{side}"):
+        if name in cssAttr:
+            value = str(cssAttr[name]).strip().lower()
+            return {"page": "always", "avoid-page": "avoid"}.get(value, value)
+    return None
+
+
+def applyWordBreaking(frag, cssAttr) -> None:
+    """
+    Where a word may be broken: overflow-wrap, word-break and -pdf-word-wrap.
+
+    A word was never broken, however long, unless the whole paragraph was laid
+    out with -pdf-word-wrap: CJK; one wider than its line ran off the page.
+    overflow-wrap: break-word or anywhere -- and word-wrap, its old name --
+    split such a word into pieces that fit, and leave every other word whole.
+    It is a property of the text rather than of the paragraph, so it works on
+    an <a> inside one. word-break: break-all is -pdf-word-wrap: CJK under its
+    standard name: the paragraph breaks between any two characters.
+    """
+    for name in ("word-wrap", "overflow-wrap"):
+        if name in cssAttr:
+            value = str(cssAttr[name]).strip().lower()
+            frag.splitLongWords = value in {"break-word", "anywhere"}
+    if "word-break" in cssAttr:
+        value = str(cssAttr["word-break"]).strip().lower()
+        if value == "break-all":
+            frag.wordWrap = "CJK"
+            frag.splitLongWords = True
+        elif value == "break-word":
+            # Deprecated, and defined as overflow-wrap: anywhere.
+            frag.splitLongWords = True
+    if "-pdf-word-wrap" in cssAttr:
+        frag.wordWrap = cssAttr["-pdf-word-wrap"]
+
+
+def pisaPreLoop(node, context, *, collect=False):
+    """Collect all CSS definitions."""
+    data = ""
+    if node.nodeType == Node.TEXT_NODE and collect:
+        data = node.data
+
+    elif node.nodeType == Node.ELEMENT_NODE:
+        name = node.tagName.lower()
+
+        if name == "a":
+            href = node.getAttribute("href").strip()
+            if href.startswith("#") and len(href) > 1:
+                context.linkTargets.add(href[1:])
+
+        if name in {"style", "link"}:
+            attr = pisaGetAttributes(context, name, node.attributes)
+            media = [x.strip() for x in attr.media.lower().split(",") if x.strip()]
+
+            if attr.get("type", "").lower() in {"", "text/css"} and (
+                not media or "all" in media or "print" in media or "pdf" in media
+            ):
+                if name == "style":
+                    for child in node.childNodes:
+                        data += pisaPreLoop(child, context, collect=True)
+                    context.addCSS(data)
+                    return ""
+
+                if name == "link" and attr.href and attr.rel.lower() == "stylesheet":
+                    # print "CSS LINK", attr
+                    context.addCSS(
+                        '\n@import "{}" {};'.format(attr.href, ",".join(media)),
+                        sourceName=f'<link href="{attr.href}">',
+                    )
+
+    for child in node.childNodes:
+        result = pisaPreLoop(child, context, collect=collect)
+        if collect:
+            data += result
+
+    return data
+
+
+def _keeps_with_next(flowable) -> bool:
+    """Whether `flowable` asks to stay on the page of the one after it."""
+    get = getattr(flowable, "getKeepWithNext", None)
+    return bool(get() if get is not None else getattr(flowable, "keepWithNext", 0))
+
+
+def _take_page_padding(context, kw: dict) -> None:
+    """
+    Turn the padding of <html> or <body> into room around the page content.
+
+    The side padding indents everything inside and the top padding is room
+    above the first block. Nothing follows the last block, so the bottom
+    padding has nothing to keep away; a page of its own for it would be
+    empty. The padding is taken off the frag, so nothing inside draws it.
+    """
+    frag = context.frag
+    left = getattr(frag, "paddingLeft", 0) or 0
+    right = getattr(frag, "paddingRight", 0) or 0
+    kw["margin-left"] += left
+    kw["margin-right"] += right
+    inset_left, inset_right = context.pageInset
+    context.pageInset = (inset_left + left, inset_right + right)
+    frag.paddingLeft = frag.paddingRight = 0
+    frag.leftIndent = kw["margin-left"]
+    frag.rightIndent = kw["margin-right"]
+    top = getattr(frag, "paddingTop", 0) or 0
+    frag.paddingTop = frag.paddingBottom = 0
+    if top:
+        context.addStory(Spacer(0, top))
+
+
+def pisaLoop(node, context, **kw):
+    # Once per element: a render's time limit is checked as it goes.
+    check_deadline()
+
+    # Initialize KW. The copy keeps a child's margins out of its siblings'.
+    if not kw:
+        kw = {"margin-top": 0, "margin-bottom": 0, "margin-left": 0, "margin-right": 0}
+    else:
+        kw = dict(kw)
+
+    # TEXT
+    if node.nodeType == Node.TEXT_NODE:
+        # print indent, "#", repr(node.data) #, context.frag
+        context.addFrag(node.data)
+        # context.text.append(node.value)
+
+    # ELEMENT
+    elif node.nodeType == Node.ELEMENT_NODE:
+        node.tagName = node.tagName.replace(":", "").lower()
+
+        if node.tagName in {"style", "script"}:
+            return
+
+        # Prepare attributes
+        attr = pisaGetAttributes(context, node.tagName, node.attributes)
+
+        # Calculate styles
+        context.cssAttr = CSSCollect(node, context)
+        context.cssAttr = mapNonStandardAttrs(context.cssAttr, node, attr)
+        context.node = node
+
+        # Block?
+        PAGE_BREAK = 1
+        PAGE_BREAK_RIGHT = 2
+        PAGE_BREAK_LEFT = 3
+        PAGE_BREAK_AVOID = 4
+
+        pageBreakAfter = False
+        breakInsideAvoid = False
+        frameAlignBottom = False
+        blockStoryStart = 0
+        frameBreakAfter = False
+        display = getDisplay(context.cssAttr.get("display", "inline"))
+        isFlex = display == Display.FLEX
+        isBlock = display in {Display.BLOCK, Display.FLEX}
+        # css-flexbox-1, 4: the children of a flex container are blockified.
+        # Only the child itself: collecting_item is off again once it has
+        # published its properties, before its own children are visited.
+        if context.flexData.collecting_item and display != Display.NONE:
+            isBlock = True
+        # An inline-block is a box inside the line: it must not close the
+        # paragraph it sits in, but it does have a block's padding, borders
+        # and background, which CSS2Frag only reads for a block.
+        isInlineBlock = display == Display.INLINE_BLOCK and not isBlock
+
+        if isBlock:
+            context.addPara()
+
+            # Page break by CSS
+            if "-pdf-next-page" in context.cssAttr:
+                context.addStory(
+                    NextPageTemplate(str(context.cssAttr["-pdf-next-page"]))
+                )
+            if (
+                "-pdf-page-break" in context.cssAttr
+                and str(context.cssAttr["-pdf-page-break"]).lower() == "before"
+            ):
+                context.addStory(PageBreak())
+            if "-pdf-frame-break" in context.cssAttr:
+                if str(context.cssAttr["-pdf-frame-break"]).lower() == "before":
+                    context.addStory(FrameBreak())
+                if str(context.cssAttr["-pdf-frame-break"]).lower() == "after":
+                    frameBreakAfter = True
+            breakBefore = pageBreakValue(context.cssAttr, "before")
+            if breakBefore == "always":
+                context.addStory(PageBreak())
+            if breakBefore == "right":
+                context.addStory(PageBreak())
+                context.addStory(PmlRightPageBreak())
+            if breakBefore == "left":
+                context.addStory(PageBreak())
+                context.addStory(PmlLeftPageBreak())
+            if breakBefore == "avoid" and context.story:
+                # Whatever came before stays on the page this block starts on.
+                context.story[-1].keepWithNext = True
+            breakAfter = pageBreakValue(context.cssAttr, "after")
+            if breakAfter == "always":
+                pageBreakAfter = PAGE_BREAK
+            if breakAfter == "right":
+                pageBreakAfter = PAGE_BREAK_RIGHT
+            if breakAfter == "left":
+                pageBreakAfter = PAGE_BREAK_LEFT
+            if breakAfter == "avoid":
+                pageBreakAfter = PAGE_BREAK_AVOID
+            breakInsideAvoid = pageBreakValue(context.cssAttr, "inside") == "avoid"
+            frameAlignBottom = (
+                str(context.cssAttr.get("-pdf-frame-align", "")).strip().lower()
+                == "bottom"
+            )
+            blockStoryStart = len(context.story)
+
+        if display == Display.NONE:
+            return
+
+        # Translate CSS to frags
+
+        # Save previous frag styles
+        context.pushFrag()
+        # The clone carries the parent's every attribute; the ones CSS does
+        # not inherit go back to their initial value before this element's
+        # own declarations apply.
+        reset_non_inherited(context.frag)
+
+        # An absolute or fixed box is a block whatever its display (CSS 2.1
+        # 9.7), so its padding, borders and background are read as one.
+        position = read_position(context.cssAttr)
+        outOfFlow = position in {"absolute", "fixed"}
+        parentIndent = kw["margin-left"]
+
+        # Map styles to Reportlab fragment properties
+        CSS2Frag(context, kw, isBlock=isBlock or isInlineBlock or outOfFlow)
+        if node.tagName == "html":
+            context.rootFontSize = context.frag.fontSize
+        if isBlock and node.tagName in {"html", "body"}:
+            _take_page_padding(context, kw)
+
+        offsets = (
+            read_offsets(context.cssAttr, context.frag.fontSize)
+            if position != "static"
+            else None
+        )
+        relativeContainer = None
+        if position == "relative" and isBlock:
+            blockIndent = kw["margin-left"]
+            relativeContainer = open_relative_container(
+                context, context.frag, context.cssAttr, kw["margin-right"]
+            )
+        if position == "relative" and not isBlock:
+            context.warnOnce(
+                "position: relative is applied to blocks only; an inline element"
+                " keeps its place"
+            )
+
+        # <a href="#x"> reaches any element whose id is x, not only an
+        # <a name="x">; only <a name> used to make a destination, and a link
+        # to a heading's id was dropped as pointing nowhere.
+        ident = node.getAttribute("id").strip()
+        if ident in context.linkTargets and ident not in context.anchorName:
+            context.addAnchor(ident)
+
+        # EXTRAS
+        # -pdf-keep-with-next, -pdf-outline and -pdf-outline-open. Read here
+        # and not in CSS2Frag because pisaContext.addTOC calls CSS2Frag
+        # directly for the .pdftoclevelN styles, and a table of contents
+        # should not pick up an outline flag from them.
+        apply_uniform_groups(context.frag, context.cssAttr, LOOP_GROUPS)
+        context.counters.apply(node.parentNode, context.cssAttr)
+
+        isFlexItem = context.flexData.collecting_item
+        if isFlexItem:
+            # This element is a flex item. Its properties are read off its
+            # own frag, and its margins are the item's place in the row, not
+            # an indent for the paragraphs inside it.
+            context.flexData.set_item_style(context.frag, context.cssAttr)
+            kw["margin-left"] = kw["margin-right"] = 0
+
+        if node.tagName == "table":
+            # The table's own margins place the table (tables.py reads them),
+            # and the indent of a block around it is not applied to it. The
+            # content of a cell starts at the cell, indented by neither.
+            context.frag.leftIndent = context.frag.rightIndent = 0
+            context.frag.bulletIndent = context.frag.bulletRightIndent = 0
+            kw["margin-left"] = kw["margin-right"] = 0
+
+        if "-pdf-outline-level" in context.cssAttr:
+            context.frag.outlineLevel = int(context.cssAttr["-pdf-outline-level"])
+
+        applyWordBreaking(context.frag, context.cssAttr)
+
+        # handle keep-in-frame
+        keepInFrameMode = None
+        keepInFrameMaxWidth = 0
+        keepInFrameMaxHeight = 0
+        if "-pdf-keep-in-frame-mode" in context.cssAttr:
+            keepInFrameMode = getKeepInFrameMode(
+                context.cssAttr["-pdf-keep-in-frame-mode"]
+            )
+
+        if "-pdf-keep-in-frame-max-width" in context.cssAttr:
+            keepInFrameMaxWidth = getSize(
+                "".join(context.cssAttr["-pdf-keep-in-frame-max-width"])
+            )
+        if "-pdf-keep-in-frame-max-height" in context.cssAttr:
+            keepInFrameMaxHeight = getSize(
+                "".join(context.cssAttr["-pdf-keep-in-frame-max-height"])
+            )
+
+        # BEGIN tag
+        klass = globals().get("pisaTag%s" % node.tagName.replace(":", "").upper(), None)
+        obj = None
+
+        # Static block
+        elementId = attr.get("id", None)
+        staticFrame = context.frameStatic.get(elementId, None)
+        if staticFrame:
+            context.frag.insideStaticFrame += 1
+            oldStory = context.swapStory()
+
+        # ignore nested keep-in-frames, tables have their own KIF handling
+        keepInFrame = keepInFrameMode is not None and context.keepInFrameIndex is None
+        if keepInFrame:
+            # keep track of current story index, so we can wrap everythink
+            # added after this point in a KeepInFrame. This has to come after
+            # the story swap above: an element that is itself the content of a
+            # static frame starts a story of its own, and an index taken from
+            # the story it interrupted would cut the frame's content in the
+            # wrong place.
+            context.keepInFrameIndex = len(context.story)
+
+        # Flex container: its children are collected as items into a story
+        # of their own, and the container goes into this story as one
+        # flowable when the element closes. After the keep-in-frame index,
+        # which must count the story the container will land in.
+        if isFlex:
+            context.addPara()
+            context.clearFrag()
+            flexData = FlexData(context.frag, context.cssAttr, rtl=context.dir == "rtl")
+            savedFlexData, context.flexData = context.flexData, flexData
+            savedFlexStory = context.swapStory()
+            # The container paints its own box; its items start from none,
+            # and are not indented by the container's margins twice.
+            clear_box(context.frag)
+            kw["margin-left"] = kw["margin-right"] = 0
+
+        # A block whose padding, border or background goes round other
+        # blocks: they are collected into a box drawn once around them all,
+        # rather than each drawing the box around itself (#627).
+        blockBox = None
+        if (
+            isBlock
+            and not isFlex
+            and not outOfFlow
+            and not context.flexData.collecting_item
+            and node.tagName not in _NO_BLOCK_BOX_TAGS
+        ):
+            boxStyle = block_box_style(context, kw)
+            # A block of text alone is one paragraph, which draws its own
+            # box -- unless the block is empty, when there is no paragraph
+            # to draw it, or declares a height or a width, which a paragraph
+            # ignores.
+            # Not a flex item: the container sizes and draws its items.
+            sized = bool(declared_height(context)) or (
+                declared_width(context) is not None
+            )
+            if boxStyle is not None and (
+                hasBlockContent(node, context)
+                or (not isFlexItem and (isEmptyBlock(node) or sized))
+            ):
+                blockBox = BlockBoxData(context, kw, boxStyle)
+
+        inlineBox = None
+        positionedBox = None
+        if outOfFlow:
+            positionedBox = PositionedBoxData(
+                context,
+                context.frag,
+                context.cssAttr,
+                position,
+                offsets,
+                block_level=isBlock,
+                indent=parentIndent,
+            )
+            kw["margin-left"] = kw["margin-right"] = 0
+        elif isInlineBlock:
+            inlineBox = InlineBoxData(context, context.frag, context.cssAttr)
+            kw["margin-left"] = kw["margin-right"] = 0
+
+        # An inline element with a box of its own: padding, borders, a
+        # background image or side margins, carried by a marker frag on
+        # either side of the content.
+        inlineBoxClose = None
+        if (
+            display == Display.INLINE
+            and not isBlock
+            and not outOfFlow
+            and declaresInlineBox(context, node.tagName)
+        ):
+            markers = inlineBoxMarkers(context)
+            if markers is not None:
+                inlineBoxOpen, inlineBoxClose = markers
+                context.fragList.append(inlineBoxOpen)
+
+        # Tag specific operations
+        if klass is not None:
+            obj = klass(node, attr)
+            obj.start(context)
+
+        # Visit child nodes, with a frag that carries only what this element
+        # changed: every clone of it below copies what it holds.
+        compact_frag(context.frag)
+        context.fragBlock = fragBlock = copy.copy(context.frag)
+        # A block without a box of its own: its vertical margins go on the
+        # first and last thing it puts into the flow when it closes, not on
+        # every paragraph of its own text.
+        blockMargins = None
+        placedElsewhere = isFlex or isFlexItem or outOfFlow or bool(staticFrame)
+        if (
+            isBlock
+            and blockBox is None
+            and not placedElsewhere
+            and node.tagName not in _NO_BLOCK_BOX_TAGS
+        ):
+            blockMargins = (fragBlock.spaceBefore or 0, fragBlock.spaceAfter or 0)
+            fragBlock.spaceBefore = fragBlock.spaceAfter = 0
+        if isBlock:
+            # A block's background belongs to its box, which fragBlock (or the
+            # block box) paints. Inherited by the words inside, it was painted
+            # a second time behind every line: invisible while opaque, twice
+            # as dark with an alpha.
+            context.frag.backColor = None
+        if not isFlex:
+            emitPseudo(node, context, "before", kw)
+        for nnode in node.childNodes:
+            if isFlex:
+                context.flexData.begin_item(context)
+            pisaLoop(nnode, context, **kw)
+            if isFlex:
+                context.flexData.end_item(context)
+        context.fragBlock = fragBlock
+        if not isFlex:
+            emitPseudo(node, context, "after", kw)
+        context.counters.leave(node)
+
+        # END tag
+        if obj:
+            obj.end(context)
+
+        if isFlex:
+            context.addPara()
+            flexData, context.flexData = context.flexData, savedFlexData
+            context.swapStory(savedFlexStory)
+            container = flexData.build()
+            if container is not None:
+                context.addStory(container)
+
+        if blockBox is not None:
+            for flowable in blockBox.close(context):
+                context.addStory(flowable)
+
+        if inlineBox is not None:
+            inlineBox.close(context)
+        if positionedBox is not None:
+            positionedBox.close(context)
+
+        if inlineBoxClose is not None:
+            context.fragList.append(inlineBoxClose)
+
+        # Block?
+        if isBlock:
+            context.addPara()
+            if blockMargins is not None:
+                collapse_margins(context.story[blockStoryStart:], *blockMargins)
+
+            # XXX Buggy!
+
+            if relativeContainer is not None:
+                close_relative_container(
+                    context, relativeContainer, blockStoryStart, blockIndent
+                )
+            if position == "relative":
+                # Drawn where top/left say, laid out and paginated where it is.
+                shift_story(context.story, blockStoryStart, offsets)
+            if frameAlignBottom and not staticFrame:
+                context.story[blockStoryStart:] = bottom_aligned(
+                    context.story[blockStoryStart:]
+                )
+            if breakInsideAvoid and len(context.story) > blockStoryStart:
+                # Even round a single flowable: a lone paragraph is split
+                # line by line otherwise. And with the blocks before it that
+                # must stay with it -- a heading with page-break-after: avoid
+                # -- inside: ReportLab never groups a keepWithNext flowable
+                # with a KeepTogether that follows, so the heading was left
+                # at the foot of the page the block had left.
+                start = blockStoryStart
+                while start > 0 and _keeps_with_next(context.story[start - 1]):
+                    start -= 1
+                context.story[start:] = [KeepTogether(context.story[start:])]
+            if pageBreakAfter == PAGE_BREAK_AVOID:
+                if len(context.story) > blockStoryStart:
+                    # The block stays on the page what follows it starts on.
+                    context.story[-1].keepWithNext = True
+            # Page break by CSS
+            elif pageBreakAfter:
+                context.addStory(PageBreak())
+                if pageBreakAfter == PAGE_BREAK_RIGHT:
+                    context.addStory(PmlRightPageBreak())
+                if pageBreakAfter == PAGE_BREAK_LEFT:
+                    context.addStory(PmlLeftPageBreak())
+            if frameBreakAfter:
+                context.addStory(FrameBreak())
+
+        if keepInFrame:
+            # get all content added after start of -pdf-keep-in-frame and wrap
+            # it in a KeepInFrame
+            substory = context.story[context.keepInFrameIndex :]
+            context.story = context.story[: context.keepInFrameIndex]
+            context.story.append(
+                KeepInFrame(
+                    content=substory,
+                    maxWidth=keepInFrameMaxWidth,
+                    maxHeight=keepInFrameMaxHeight,
+                    mode=keepInFrameMode,
+                )
+            )
+            # mode wasn't being used; it is necessary for tables or images at
+            # end of page.
+            context.keepInFrameIndex = None
+
+        # Static block, END
+        if staticFrame:
+            context.addPara()
+            for frame in staticFrame:
+                frame.pisaStaticStory = context.story
+            context.swapStory(oldStory)
+            context.frag.insideStaticFrame -= 1
+
+        # context.debug(1, indent, "</%s>" % (node.tagName))
+
+        # Reset frag style
+        context.pullFrag()
+
+    # Unknown or not handled
+    else:
+        # context.debug(1, indent, "???", node, node.nodeType, repr(node))
+        # Loop over children
+        for child in node.childNodes:
+            pisaLoop(child, context, **kw)
+
+
+def _limit_source(src, limit: int | None):
+    """
+    The source, refused if it is larger than ``limit`` bytes.
+
+    A file is read here, a byte past the limit at most, rather than by
+    html5lib, which would read all of it.
+    """
+    if limit is None:
+        return src
+    if isinstance(src, str):
+        size = len(src.encode("utf-8", "surrogatepass"))
+    elif isinstance(src, bytes | bytearray):
+        size = len(src)
+    elif hasattr(src, "read"):
+        src = src.read(limit + 1)
+        if isinstance(src, str):
+            src = src.encode("utf-8")
+        size = len(src)
+    else:
+        return src
+    if size > limit:
+        msg = f"the document is larger than the {limit} bytes it may take"
+        raise RenderLimitError(msg)
+    return src
+
+
+def _check_depth(document, limit: int | None) -> None:
+    """
+    Refuse a document whose elements nest more than ``limit`` deep.
+
+    Walked with a stack of its own, not recursively: what this guards is the
+    recursion of the walks that follow.
+    """
+    if limit is None:
+        return
+    stack = [(document, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > limit:
+            msg = f"the document nests more than the {limit} levels it may"
+            raise RenderLimitError(msg)
+        stack.extend(
+            (child, depth + 1)
+            for child in node.childNodes
+            if child.nodeType == Node.ELEMENT_NODE
+        )
+
+
+def pisaParser(
+    src,
+    context,
+    default_css="",
+    xhtml=False,  # noqa: FBT002
+    encoding=None,
+    xml_output=None,
+):
+    """
+    - Parse HTML and get miniDOM
+    - Extract CSS information, add default CSS, parse CSS
+    - Handle the document DOM itself and build reportlab story
+    - Return Context object.
+    """
+    if xhtml:
+        log.warning("xhtml parameter will be removed on next release 0.2.8")
+        # TODO: XHTMLParser doesn't seem to exist...
+        parser = html5lib.XHTMLParser(tree=treebuilders.getTreeBuilder("dom"))
+    else:
+        parser = html5lib.HTMLParser(tree=treebuilders.getTreeBuilder("dom"))
+    parser_kwargs = {}
+    policy = current_policy()
+    src = _limit_source(src, policy.max_document_bytes)
+    if isinstance(src, str):
+        # Text has to become bytes for html5lib, and the encoding chosen here
+        # is the one it must decode with, so it is not a guess either way.
+        encoding = encoding or "utf-8"
+        src = src.encode(encoding)
+        src = pisaTempFile(src, capacity=context.capacity)
+    if encoding:
+        # An encoding the caller named is the answer, whatever the source was.
+        # Without this a bytes or file source fell through to html5lib's own
+        # sniffing, whose last resort is windows-1252, so UTF-8 bytes came out
+        # as mojibake -- a bullet as "\u00e2\u0080\u00a2". Sniffing is still what
+        # happens when the caller names nothing, which is how a document with
+        # its own <meta charset> keeps deciding for itself.
+        parser_kwargs["transport_encoding"] = encoding
+
+    # # Test for the restrictions of html5lib
+    # if encoding:
+    #     # Workaround for html5lib<0.11.1
+    #     if hasattr(inputstream, "isValidEncoding"):
+    #         if encoding.strip().lower() == "utf8":
+    #             encoding = "utf-8"
+    #         if not inputstream.isValidEncoding(encoding):
+    #             log.error("%r is not a valid encoding e.g. 'utf8' is not valid but 'utf-8' is!", encoding)
+    #     else:
+    #         if inputstream.codecName(encoding) is None:
+    #             log.error("%r is not a valid encoding", encoding)
+    document = parser.parse(src, **parser_kwargs)  # encoding=encoding)
+    _check_depth(document, policy.max_depth)
+
+    if xml_output:
+        xml_output.write(document.toprettyxml(encoding=encoding or "utf-8"))
+
+    if default_css:
+        context.addDefaultCSS(default_css)
+
+    pisaPreLoop(document, context)
+    context.parseCSS()
+    pisaLoop(document, context)
+    # After the walk, not before: an inline style="" reaches the cascade only
+    # while its element is being visited, so the set is not complete until now.
+    warnDroppedFunctions(context.cssDroppedFunctions, context.cssDroppedFunctionSources)
+    warnUnsupportedProperties(context.cssParser.declaredBySource)
+    # Same reason, the other way round: a <pdf:toc> may legitimately be
+    # written after the entries that feed it, so neither side of the binding
+    # is complete until the walk is over. An entry naming an index that never
+    # appears is simply never heard -- ReportLab's notify is a broadcast, and
+    # a kind nobody listens for goes nowhere -- so this warning is its only
+    # trace. The bookmark and the link destination still happen.
+    warnUnknownTocNames(context)
+    # The walk is over and the story is all ReportLab needs from here on. The
+    # last element visited and the cascade cache, whose keys name each
+    # element's parent, would otherwise keep the whole DOM alive through the
+    # build -- the moment the story is at its largest. Unlinking breaks the
+    # parent/child cycles too, so the tree goes now rather than whenever the
+    # cyclic collector next runs. It was parsed above; nothing else has it.
+    context.node = None
+    context.cssAttrCache.clear()
+    context.cssPseudoCache.clear()
+    document.unlink()
+    return context
+
+
+# Shortcuts
+
+HTML2PDF = pisaParser
+
+
+def XHTML2PDF(*a, **kw):
+    kw["xhtml"] = True
+    return HTML2PDF(*a, **kw)
+
+
+XML2PDF = XHTML2PDF

@@ -1,0 +1,2356 @@
+# Copyright 2010 Dirk Holtwick, holtwick.it
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import codecs
+import contextlib
+import copy
+import functools
+import logging
+import sys
+import weakref
+from hashlib import md5
+from html import escape as html_escape
+from io import BytesIO, StringIO
+from typing import TYPE_CHECKING, Any, ClassVar
+from uuid import uuid4
+
+from PIL import Image as PILImage
+from PIL import UnidentifiedImageError
+from PIL.Image import Image
+from reportlab.graphics.shapes import Drawing
+from reportlab.lib.attrmap import AttrMap, AttrMapValue
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.utils import LazyImageReader, flatten, haveImages, open_for_read
+from reportlab.lib.validators import isNumber
+from reportlab.pdfbase import pdfform
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.platypus.doctemplate import (
+    ActionFlowable,
+    BaseDocTemplate,
+    IndexingFlowable,
+    PageTemplate,
+    PTCycle,
+)
+from reportlab.platypus.flowables import (
+    CondPageBreak,
+    Flowable,
+    KeepInFrame,
+    PageBreak,
+    ParagraphAndImage,
+)
+from reportlab.platypus.frames import Frame
+from reportlab.platypus.tableofcontents import TableOfContents, drawPageNumbers
+from reportlab.platypus.tables import _SPECIALROWS, Table, TableStyle
+from reportlab.rl_config import register_reset
+
+from xhtml2pdf.builders.printmarks import MarkedCanvas, begin_page, draw_marks
+from xhtml2pdf.config.resources import (
+    ResourceAccessError,
+    check_deadline,
+    current_policy,
+)
+from xhtml2pdf.files import pisaFileObject, pisaTempFile
+from xhtml2pdf.reportlab_paragraph import Paragraph
+from xhtml2pdf.util import (
+    ImageWarning,
+    drawBoxBackground,
+    drawBoxBorders,
+    getBorderWidth,
+    roundedBox,
+    roundedClip,
+)
+
+if TYPE_CHECKING:
+    from reportlab.pdfgen.canvas import Canvas
+
+
+try:
+    from reportlab.graphics import renderPM
+except ImportError:
+    renderPM = None
+try:
+    from svglib.svglib import svg2rlg
+except ImportError:
+    svg2rlg = None
+
+log = logging.getLogger(__name__)
+
+MAX_IMAGE_RATIO: float = 0.95
+PRODUCER: str = "xhtml2pdf <https://github.com/xhtml2pdf/xhtml2pdf/>"
+
+
+class PmlMaxHeightMixIn:
+    def setMaxHeight(self, availHeight: float) -> float:
+        self.availHeightValue: float = availHeight
+        if availHeight < 70000 and hasattr(self, "canv"):
+            if not hasattr(self.canv, "maxAvailHeightValue"):
+                self.canv.maxAvailHeightValue = 0
+            self.availHeightValue = self.canv.maxAvailHeightValue = max(
+                availHeight, self.canv.maxAvailHeightValue
+            )
+        return self.availHeightValue
+
+    def getMaxHeight(self) -> float:
+        return self.availHeightValue if hasattr(self, "availHeightValue") else 0
+
+
+def _undo_postponed(ref) -> None:
+    """Clear `_postponed` on the flowable `ref` names, if it is still there."""
+    flowable = ref()
+    if flowable is not None and hasattr(flowable, "_postponed"):
+        del flowable._postponed
+
+
+class PageNumberReset(Flowable):
+    """
+    Where <pdf:resetpagenumber> was written: the page it is drawn on is
+    numbered `value`, and the pages after it on from there.
+    """
+
+    _ZEROSIZE = 1
+
+    def __init__(self, value: int) -> None:
+        super().__init__()
+        self.value = value
+
+    def draw(self) -> None:
+        doc = self.canv._doctemplate
+        if isinstance(doc, PmlBaseDoc):
+            doc.pageNumberResets.append((doc.page, self.value))
+
+
+class PdfInsertPage(Flowable):
+    """
+    A page that <pdf:insertpdf> fills with page `index` of `source`.
+
+    The page is laid out like any other, so it counts for the page numbers,
+    the page count and the table of contents; what is drawn on it is
+    replaced by the source page once the document is built
+    (xhtml2pdf.builders.inserts).
+    """
+
+    _ZEROSIZE = 1
+
+    def __init__(self, source: bytes, index: int) -> None:
+        super().__init__()
+        self.source = source
+        self.index = index
+
+    def draw(self) -> None:
+        doc = self.canv._doctemplate
+        if isinstance(doc, PmlBaseDoc):
+            doc.pdfInserts.append((doc.page, self.source, self.index))
+            doc.pageTaken = True
+
+
+def layout_moment(canv) -> tuple[int, int]:
+    """
+    The layout pass and the page a flowable is being laid out for.
+
+    Part of the key a container keeps its layout under: what it holds may
+    show the page number or the page count, which change with either.
+    """
+    doc = getattr(canv, "_doctemplate", None)
+    return getattr(doc, "layoutPass", 0), getattr(doc, "page", 0)
+
+
+class PmlBaseDoc(BaseDocTemplate):
+    """We use our own document template to get access to the canvas and set some information once."""
+
+    # Stores a list of page templates, and the first page from which they're active.
+    pisaTemplateList: list[tuple[int, PmlPageTemplate]]
+    #: (page, number) for each <pdf:resetpagenumber> this pass has drawn.
+    pageNumberResets: list[tuple[int, int]]
+    #: The same, from the pass before. A page's header is painted before
+    #: its content, so it can only be numbered from what an earlier pass
+    #: found; the tag asks for a second pass.
+    _knownResets: list[tuple[int, int]]
+    #: (page, source PDF, page index in it) for each page <pdf:insertpdf>
+    #: reserved in this pass.
+    pdfInserts: list[tuple[int, bytes, int]]
+    #: Whether the current page is an inserted one, which nothing else is
+    #: laid out on: what comes next starts a new page.
+    pageTaken = False
+
+    def _makeCanvas(self, filename=None, canvasmaker=None):
+        # build() passes reportlab's plain Canvas when it is given none.
+        if canvasmaker is None or issubclass(MarkedCanvas, canvasmaker):
+            canvasmaker = MarkedCanvas
+        return super()._makeCanvas(filename=filename, canvasmaker=canvasmaker)
+
+    def pageLabel(self, page: int) -> int:
+        """The number page `page` shows, after the resets before it."""
+        label = page
+        for start, value in getattr(self, "_knownResets", ()):
+            if start <= page:
+                label = value + page - start
+        return label
+
+    @property
+    def _multiBuildEdits(self):
+        """
+        What multiBuild undoes between its passes, or None outside it.
+
+        Every flowable moved on to the next frame is noted here with
+        (delattr, flowable, "_postponed"), and multiBuild keeps the notes for
+        the whole pass; the last one never clears them. Each part of a table
+        that runs over a page is moved on once and holds the rest of its
+        table, so a postponed flowable is noted by a weak reference: a
+        flowable of the story is still there to be undone at the next pass,
+        and a part that has been drawn and dropped needs nothing undone.
+        """
+        return self.__dict__.get("_weakMultiBuildEdits")
+
+    @_multiBuildEdits.setter
+    def _multiBuildEdits(self, append) -> None:
+        def add(edit, append=append) -> None:
+            if len(edit) == 3 and edit[0] is delattr and edit[2] == "_postponed":
+                # A flowable with __slots__ and no __weakref__ is kept as
+                # ReportLab keeps it.
+                with contextlib.suppress(TypeError):
+                    edit = (_undo_postponed, weakref.ref(edit[1]))
+            append(edit)
+
+        self.__dict__["_weakMultiBuildEdits"] = add
+
+    @_multiBuildEdits.deleter
+    def _multiBuildEdits(self) -> None:
+        self.__dict__.pop("_weakMultiBuildEdits", None)
+
+    def beforeDocument(self) -> None:
+        """
+        This is called before any processing is done on the document.
+
+        In case of multiBuild is used, this will be called before any build, not just the first.
+        """
+        # Clear the list of templates, to ensure the list refers to the *final* rendering, also
+        # in a multiBuild rendering.
+        self.pisaTemplateList = []
+        self._knownResets = sorted(getattr(self, "pageNumberResets", []))
+        #: Counts the layout passes, for the containers' layout caches.
+        self.layoutPass = getattr(self, "layoutPass", 0) + 1
+        self.pageNumberResets = []
+        self.pdfInserts = []
+        self.pageTaken = False
+
+        # The anchors of the positioned boxes fall where this pass puts them.
+        from xhtml2pdf.builders.position import reset_positioned
+
+        reset_positioned(self)
+
+        # And the page template left pending by the previous pass. A
+        # <pdf:nextpage name="x"/> onto a :left/:right pair leaves a cycle on
+        # the document and reportlab never clears it, so on the second pass of
+        # a multiBuild every page after the first came out on the mirrored
+        # templates whatever the markup said. handle_documentBegin has already
+        # chosen this page's template by the time we get here, and the story --
+        # with its NextPageTemplate flowables -- is walked again on every pass,
+        # so the cycle rebuilds itself where it belongs.
+        if not isinstance(self._firstPageTemplateIndex, list):
+            # A list is the one case where reportlab has just built the cycle
+            # itself, in the two lines above this call.
+            for attribute in ("_nextPageTemplateCycle", "_nextPageTemplateIndex"):
+                if hasattr(self, attribute):
+                    delattr(self, attribute)
+
+    def beforePage(self) -> None:
+        self.canv.setProducer(PRODUCER)
+
+        """
+        # Convert to ASCII because there is a Bug in Reportlab not
+        # supporting other than ASCII. Send to list on 23.1.2007
+        author = toString(self.pml_data.get("author", "")).encode("ascii","ignore")
+        subject = toString(self.pml_data.get("subject", "")).encode("ascii","ignore")
+        title = toString(self.pml_data.get("title", "")).encode("ascii","ignore")
+        # print repr((author,title,subject))
+        self.canv.setAuthor(author)
+        self.canv.setSubject(subject)
+        self.canv.setTitle(title)
+        if self.pml_data.get("fullscreen", 0):
+            self.canv.showFullScreen0()
+        if self.pml_data.get("showoutline", 0):
+            self.canv.showOutline()
+        if self.pml_data.get("duration", None) is not None:
+            self.canv.setPageDuration(self.pml_data["duration"])
+        """
+
+    def afterFlowable(self, flowable: Flowable) -> None:
+        # The build is most of a long render's time, and this runs for every
+        # flowable placed, including each part of one split across pages.
+        check_deadline()
+        # A block's box, a table or a keep-in-frame holds what it drew; a
+        # heading in one is an entry of the index as much as one in the story.
+        inner = drawn_inside(flowable)
+        if inner is not None:
+            for drawn in inner:
+                self.afterFlowable(drawn)
+            return
+        # Does the flowable contain fragments?
+        if getattr(flowable, "outline", False):
+            self.notify(
+                # Which table of contents the entry is for. getattr with a
+                # default because not every flowable carrying `outline` is a
+                # PmlParagraph -- PmlParagraphAndImage wraps one.
+                tocNotifyKind(getattr(flowable, "tocName", "")),
+                (
+                    flowable.outlineLevel,
+                    html_escape(copy.deepcopy(flowable.text), quote=True),
+                    self.pageLabel(self.page),
+                    # The fourth element ReportLab documents: the destination
+                    # the entry links to. PmlParagraph.draw has bookmarked it
+                    # by now, this being called after the flowable is drawn.
+                    getattr(flowable, "tocKey", None),
+                ),
+            )
+
+    def handle_flowable(self, flowables) -> None:
+        """
+        Start a new page before what follows an inserted page.
+
+        Only before something laid out: a page template chosen after the
+        tag applies to that new page, and a page break of its own takes the
+        place of this one. Nothing is added when nothing follows, so the
+        document does not end on an empty page.
+        """
+        if self.pageTaken and flowables:
+            first = flowables[0]
+            if isinstance(first, PageBreak):
+                self.pageTaken = False
+            elif not isinstance(first, ActionFlowable | PmlPageCount):
+                self.pageTaken = False
+                flowables.insert(0, PageBreak())
+        super().handle_flowable(flowables)
+
+    def handle_nextPageTemplate(self, pt: str | int | list | tuple) -> None:
+        """If pt has also templates for even and odd page convert it to list."""
+        has_left_template: bool = self._has_template_for_name(f"{pt}_left")
+        has_right_template: bool = self._has_template_for_name(f"{pt}_right")
+
+        if has_left_template and has_right_template:
+            pt = [f"{pt}_left", f"{pt}_right"]
+
+        """On endPage change to the page template with name or index pt"""
+        if isinstance(pt, str):
+            if hasattr(self, "_nextPageTemplateCycle"):
+                del self._nextPageTemplateCycle
+            for t in self.pageTemplates:
+                if t.id == pt:
+                    self._nextPageTemplateIndex: int = self.pageTemplates.index(t)
+                    return
+            msg = f"can't find template('{pt}')"
+            raise ValueError(msg)
+        if isinstance(pt, int):
+            if hasattr(self, "_nextPageTemplateCycle"):
+                del self._nextPageTemplateCycle
+            self._nextPageTemplateIndex = pt
+        elif isinstance(pt, list | tuple):
+            # used for alternating left/right pages
+            # collect the refs to the template objects, complain if any are bad
+            c: PTCycle = PTCycle()
+            for ptn in pt:
+                # special case name used to short circuit the iteration
+                if ptn == "*":
+                    c._restart = len(c)  # type: ignore[attr-defined]
+                    continue
+                for t in self.pageTemplates:
+                    if t.id == ptn.strip():
+                        c.append(t)
+                        break
+            if not c:
+                msg = "No valid page templates in cycle"
+                raise ValueError(msg)
+            if c._restart > len(c):  # type: ignore[attr-defined]
+                msg = "Invalid cycle restart position"
+                raise ValueError(msg)
+
+            # ensure we start on the first one
+            # NB: reportlab's BaseDocTemplate._setPageTemplate reads
+            # ``_nextPageTemplateCycle.next_value``, so this must be the PTCycle
+            # itself and not an iterator over it.
+            self._nextPageTemplateCycle: PTCycle = c
+        else:
+            msg = "Argument pt should be string or integer or list"
+            raise TypeError(msg)
+
+    def _has_template_for_name(self, name: str) -> bool:
+        return any(template.id == name.strip() for template in self.pageTemplates)
+
+
+#: What copy.deepcopy hands back unchanged, so a copy can share it.
+_ATOMIC = frozenset((int, float, str, bool, type(None)))
+
+
+class DeepCopiedDirectly:
+    """
+    Deep-copied by copying its own dict, without copy's general machinery.
+
+    ReportLab deep-copies the current frame every time it measures a list of
+    flowables (flowables._listWrapOn) -- once per table cell, per wrap -- and
+    xhtml2pdf copies each static frame's story, paragraphs, styles and frags
+    included, for every page it draws one on. Through __reduce_ex__ and
+    _reconstruct each of those objects cost tens of microseconds. The result
+    is the same: atomic values shared, which is what deepcopy does with them
+    anyway, everything else deep-copied with the same memo.
+    """
+
+    def __deepcopy__(self, memo):
+        new = self.__class__.__new__(self.__class__)
+        memo[id(self)] = new
+        new.__dict__.update(
+            {
+                name: value if type(value) in _ATOMIC else copy.deepcopy(value, memo)
+                for name, value in self.__dict__.items()
+            }
+        )
+        return new
+
+
+class PmlFrame(DeepCopiedDirectly, Frame):
+    """Every frame xhtml2pdf makes; see DeepCopiedDirectly."""
+
+
+class PmlParagraphStyle(DeepCopiedDirectly, ParagraphStyle):
+    """Every paragraph style xhtml2pdf makes; see DeepCopiedDirectly."""
+
+
+class PmlPageTemplate(PageTemplate):
+    PORTRAIT: str = "portrait"
+    LANDSCAPE: str = "landscape"
+    # by default portrait
+    pageorientation: str = PORTRAIT
+
+    #: How the content of a static frame that outgrows its @frame is painted,
+    #: when the frame itself does not say. See xhtml2pdf.util.getKeepInFrameMode.
+    staticOverflowMode: str = "shrink"
+
+    #: Slack, in points, before a static frame counts as overflowing. Below it
+    #: the two measurements are the same number said in different words.
+    STATIC_OVERFLOW_FUZZ: float = 0.1
+
+    #: `@page { bleed; marks }`; see xhtml2pdf.builders.printmarks.
+    bleed: float = 0.0
+    marks: frozenset[str] = frozenset()
+
+    def __init__(self, **kw) -> None:
+        self.pisaStaticList: list = []
+        self.pisaBackground: Any = None
+        #: Colour propagated from <body> to the page canvas; see CSS 2.1 14.2.
+        self.canvasBackground = None
+        super().__init__(**kw)
+        self._page_count: int = 0
+        self._first_flow: bool = True
+        #: (complaint, frame id) pairs already logged, so that a hundred-page
+        #: document says each one once and not once per page and layout pass.
+        self._staticFrameWarned: set[tuple[str, str]] = set()
+
+        # Background Image
+        self.img = None
+        self.ph: int = 0
+        self.h: int = 0
+        self.w: int = 0
+
+    def isFirstFlow(self, canvas: Canvas) -> bool:
+        if self._first_flow:
+            if canvas.getPageNumber() <= self._page_count:
+                self._first_flow = False
+            else:
+                self._page_count = canvas.getPageNumber()
+                canvas._doctemplate._page_count = canvas.getPageNumber()
+        return self._first_flow
+
+    def isPortrait(self) -> bool:
+        return self.pageorientation == self.PORTRAIT
+
+    def isLandscape(self) -> bool:
+        return self.pageorientation == self.LANDSCAPE
+
+    def afterDrawPage(self, canvas: Canvas, doc):
+        # After the page's flow, before showPage: the absolute and fixed
+        # boxes paint over everything in the flow, in z-index order.
+        from xhtml2pdf.builders.position import paint_positioned
+
+        paint_positioned(canvas, doc, self)
+        draw_marks(canvas, self.pagesize, self.bleed, self.marks)
+
+    def beforeDrawPage(self, canvas: Canvas, doc):
+        begin_page(canvas, self.pagesize, self.bleed, self.marks)
+        canvas.saveState()
+        try:
+            # CSS 2.1 14.2: a background propagated from body paints the whole
+            # canvas, underneath everything else including the @page background,
+            # and reaches into the bleed.
+            if self.canvasBackground is not None:
+                bleed = self.bleed
+                canvas.saveState()
+                canvas.setFillColor(self.canvasBackground)
+                canvas.rect(
+                    -bleed,
+                    -bleed,
+                    self.pagesize[0] + 2 * bleed,
+                    self.pagesize[1] + 2 * bleed,
+                    stroke=0,
+                    fill=1,
+                )
+                canvas.restoreState()
+            if (
+                # No template was set yet, or the previous template differs from the last
+                not doc.pisaTemplateList
+                or doc.pisaTemplateList[-1][-1] != self
+            ):
+                doc.pisaTemplateList.append((canvas.getPageNumber(), self))
+
+            def pageNumbering(objList):
+                for obj in flatten(objList):
+                    if isinstance(obj, PmlParagraph):
+                        for frag in obj.frags:
+                            if frag.pageNumber:
+                                frag.text = str(label)
+                            elif frag.pageCount:
+                                frag.text = str(canvas._doctemplate._page_count)
+
+                    elif isinstance(obj, PmlTable):
+                        # Flatten the cells ([[1,2], [3,4]] becomes [1,2,3,4])
+                        flat_cells = [
+                            item for sublist in obj._cellvalues for item in sublist
+                        ]
+                        pageNumbering(flat_cells)
+
+            # Paint static frames
+            pagenumber = canvas.getPageNumber()
+            pageLabel = getattr(doc, "pageLabel", None)
+            label = pageLabel(pagenumber) if pageLabel else pagenumber
+            if pagenumber > self._page_count:
+                self._page_count = pagenumber
+                canvas._doctemplate._page_count = pagenumber
+
+            last = pagenumber == canvas._doctemplate._page_count
+            for frame in self.pisaStaticList:
+                pages = getattr(frame, "pisaPages", "all")
+                if (pages == "last" and not last) or (pages == "not-last" and last):
+                    continue
+                self._paintStaticFrame(frame, canvas, pageNumbering)
+        finally:
+            canvas.restoreState()
+
+        # Room under the flow for the boxes with a negative z-index, filled in
+        # once the page is known; see builders/position.py.
+        from xhtml2pdf.builders.position import reserve_under_flow
+
+        reserve_under_flow(canvas, doc)
+
+    def _firstComplaint(self, complaint: str, frame_id: str) -> bool:
+        """Whether this is the first time a frame draws this complaint."""
+        key = (complaint, frame_id)
+        if key in self._staticFrameWarned:
+            return False
+        self._staticFrameWarned.add(key)
+        return True
+
+    @staticmethod
+    def _storyHeight(story, frame, canvas: Canvas) -> float:
+        """
+        The height a static frame's story takes up in that frame.
+
+        Measured with the very calls ``Frame.add`` is about to make, and not
+        with ``_listWrapOn``: an image is allowed to scale itself down to the
+        height it is offered (see ``PmlParagraph._calcImageMaxSizes``), so
+        measuring against unlimited height would report an overflow for a logo
+        that fits its header perfectly well. Wrapping is idempotent, so the
+        real pass right after this one gets the same numbers.
+        """
+        used = 0.0
+        spaceAfter = 0.0
+        for flowable in story:
+            # reportlab's Frame swallows the space before a flowable into the
+            # space after the one above it; see Frame._add.
+            space = max(flowable.getSpaceBefore() - spaceAfter, 0.0) if used else 0.0
+            height = flowable.wrapOn(
+                canvas, frame._aW, max(frame._aH - used - space, 0.0)
+            )[1]
+            spaceAfter = flowable.getSpaceAfter()
+            used += space + height + spaceAfter
+        # The space after the last flowable is not height the frame has to
+        # find room for.
+        return used - spaceAfter
+
+    def _paintStaticFrame(self, frame, canvas: Canvas, renumber) -> None:
+        """
+        Draw the story of one static frame on the page being started.
+
+        Anything that goes wrong is caught here, per frame: the guard used to
+        sit around the loop over every static frame, so a header that could not
+        be painted took the page's footer with it.
+        """
+        try:
+            self._drawStaticFrame(frame, canvas, renumber)
+        except Exception:
+            frame_id = str(getattr(frame, "id", None))
+            log.debug("static frame %r", frame_id, exc_info=True)
+            if self._firstComplaint("unpainted", frame_id):
+                log.warning("Could not paint the static frame %r", frame_id)
+
+    def _drawStaticFrame(self, frame, canvas: Canvas, renumber) -> None:
+        """
+        Lay the story of one static frame out and draw it.
+
+        Both the frame and its story are deep-copied first: reportlab consumes
+        the list and mutates the flowables and the frame's cursor as it draws,
+        and the originals have to survive for every remaining page.
+        """
+        frame = copy.deepcopy(frame)
+        story = frame.pisaStaticStory
+        renumber(story)
+
+        # A static frame has no continuation frame, so anything that does not
+        # fit is content the page will simply be missing -- most visibly the
+        # logo at the end of a header, which is an inline fragment of the last
+        # paragraph and so the last flowable of the story.
+        needed = self._storyHeight(story, frame, canvas)
+        if needed > frame._aH + self.STATIC_OVERFLOW_FUZZ:
+            mode = (
+                getattr(frame, "pisaStaticOverflowMode", None)
+                or self.staticOverflowMode
+            )
+            if self._firstComplaint("overflow", frame.id):
+                log.warning(
+                    "The content of the static frame %r needs %.1f pt of"
+                    " height and the @frame is %.1f pt tall, so it was fitted"
+                    " with -pdf-keep-in-frame-mode: %s. Give the @frame more"
+                    " height.",
+                    frame.id,
+                    needed,
+                    frame._aH,
+                    mode,
+                )
+            # KeepInFrame is the only thing a Frame will accept here: for
+            # truncate and overflow it reports a height that fits and then
+            # clips or spills on its own, and for shrink it scales the whole
+            # story down. Not PmlKeepInFrame -- that one overrides maxHeight
+            # with the largest height seen on the canvas, which is the body
+            # frame of some earlier page, and would decide nothing is wrong.
+            story = [
+                KeepInFrame(
+                    maxWidth=frame._aW, maxHeight=frame._aH, mode=mode, content=story
+                )
+            ]
+
+        frame.addFromList(story, canvas)
+
+        if story and self._firstComplaint("dropped", frame.id):
+            # addFromList stops at the first flowable that does not fit and
+            # leaves the rest of the list "for later". There is no later here:
+            # whatever is still in it is missing from the page.
+            log.warning(
+                "The static frame %r dropped %d flowable(s) that did not fit.",
+                frame.id,
+                len(story),
+            )
+
+
+_ctr: int = 1
+
+
+class PmlImageReader:  # TODO We need a factory here, returning either a class for java or a class for PIL
+    """Wraps up either PIL or Java to get data from bitmaps."""
+
+    _cache: ClassVar[dict] = {}
+    # Experimental features, disabled by default
+    use_cache: bool = False
+    use_lazy_loader: bool = False
+    process_internal_files: bool = False
+
+    @classmethod
+    def _clear_cache(cls) -> None:
+        cls._cache.clear()
+
+    @staticmethod
+    def _open(fileName) -> tuple[BytesIO | StringIO, bool]:
+        """
+        Open ``fileName``, falling back to xhtml2pdf's own fetcher.
+
+        reportlab 5 changed ``rl_config.trustedHosts=None`` from "every host is
+        trusted" to "no host is trusted", so ``open_for_read`` now refuses every
+        URL and ``data:`` URI by default. That default is deliberate SSRF
+        hardening and must not be reverted from a library, so remote resources
+        are routed through ``xhtml2pdf.files`` instead, which applies this
+        project's own network policy (timeouts, retries, redirect budget).
+
+        Local paths are unaffected: ``open_for_read`` tries a plain ``open()``
+        first. Returns ``(stream, used_fallback)``.
+        """
+        try:
+            return open_for_read(fileName, "b"), False
+        except OSError:
+            if not isinstance(fileName, str) or not fileName.startswith(
+                ("data:", "http://", "https://")
+            ):
+                raise
+            log.debug("open_for_read refused %r, using xhtml2pdf.files", fileName[:80])
+            stream = pisaFileObject(fileName).getBytesIO()
+            if stream is None:
+                msg = f"Cannot open resource {fileName[:80]!r}"
+                raise OSError(msg) from None
+            return stream, True
+
+    def __init__(
+        self, fileName: PmlImage | Image | str, label: str | None = None
+    ) -> None:
+        """
+        `label` names the image in a refusal when fileName cannot: an image
+        from a data: URI or a fetched resource arrives as a buffer.
+        """
+        if isinstance(fileName, PmlImage):
+            self.__dict__ = fileName.__dict__  # borgize
+            return
+            # start with lots of null private fields, to be populated by
+        # the relevant engine.
+        self.fileName: PmlImage | Image | str = fileName or f"PILIMAGE_{id(self)}"
+        self._image: Image = None
+        self._width: int | None = None
+        self._height: int | None = None
+        self._transparent = None
+        self._data: bytes | str | None = None
+        self._dataA: PmlImageReader | None = None
+        self.fp: BytesIO | StringIO | None = None
+        if Image and isinstance(fileName, Image):
+            self._image = fileName
+            self.fp = getattr(fileName, "fp", None)
+        else:
+            try:
+                self.fp, used_fallback = self._open(fileName)
+                if self.process_internal_files and isinstance(self.fp, StringIO):
+                    data: str = self.fp.read()
+                    with contextlib.suppress(Exception):
+                        self.fp.close()
+                    if self.use_cache:
+                        if not self._cache:
+                            # a bound method, not dict.clear: reportlab wraps
+                            # the callback in a WeakMethod, which rejects
+                            # builtin methods
+                            register_reset(type(self)._clear_cache)
+                        cache_key = md5(data.encode("utf8")).digest()
+                        data = self._cache.setdefault(cache_key, data)
+                    self.fp = StringIO(data)
+                elif (
+                    self.use_lazy_loader
+                    and isinstance(fileName, str)
+                    and not used_fallback
+                ):
+                    # try Ralf Schmitt's re-opening technique of avoiding too many open files
+                    # NB: skipped for the fallback below -- LazyImageReader
+                    # re-opens by name via open_for_read on every redraw, which
+                    # is exactly the call that failed in the first place.
+                    self.fp.close()
+                    del self.fp  # will become a property in the next statement
+                    self.__class__ = LazyImageReader
+                if haveImages:
+                    # detect which library we are using and open the image
+                    if not self._image:
+                        where = label or (
+                            fileName if isinstance(fileName, str) else "an image"
+                        )
+                        self._image = self._read_bounded_image(self.fp, where)
+                        # Opening reads the header only; the pixels are
+                        # decoded when they are drawn. Refused here, that
+                        # decode never happens.
+                        width, height = self._image.size
+                        current_policy().check_image_pixels(width, height, where)
+                        if getattr(self._image, "format", None) != "JPEG":
+                            self._decode(where)
+                    if getattr(self._image, "format", None) == "JPEG":
+                        self.jpeg_fh = self._jpeg_fh
+                else:
+                    from reportlab.pdfbase.pdfutils import readJPEGInfo
+
+                    try:
+                        self._width, self._height, c = readJPEGInfo(self.fp)
+                    except Exception as e:
+                        msg = (
+                            "Imaging Library not available, unable to import bitmaps"
+                            " only jpegs"
+                        )
+                        raise ImageWarning(msg) from e
+                    self.jpeg_fh = self._jpeg_fh
+                    self._data = self.fp.read()
+                    self.fp.seek(0)
+            # Catch all errors that are known and don't need the stack trace
+            except UnidentifiedImageError as e:
+                msg = "Cannot identify image file"
+                raise ImageWarning(msg) from e
+
+    def _decode(self, where: str) -> None:
+        """
+        Decode the pixels now, as a warning if they cannot be.
+
+        Left to the drawing, a truncated or corrupt image raised from inside
+        ReportLab's drawImage and took the whole document with it. A JPEG is
+        not decoded: ReportLab embeds its bytes as they are.
+        """
+        try:
+            self._image.load()
+        except (OSError, SyntaxError, ValueError) as e:
+            msg = f"Cannot decode {str(where)[:120]!r}: {e}"
+            raise ImageWarning(msg) from None
+
+    @classmethod
+    def _read_bounded_image(cls, fp, where: str) -> Image:
+        """
+        Open an image, as the pixel limit's refusal when Pillow refuses it.
+
+        Pillow refuses on its own, while still reading the header, an image
+        of more than about 179 million pixels. That came before the policy's
+        check and surfaced as "Error in handling image" with a traceback;
+        it is the same refusal, so it is now reported as one.
+        """
+        try:
+            return cls._read_image(fp)
+        except PILImage.DecompressionBombError as e:
+            limit = current_policy().max_image_pixels
+            if limit is not None:
+                msg = (
+                    f"{str(where)[:120]!r} is too large for Pillow to open ({e}),"
+                    f" more than the {limit} pixels an image may decode to"
+                )
+                raise ResourceAccessError(msg) from None
+            msg = f"Cannot open {str(where)[:120]!r}: {e}"
+            raise ImageWarning(msg) from None
+
+    @staticmethod
+    def _read_image(fp) -> Image:
+        if sys.platform[:4] == "java":
+            from java.io import ByteArrayInputStream
+            from javax.imageio import ImageIO
+
+            input_stream = ByteArrayInputStream(fp.read())
+            return ImageIO.read(input_stream)
+        return PILImage.open(fp)
+
+    def _jpeg_fh(self) -> BytesIO | StringIO | None:
+        fp = self.fp
+        if isinstance(fp, BytesIO | StringIO):
+            fp.seek(0)
+        return fp
+
+    def jpeg_fh(self) -> BytesIO | StringIO | None:  # noqa: PLR6301
+        """Might be replaced with _jpeg_fh in some cases"""
+        return None
+
+    def getSize(self) -> tuple[int, int]:
+        if self._width is None or self._height is None:
+            if sys.platform[:4] == "java":
+                self._width = self._image.getWidth()
+                self._height = self._image.getHeight()
+            else:
+                self._width, self._height = self._image.size
+            if TYPE_CHECKING:
+                assert self._width is not None and self._height is not None
+        return self._width, self._height
+
+    def getRGBData(self) -> bytes | str:
+        """Return byte array of RGB data as string."""
+        if self._data is None:
+            self._dataA = None
+            if sys.platform[:4] == "java":
+                import jarray  # TODO: Move to top.
+                from java.awt.image import PixelGrabber
+
+                width, height = self.getSize()
+                buffer = jarray.zeros(width * height, "i")
+                pg: PixelGrabber = PixelGrabber(
+                    self._image, 0, 0, width, height, buffer, 0, width
+                )
+                pg.grabPixels()
+                # there must be a way to do this with a cast not a byte-level loop,
+                # I just haven't found it yet...
+                pixels: list[str] = []
+                a = pixels.append
+                for rgb in buffer:
+                    a(chr((rgb >> 16) & 0xFF))
+                    a(chr((rgb >> 8) & 0xFF))
+                    a(chr(rgb & 0xFF))
+                self._data = "".join(pixels)
+                self.mode = "RGB"
+            else:
+                im = self._image
+                mode = self.mode = im.mode
+                if mode != "RGBA" and im.getbands()[-1] in {"A", "a"}:
+                    # An alpha channel on grey or palette pixels. Converted
+                    # straight to RGB the alpha was dropped, and a grey logo
+                    # on a transparent ground -- black under the alpha --
+                    # came out as a black box.
+                    im = im.convert("RGBA")
+                    mode = "RGBA"
+                if mode == "RGBA":
+                    im.load()
+                    self._dataA = PmlImageReader(im.split()[3])
+                    im = im.convert("RGB")
+                    self.mode = "RGB"
+                elif mode not in {"L", "RGB", "CMYK"}:
+                    im = im.convert("RGB")
+                    self.mode = "RGB"
+                self._data = im.tobytes() if hasattr(im, "tobytes") else im.tostring()
+        return self._data
+
+    def getImageData(self):
+        width, height = self.getSize()
+        return width, height, self.getRGBData()
+
+    def getTransparent(self):
+        if sys.platform[:4] == "java":
+            return None
+        if "transparency" in self._image.info:
+            transparency = self._image.info["transparency"] * 3
+            palette = self._image.palette
+            if hasattr(palette, "palette"):
+                palette = palette.palette
+            elif hasattr(palette, "data"):
+                palette = palette.data
+            else:
+                return None
+
+            # 8-bit PNGs could give an empty string as transparency value, so
+            # we have to be careful here.
+            try:
+                return list(palette[transparency : transparency + 3])
+            except Exception as e:
+                log.debug(str(e), exc_info=e)
+                return None
+        else:
+            return None
+
+    def __str__(self) -> str:
+        # ReportLab caches one XObject per name, so the name is the content:
+        # two different images must not share it, the same image may.
+        if isinstance(self.fileName, BytesIO):
+            data = self.fileName.getvalue()
+            if data:
+                return f"PmlImageObject_{md5(data).hexdigest()}"
+            return f"PmlImageObject_{id(self)}"
+        if isinstance(self.fileName, PmlImage | Image):
+            return f"PmlImageObject_{id(self)}"
+        return str(self.fileName or id(self))
+
+
+@functools.cache
+def _warn_without_svglib() -> None:
+    """Say, once, why an SVG image is left out."""
+    log.warning(
+        "An SVG image is left out: drawing SVG needs svglib, which cannot be"
+        " imported: pip install svglib"
+    )
+
+
+_BOMS: tuple[bytes, ...] = (codecs.BOM_UTF8, codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)
+
+
+def looks_like_svg(data: bytes, mimetype: str | None = None) -> bool:
+    """
+    Whether an image payload may be SVG, and so is worth handing to svglib.
+
+    Every image used to go through ``svg2rlg`` first, a JPEG or a PNG
+    included, and was only taken for a raster once the XML parser had given
+    up on it. SVG is text, so it starts with a ``<`` -- after any byte-order
+    mark and white space -- or is gzipped (svgz); no raster format does.
+    """
+    if mimetype and "svg" in mimetype.lower():
+        return True
+    if data.startswith(_BOMS):
+        # UTF-16 spells the "<" as two bytes; a raster never has a BOM.
+        return True
+    return data.lstrip().startswith((b"<", b"\x1f\x8b"))
+
+
+class PmlImage(Flowable, PmlMaxHeightMixIn):
+    def __init__(
+        self,
+        data: pisaFileObject | pisaTempFile | bytes,
+        src: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        mask: str = "auto",
+        mimetype: str | None = None,
+        **kw: dict,
+    ) -> None:
+        self.kw: dict = kw
+        self.hAlign: str = "CENTER"
+        self._mask: str = mask
+        self._imgdata: bytes = b""
+        if isinstance(data, bytes):
+            self._imgdata = data
+        elif isinstance(data, pisaTempFile):
+            self._imgdata = data.getvalue()
+        elif isinstance(data, pisaFileObject):
+            self._imgdata = data.getData() or b""
+        self.src: str | None = src
+        # print "###", repr(data)
+        self.mimetype: str | None = mimetype
+
+        # Resolve size
+        drawing = self.getDrawing()
+        self.imageWidth: float = 0.0
+        self.imageHeight: float = 0.0
+        if drawing:
+            _, _, self.imageWidth, self.imageHeight = drawing.getBounds() or (
+                0,
+                0,
+                0,
+                0,
+            )
+            # Drawn as a raster at a point per pixel; refused now rather than
+            # when the page is drawn, which nothing would catch.
+            self.checkRasterSize(drawing)
+        else:
+            img = self.getImage()
+            if img:
+                self.imageWidth, self.imageHeight = img.getSize()
+
+        self.drawWidth: float = width or self.imageWidth
+        self.drawHeight: float = height or self.imageHeight
+
+    def wrap(self, availWidth, availHeight):
+        """
+        Resize the image if necessary.
+
+        This can be called more than once! Do not overwrite important data like drawWidth.
+        """
+        availHeight = self.setMaxHeight(availHeight)
+        # print "image wrap", id(self), availWidth, availHeight, self.drawWidth, self.drawHeight
+        width = min(self.drawWidth, availWidth)
+        wfactor = float(width) / self.drawWidth
+        height = min(self.drawHeight, availHeight * MAX_IMAGE_RATIO)
+        hfactor = float(height) / self.drawHeight
+        factor = min(wfactor, hfactor)
+        self.dWidth = self.drawWidth * factor
+        self.dHeight = self.drawHeight * factor
+        # print "image result", factor, self.dWidth, self.dHeight
+        return self.dWidth, self.dHeight
+
+    def getDrawing(
+        self, width: float | None = None, height: float | None = None
+    ) -> Drawing | None:
+        """If this image is a vector image and the library is available, returns a ReportLab Drawing."""
+        if svg2rlg is None:
+            if looks_like_svg(self._imgdata, self.mimetype):
+                _warn_without_svglib()
+            return None
+        if looks_like_svg(self._imgdata, self.mimetype):
+            try:
+                # From a buffer, not a path, so svglib has no directory to
+                # resolve an <image href> against and follows none; entities
+                # are left unexpanded, which is svglib's default, stated here
+                # so that a change of default cannot reach untrusted input.
+                drawing = svg2rlg(BytesIO(self._imgdata), resolve_entities=False)
+            except Exception:
+                return None
+            if drawing:
+                # Apply size
+                scale_x = 1
+                scale_y = 1
+                try:
+                    if getattr(self, "drawWidth", None) is not None:
+                        if width is None:
+                            width = self.drawWidth
+                        scale_x = width / drawing.width
+                    if getattr(self, "drawHeight", None) is not None:
+                        if height is None:
+                            height = self.drawHeight
+                        scale_y = height / drawing.height
+                    if scale_x != 1 or scale_y != 1:
+                        drawing.scale(scale_x, scale_y)
+                except ZeroDivisionError:
+                    log.warning(
+                        "SVG drawing could not be resized: %r",
+                        self.src or self._imgdata[:50],
+                    )
+                return drawing
+        return None
+
+    def checkRasterSize(self, drawing: Drawing) -> None:
+        """Refuse an SVG whose raster would be larger than the policy allows."""
+        current_policy().check_image_pixels(
+            drawing.width, drawing.height, self.src or "an SVG image"
+        )
+
+    def getDrawingRaster(self) -> BytesIO | None:
+        """If this image is a vector image and the libraries are available, returns a PNG raster."""
+        if svg2rlg and renderPM:
+            svg: Drawing = self.getDrawing()
+            if svg:
+                self.checkRasterSize(svg)
+                imgdata = BytesIO()
+                renderPM.drawToFile(svg, imgdata, fmt="PNG")
+                return imgdata
+        return None
+
+    def getImage(self) -> PmlImageReader:
+        """Return a raster image."""
+        vectorRaster = self.getDrawingRaster()
+        imgdata = vectorRaster or BytesIO(self._imgdata)
+        return PmlImageReader(imgdata, label=self.src)
+
+    def draw(self) -> None:
+        # TODO this code should work, but untested
+        # drawing = self.getDrawing(self.dWidth, self.dHeight)
+        # if drawing and renderPDF:
+        #     renderPDF.draw(drawing, self.canv, 0, 0)
+        # else:
+        img = self.getImage()
+        with roundedClip(self.canv, self, 0, 0, self.dWidth, self.dHeight):
+            self.canv.drawImage(img, 0, 0, self.dWidth, self.dHeight, mask=self._mask)
+
+    def identity(self, maxLen=None):
+        return Flowable.identity(self, maxLen)
+
+
+class PmlParagraphAndImage(ParagraphAndImage, PmlMaxHeightMixIn):
+    def wrap(self, availWidth, availHeight):
+        self.I.canv = self.canv
+        result = ParagraphAndImage.wrap(self, availWidth, availHeight)
+        del self.I.canv
+        return result
+
+    def split(self, availWidth, availHeight):
+        # print "# split", id(self)
+        if not hasattr(self, "wI"):
+            self.wI, self.hI = self.I.wrap(
+                availWidth, availHeight
+            )  # drawWidth, self.I.drawHeight
+        return ParagraphAndImage.split(self, availWidth, availHeight)
+
+
+class PmlParagraph(DeepCopiedDirectly, Paragraph, PmlMaxHeightMixIn):
+    def _calcImageMaxSizes(self, availWidth, availHeight):
+        """
+        Fit every inline image into the space the paragraph is offered.
+
+        Scales from the image's natural size each time, not from whatever the
+        previous call left: wrap runs more than once per flowable (Frame.add,
+        then split, and anything that measures a paragraph before placing
+        it), and scaling the already-scaled size compounded the shrink -- an
+        image at 50% measured twice came out at 25%.
+        """
+        self.hasImages = False
+        for frag in self.frags:
+            if not hasattr(frag, "cbDefn"):
+                continue
+            if frag.cbDefn.kind == "box":
+                # An inline-block is not scaled; it is laid out again for the
+                # width on offer, which is when a percentage width or a box
+                # wider than the line gets its real size.
+                box = frag.cbDefn
+                canv = getattr(self, "canv", None)
+                box.width, box.height = box.flowable.wrapOn(
+                    canv, availWidth, availHeight
+                )
+                box.fontSize = box.height
+                # vertical-align: baseline puts the box's last line on the
+                # line's baseline, which imgVRange takes as a bottom offset
+                # below it; a box with no text keeps its bottom edge there.
+                declared = getattr(box, "declared_valign", box.valign)
+                box.valign = declared
+                last_baseline = getattr(box.flowable, "last_baseline", None)
+                if declared == "baseline" and last_baseline is not None:
+                    box.valign = -last_baseline
+            elif frag.cbDefn.kind == "img":
+                img = frag.cbDefn
+                natural = getattr(img, "naturalSize", None)
+                if natural is None:
+                    natural = img.naturalSize = (img.width, img.height)
+                naturalWidth, naturalHeight = natural
+                if naturalWidth > 0 and naturalHeight > 0:
+                    self.hasImages = True
+                    width = min(naturalWidth, availWidth)
+                    wfactor = float(width) / naturalWidth
+                    height = min(
+                        naturalHeight, availHeight * MAX_IMAGE_RATIO
+                    )  # XXX 99% because 100% do not work...
+                    hfactor = float(height) / naturalHeight
+                    factor = min(wfactor, hfactor)
+                    img.height = naturalHeight * factor
+                    img.width = naturalWidth * factor
+
+    def wrap(self, availWidth, availHeight):
+        availHeight = self.setMaxHeight(availHeight)
+
+        style = self.style
+
+        # A border only takes up room when its style says it is drawn; see
+        # util.getBorderWidth.
+        self.borderWidthLeft = getBorderWidth(
+            style.borderLeftStyle, style.borderLeftWidth
+        )
+        self.borderWidthRight = getBorderWidth(
+            style.borderRightStyle, style.borderRightWidth
+        )
+        self.borderWidthTop = getBorderWidth(style.borderTopStyle, style.borderTopWidth)
+        self.borderWidthBottom = getBorderWidth(
+            style.borderBottomStyle, style.borderBottomWidth
+        )
+
+        self.deltaWidth = (
+            style.paddingLeft
+            + style.paddingRight
+            + self.borderWidthLeft
+            + self.borderWidthRight
+        )
+        self.deltaHeight = (
+            style.paddingTop
+            + style.paddingBottom
+            + self.borderWidthTop
+            + self.borderWidthBottom
+        )
+
+        # reduce the available width & height by the padding so the wrapping
+        # will use the correct size
+        availWidth -= self.deltaWidth
+        availHeight -= self.deltaHeight
+
+        # Modify maximum image sizes
+        self._calcImageMaxSizes(availWidth, availHeight)
+
+        # A page number or count takes its value as the line is laid out: in
+        # a box or a table cell the lines are broken before anything in it
+        # is drawn.
+        doc = getattr(getattr(self, "canv", None), "_doctemplate", None)
+        if doc is not None:
+            for frag in self.frags:
+                resolve = getattr(getattr(frag, "text", None), "resolve", None)
+                if resolve is not None:
+                    resolve(doc)
+
+        # call the base class to do wrapping and calculate the size
+        Paragraph.wrap(self, availWidth, availHeight)
+
+        # self.height = max(1, self.height)
+        # self.width = max(1, self.width)
+
+        # increase the calculated size by the padding
+        self.width += self.deltaWidth
+        self.height += self.deltaHeight
+
+        return self.width, self.height
+
+    def split(self, availWidth, availHeight):
+        if len(self.frags) <= 0:
+            return []
+
+        # the split information is all inside self.blPara
+        if not hasattr(self, "deltaWidth"):
+            self.wrap(availWidth, availHeight)
+
+        availWidth -= self.deltaWidth
+        availHeight -= self.deltaHeight
+
+        return Paragraph.split(self, availWidth, availHeight)
+
+    def draw(self):
+        # Create outline
+        if getattr(self, "outline", False):
+            # Once per flowable, not once per drawing. multiBuild draws the
+            # story twice: the table of contents is built from the entries the
+            # first pass notified, so the key it links to has to be the one the
+            # final pass bookmarks. A fresh uuid per draw leaves the link
+            # dangling and ReportLab refuses to save the document at all
+            # ("undefined destination target"). The story holds the same
+            # flowable objects across passes, so this persists.
+            if not getattr(self, "tocKey", None):
+                self.tocKey = uuid4().hex
+
+            # The entry goes under the nearest entry before it with a lower
+            # level, or at the top with none, as a browser nests a document's
+            # headings: an h3 straight after an h1 is the h1's child, and a
+            # document that starts at h2 has its h2s at the top. The stack
+            # holds the levels of the entries still open, so the depth is
+            # never more than one below the entry before, which is all
+            # ReportLab accepts.
+            levels = self.canv.__dict__.setdefault("outlineLevels", [])
+            while levels and levels[-1] >= self.outlineLevel:
+                levels.pop()
+            depth = len(levels)
+            levels.append(self.outlineLevel)
+
+            self.canv.bookmarkPage(self.tocKey)
+            self.canv.addOutlineEntry(
+                self.text, self.tocKey, depth, not self.outlineOpen
+            )
+
+        # Draw the background and borders here before passing control on to
+        # ReportLab. This is because ReportLab can't handle the individual
+        # components of the border independently. This will also let us
+        # support more border styles eventually.
+        canvas = self.canv
+        style = self.style
+        bg = style.backColor
+        leftIndent = style.leftIndent
+        bp = 0  # style.borderPadding
+
+        x = leftIndent - bp
+        y = -bp
+        w = self.width - (leftIndent + style.rightIndent) + 2 * bp
+        h = self.height + 2 * bp
+
+        drawBoxBackground(canvas, x, y, w, h, style)
+
+        # we need to hide the bg color (if any) so Paragraph won't try to draw it again
+        style.backColor = None
+
+        # offset the origin to compensate for the padding
+        canvas.saveState()
+        canvas.translate(
+            (style.paddingLeft + getattr(self, "borderWidthLeft", 0)),
+            -1 * (style.paddingTop + getattr(self, "borderWidthTop", 0)),
+        )  # + (style.leading / 4)))
+
+        # Call the base class draw method to finish up
+        Paragraph.draw(self)
+        canvas.restoreState()
+
+        # Reset color because we need it again if we run 2-PASS like we
+        # do when using TOC
+        style.backColor = bg
+
+        drawBoxBorders(canvas, x, y, w, h, style)
+
+
+def drawn_inside(flowable: Flowable) -> list[Flowable] | None:
+    """
+    What a container drew inside itself, or None for any other flowable.
+
+    The document hears about what a frame placed, not about what a table
+    cell, a keep-in-frame or a block's box drew inside it; a heading in one
+    of those reaches the index only through here.
+    """
+    inner = getattr(flowable, "drawn_flowables", None)
+    if inner is not None:
+        return inner()
+    if isinstance(flowable, KeepInFrame):
+        # Shrunk or not, all of its content is drawn.
+        return opened_up(flowable._content)
+    return None
+
+
+def opened_up(flowables) -> list[Flowable]:
+    """`flowables` with every container in it opened up."""
+    drawn: list[Flowable] = []
+    for flowable in flowables:
+        inner = drawn_inside(flowable)
+        drawn.extend(inner if inner is not None else [flowable])
+    return drawn
+
+
+class PmlKeepInFrame(KeepInFrame, PmlMaxHeightMixIn):
+    def wrap(self, availWidth, availHeight):
+        availWidth = max(availWidth, 1.0)
+        availHeight = max(availHeight, 1.0)
+        self.maxWidth = availWidth
+        self.maxHeight = self.setMaxHeight(availHeight)
+        return KeepInFrame.wrap(self, availWidth, availHeight)
+
+
+class _CellPart(PmlKeepInFrame):
+    """
+    One part of a cell whose row was cut between pages.
+
+    Shrunk to the cell's width when something in it is wider, so that it
+    stays inside the cell, but never to a height: what does not fit the
+    page goes on in the next part, in print of the same size.
+    """
+
+    def __init__(self, content) -> None:
+        super().__init__(maxWidth=0, maxHeight=0, mode="shrink", content=content)
+
+    def wrap(self, availWidth, availHeight):
+        return PmlKeepInFrame.wrap(self, availWidth, _UNBOUNDED)
+
+
+#: A height nothing is shrunk to, and that setMaxHeight does not record.
+_UNBOUNDED = 0xFFFFFFF
+
+
+class PmlFlowingCell(_CellPart):
+    """
+    A cell holding a table of its own, at its natural height.
+
+    A nested table taller than the page goes on from page to page in print
+    of its own size: the row holding it is cut wherever the page ends
+    (PmlTable.split), rather than the cell being shrunk to fit one page.
+    """
+
+
+def _cutContent(canv, content: list, width: float, height: float):
+    """
+    `content` as what fits `height` and the rest, cut by height alone.
+
+    ReportLab's _findSplit also stops at anything wider than `width`, and
+    with nothing before it gives up; here a long word or a wide image goes
+    where its height puts it, and the part holding it is shrunk to width.
+    """
+    used = 0.0
+    after = 0.0
+    for i, flowable in enumerate(content):
+        _w, h = flowable.wrapOn(canv, width, _UNBOUNDED)
+        before = max(flowable.getSpaceBefore() - after, 0) if i else 0
+        if used + before + h <= height:
+            after = flowable.getSpaceAfter()
+            used += before + h + after
+            continue
+        room = height - used - before
+        try:
+            parts = (
+                copy.deepcopy(flowable).splitOn(canv, width, room) if room > 0 else []
+            )
+        except Exception:  # some flowables cannot be copied
+            parts = []
+        if parts:
+            return content[:i] + parts[:1], parts[1:] + content[i + 1 :]
+        return content[:i], content[i:]
+    return content, []
+
+
+class RoundedTableBox:
+    """
+    A table or cell with a border-radius, as the argument of a BACKGROUND.
+
+    ReportLab calls a callable BACKGROUND argument to paint it, and carries
+    the command through everything it does to a table's commands: splitting
+    it between pages, repeating header rows, spans, negative indices. So the
+    rounded box rides along as one, and PmlTable works out from the command
+    where the box has ended up before it paints.
+
+    `style` has the box's background, borders and radii, spelt as
+    drawBoxBackground and drawBoxBorders read them.
+    """
+
+    def __init__(self, style, kind: str) -> None:
+        self.style = style
+        #: "table" or "td": a table's box is cut by any page break, a cell's
+        #: only when its row is too tall for a page and is cut inside.
+        self.kind = kind
+
+    def __call__(self, table, canv, x0, y0, w, h) -> None:
+        placed = getattr(table, "_roundedBoxes", {}).get(id(self))
+        if placed is None or placed.painted:
+            return
+        # Repeated header rows split a table-wide command in two; the box
+        # is the union of both, painted once.
+        placed.painted = True
+        drawBoxBackground(
+            canv, placed.x, placed.y, placed.w, placed.h, self.style, placed.sides
+        )
+
+
+class _PlacedBox:
+    """Where a RoundedTableBox lands in one table, or one fragment of it."""
+
+    def __init__(self, painter: RoundedTableBox, x0, x1, bottom, top) -> None:
+        self.painter = painter
+        self.x0, self.x1, self.bottom, self.top = x0, x1, bottom, top
+        self.sides: tuple[str, ...] = ("Left", "Right", "Top", "Bottom")
+        self.painted = False
+        self.rounded = None
+
+    def extend(self, x0, x1, bottom, top) -> None:
+        self.x0, self.x1 = min(self.x0, x0), max(self.x1, x1)
+        self.bottom, self.top = min(self.bottom, bottom), max(self.top, top)
+
+    @property
+    def x(self) -> float:
+        return self.x0
+
+    @property
+    def y(self) -> float:
+        return self.bottom
+
+    @property
+    def w(self) -> float:
+        return self.x1 - self.x0
+
+    @property
+    def h(self) -> float:
+        return self.top - self.bottom
+
+
+def _mergeBlocks(blocks: dict) -> dict:
+    """Sort and join overlapping intervals; _hLine walks them in order."""
+    merged = {}
+    for key, intervals in blocks.items():
+        joined: list = []
+        for start, end in sorted(intervals):
+            if joined and start <= joined[-1][1]:
+                joined[-1] = (joined[-1][0], max(joined[-1][1], end))
+            else:
+                joined.append((start, end))
+        merged[key] = joined
+    return merged
+
+
+class PmlTable(Table, PmlMaxHeightMixIn):
+    #: Whether a page break cut this fragment of the table at its top or its
+    #: bottom; the table's box has no edge and no rounded corners there.
+    _cutTop = False
+    _cutBottom = False
+    #: Whether the cut went through a row rather than between two: the
+    #: first body row of this fragment is the rest of one, or its last row
+    #: goes on in the next. A cell's box has no edge there.
+    _rowCutTop = False
+    _rowCutBottom = False
+    #: ReportLab's, swapped for the time of a cut inside a row.
+    _cellvalues: list[Any]
+    _cellStyles: list[Any]
+    #: The table's own margin-left and margin-right. The table is laid out
+    #: in what the frame has less these, and drawn that far in; a percentage
+    #: width is of that narrower box, as in a browser.
+    marginLeft = 0.0
+    marginRight = 0.0
+    #: Whether the table is as wide as its content rather than the frame:
+    #: what an auto margin asks of a table with no width of its own (#562).
+    shrinkToFit = False
+    #: A CSS height, in points: the least the table is high. Rows shorter
+    #: than that share the difference, as in a browser; content taller than
+    #: that makes the table taller.
+    minHeight: float | None = None
+
+    def _margins(self) -> float:
+        return self.marginLeft + self.marginRight
+
+    def drawn_flowables(self) -> list[Flowable]:
+        """
+        What this part of the table drew, cell by cell, row by row.
+
+        A heading in a cell was bookmarked in the outline as it was drawn,
+        but its index entry is notified by afterFlowable, which saw only the
+        table. The header rows a continued part repeats are not counted
+        again.
+        """
+        rows = self._cellvalues
+        if self._cutTop:
+            rows = rows[self._repeatCount() :]
+        drawn: list[Flowable] = []
+        for row in rows:
+            for cell in row:
+                if isinstance(cell, Flowable):
+                    drawn.extend(opened_up([cell]))
+                elif isinstance(cell, (list, tuple)):
+                    drawn.extend(opened_up(cell))
+        return drawn
+
+    def split(self, availWidth, availHeight):
+        if self.minHeight and self._height > availHeight:
+            # Stretched, the table does not fit here. Its rows at their own
+            # height might, and ReportLab's split would then hand it back
+            # whole, which platypus takes for a split that went nowhere. A
+            # table that was already moved on once is cut at its natural
+            # height instead: the height is a minimum, not a reason to
+            # leave a page empty.
+            if not getattr(self, "_postponed", False):
+                natural = sum(getattr(self, "_naturalRowHeights", self._rowHeights))
+                if natural <= availHeight:
+                    return []
+            self.minHeight = None
+        parts = []
+        inRow = False
+        if self._flowsAt(availHeight):
+            parts = self._splitInsideRow(availWidth - self._margins(), availHeight)
+            inRow = bool(parts)
+        if not parts:
+            parts = Table.split(self, availWidth - self._margins(), availHeight)
+        if not parts and self._mayCutInsideRow():
+            parts = self._splitInsideRow(availWidth - self._margins(), availHeight)
+            inRow = True
+        for part in parts:
+            part.marginLeft, part.marginRight = self.marginLeft, self.marginRight
+            part.splitInRow = 0
+        if len(parts) == 2:
+            parts[0]._cutTop, parts[0]._cutBottom = self._cutTop, True
+            parts[1]._cutTop, parts[1]._cutBottom = True, self._cutBottom
+            parts[0]._rowCutTop, parts[0]._rowCutBottom = self._rowCutTop, inRow
+            parts[1]._rowCutTop = inRow
+        return parts
+
+    def _repeatCount(self) -> int:
+        """How many header rows each fragment of the table repeats."""
+        repeat = self.repeatRows
+        return (len(repeat) if isinstance(repeat, (list, tuple)) else repeat) or 0
+
+    def _flowsAt(self, availHeight) -> bool:
+        """
+        Whether the first row that does not fit `availHeight` holds a
+        PmlFlowingCell, which is cut there rather than moved on whole.
+        """
+        n = self._getFirstPossibleSplitRowPosition(availHeight, ignoreSpans=1)
+        if n >= self._nrows or n < self._repeatCount():
+            return False
+        return any(
+            isinstance(flowable, PmlFlowingCell)
+            for cell in self._cellvalues[n]
+            for flowable in (cell if isinstance(cell, (list, tuple)) else [cell])
+        )
+
+    def _mayCutInsideRow(self) -> bool:
+        """
+        Whether a row too tall to go anywhere may be cut in two.
+
+        Only where it could go nowhere else: the table was already moved on
+        once, or it stands at the top of an empty frame and moving on would
+        only leave the frame empty. A row that fits the next frame goes there
+        whole.
+        """
+        if getattr(self, "_postponed", False):
+            return True
+        doc = getattr(getattr(self, "canv", None), "_doctemplate", None)
+        return bool(getattr(getattr(doc, "frame", None), "_atTop", False))
+
+    def _splitInsideRow(self, availWidth, availHeight) -> list:
+        """
+        The table cut inside the first row that does not fit, or [] if not.
+
+        ReportLab can cut a row (splitInRow), but only a cell that is a list
+        of flowables, and every cell here is one PmlKeepInFrame; so for the
+        time of the split each cell is a list of one, which _splitCell
+        knows how to cut. A row that a rowspan crosses is not cut: ReportLab
+        gets that case wrong. Cells are cut top-aligned, as a browser does,
+        and nothing of the table itself is changed.
+        """
+        n = self._getFirstPossibleSplitRowPosition(availHeight, ignoreSpans=1)
+        if n >= self._nrows:
+            return []
+        values = [
+            [[v] if isinstance(v, Flowable) else v for v in row]
+            for row in self._cellvalues
+        ]
+        # A colspan's cell is as wide as its columns, not as its first.
+        widths: dict[int, float] = {}
+        for c in range(self._ncols):
+            span = getattr(self, "_spanRanges", {}).get((c, n), (c, n, c, n))
+            if span is not None:
+                widths[c] = sum(self._colWidths[span[0] : span[2] + 1])
+        for span in getattr(self, "_spanRanges", {}).values():
+            if span is not None and span[1] != span[3] and span[1] <= n <= span[3]:
+                return []
+        styles = [[s.copy() for s in row] for row in self._cellStyles]
+        for row in styles:
+            for style in row:
+                style.valign = "TOP"
+        saved = self._cellvalues, self._cellStyles
+        self._cellvalues, self._cellStyles = values, styles
+        self.splitInRow, self._splitRow = 1, (n, widths)
+        try:
+            parts = Table.split(self, availWidth, availHeight)
+        finally:
+            self._cellvalues, self._cellStyles = saved
+            self.splitInRow = 0
+            del self._splitRow
+        if len(parts) == 2:
+            # ReportLab gives the two halves of the row heights measured in
+            # the first column of a colspan; they are measured again, whole.
+            parts[0]._argH[-1] = None
+            parts[1]._argH[self._repeatCount()] = None
+        return parts
+
+    def _splitCell(self, value, style, oldHeight, newHeight, width):
+        if hasattr(self, "_splitRow"):
+            # Which column: ReportLab only says how wide the first one is.
+            # By identity, as measuring the row replaced the lists.
+            n, widths = self._splitRow
+            for c, cell in enumerate(self._cellvalues[n]):
+                if cell is value:
+                    width = widths.get(c, width)
+                    break
+        if (
+            isinstance(value, (list, tuple))
+            and len(value) == 1
+            and isinstance(value[0], PmlKeepInFrame)
+        ):
+            return self._splitKeepInFrame(value[0], style, newHeight, width)
+        return Table._splitCell(self, value, style, oldHeight, newHeight, width)
+
+    def _splitKeepInFrame(self, cell, style, newHeight, width):
+        """
+        `cell` in what fits `newHeight` of its row and the rest, or [].
+
+        ReportLab's own _splitCell measures in the column's width and the
+        row's height, paddings left in, so the top half it cuts can come out
+        taller than the room it was cut for once it is laid out in the cell.
+
+        The halves are _CellParts: the top one was cut to fit, and the rest,
+        shrunk to a height, would come out in smaller print than the top; at
+        its own height it is cut again on the next page if it has to be.
+        """
+        inner = width - style.leftPadding - style.rightPadding
+        room = newHeight - style.topPadding - style.bottomPadding
+        top, rest = _cutContent(getattr(self, "canv", None), cell._content, inner, room)
+        if not rest:
+            return (cell,), ()
+        if not top:
+            return []
+        part = PmlFlowingCell if isinstance(cell, PmlFlowingCell) else _CellPart
+        return (part(top),), (part(rest),)
+
+    def _placeRoundedBoxes(self) -> dict:
+        """Each RoundedTableBox's rectangle in this table, by painter."""
+        boxes: dict = {}
+        ncols, nrows = self._ncols, self._nrows
+        cp, rp = self._colpositions, self._rowpositions
+        for _cmd, (sc, sr), (ec, er), arg in self._bkgrndcmds:
+            if not isinstance(arg, RoundedTableBox) or sr in _SPECIALROWS:
+                continue
+            sc, ec = (c + ncols if c < 0 else c for c in (sc, ec))
+            sr, er = (r + nrows if r < 0 else r for r in (sr, er))
+            rect = (cp[sc], cp[min(ec + 1, ncols)], rp[min(er + 1, nrows)], rp[sr])
+            if id(arg) in boxes:
+                boxes[id(arg)].extend(*rect)
+            else:
+                boxes[id(arg)] = _PlacedBox(arg, *rect)
+        # Where a row was cut inside: the top of the first body row, the
+        # bottom of the last.
+        rowCutTop = rp[self._repeatCount()] if self._rowCutTop else None
+        rowCutBottom = rp[nrows] if self._rowCutBottom else None
+        for box in boxes.values():
+            if box.painter.kind == "table":
+                box.sides = tuple(
+                    side
+                    for side in box.sides
+                    if not (side == "Top" and self._cutTop)
+                    and not (side == "Bottom" and self._cutBottom)
+                )
+            else:
+                box.sides = tuple(
+                    side
+                    for side in box.sides
+                    if not (side == "Top" and box.top == rowCutTop)
+                    and not (side == "Bottom" and box.bottom == rowCutBottom)
+                )
+            box.rounded = roundedBox(
+                box.painter.style, box.x, box.y, box.w, box.h, box.sides
+            )
+        return boxes
+
+    def _drawBkgrnd(self):
+        self._roundedBoxes = self._placeRoundedBoxes()
+        Table._drawBkgrnd(self)
+
+    def _drawLines(self):
+        """
+        Draw the grid, leaving out the edges a rounded box strokes itself.
+
+        The lines are ReportLab's, from the LINE* commands, and can come
+        from anywhere: the box's own, a neighbour's on the edge they share,
+        a table-wide one. _hBlocks and _vBlocks are how ReportLab keeps its
+        lines out of a spanned cell, and they keep them off a rounded edge
+        just as well; the rounded box then draws its own border.
+        """
+        boxes = [
+            box
+            for box in getattr(self, "_roundedBoxes", {}).values()
+            if box.rounded is not None and box.rounded.borders
+        ]
+        if not boxes:
+            Table._drawLines(self)
+            return
+        saved = {name: self.__dict__.get(name) for name in ("_hBlocks", "_vBlocks")}
+        hBlocks = {k: list(v) for k, v in (saved["_hBlocks"] or {}).items()}
+        vBlocks = {k: list(v) for k, v in (saved["_vBlocks"] or {}).items()}
+        for box in boxes:
+            for side in box.rounded.borders:
+                if side in {"Top", "Bottom"}:
+                    y = box.top if side == "Top" else box.bottom
+                    hBlocks.setdefault(y, []).append((box.x0, box.x1))
+                else:
+                    x = box.x0 if side == "Left" else box.x1
+                    vBlocks.setdefault(x, []).append((box.bottom, box.top))
+        self._hBlocks, self._vBlocks = _mergeBlocks(hBlocks), _mergeBlocks(vBlocks)
+        try:
+            Table._drawLines(self)
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    self.__dict__.pop(name, None)
+                else:
+                    setattr(self, name, value)
+        for box in boxes:
+            drawBoxBorders(
+                self.canv, box.x, box.y, box.w, box.h, box.painter.style, box.sides
+            )
+
+    @staticmethod
+    def _normWidth(w, maxw):
+        """Normalize width when using percentages."""
+        if isinstance(w, str):
+            w = (maxw / 100.0) * float(w[:-1])
+        elif (w is None) or (w == "*"):
+            w = maxw
+        return min(w, maxw)
+
+    def _listCellGeom(self, V, w, s, W=None, H=None, aH=72000):
+        # print "#", self.availHeightValue
+        if aH == 72000:
+            aH = self.getMaxHeight() or aH
+        return Table._listCellGeom(self, V, w, s, W=W, H=H, aH=aH)
+
+    def wrap(self, availWidth, availHeight):
+        width, height = self._wrapInside(availWidth - self._margins(), availHeight)
+        return width + self._margins(), height
+
+    def drawOn(self, canvas, x, y, _sW=0):
+        Table.drawOn(self, canvas, x + self.marginLeft, y, _sW)
+
+    def _contentColumnWidths(self, availWidth: float) -> list[float] | None:
+        """
+        Column widths that follow the content, for a table that shrinks to
+        fit; None when the columns are not the content's to decide.
+
+        The CSS automatic layout, roughly: every column as wide as its
+        content unset (max-content) when that fits, as narrow as its longest
+        word (min-content) when even that does not, and in between the room
+        left shared in proportion to what each would still take. Percentage
+        columns keep the table at its width: they are a share of it, and
+        there is no width to take a share of.
+        """
+        widths = self._colWidths
+        if any(isinstance(w, str) for w in widths) or None not in widths:
+            return None
+        # Here, not at the top: builders.flex imports this module.
+        from xhtml2pdf.builders.flex import table_column_widths
+
+        lows, highs = table_column_widths(self, self.canv, widths, spans=True)
+        auto = [i for i, w in enumerate(widths) if w is None]
+        room = availWidth - sum(w for w in widths if w is not None)
+        autoMin = sum(lows[i] for i in auto)
+        autoMax = sum(highs[i] for i in auto)
+        result = list(widths)
+        for i in auto:
+            if autoMax <= room:
+                result[i] = highs[i]
+            elif autoMin < room:
+                share = (room - autoMin) / (autoMax - autoMin)
+                result[i] = lows[i] + (highs[i] - lows[i]) * share
+            else:
+                result[i] = lows[i]
+        return result
+
+    def _wrapInside(self, availWidth, availHeight):
+        self.setMaxHeight(availHeight)
+
+        # Strange bug, sometime the totalWidth is not set !?
+        if not hasattr(self, "totalWidth"):
+            self.totalWidth = availWidth
+
+        newColWidths = self._colWidths
+        if self.shrinkToFit and self.totalWidth is None:
+            content = self._contentColumnWidths(availWidth)
+            if content is not None:
+                newColWidths[:] = content
+                self.totalWidth = min(sum(content), availWidth)
+
+        # Prepare values
+        totalWidth = self._normWidth(self.totalWidth, availWidth)
+        remainingWidth = totalWidth
+        remainingCols = 0
+
+        # Calculate widths that are fix
+        # IMPORTANT!!! We can not substitute the private value
+        # self._colWidths therefore we have to modify list in place
+        for i, colWidth in enumerate(newColWidths):
+            if colWidth is not None:
+                newColWidth = self._normWidth(colWidth, totalWidth)
+                remainingWidth -= newColWidth
+            else:
+                remainingCols += 1
+                newColWidth = None
+            newColWidths[i] = newColWidth
+
+        # Distribute remaining space
+        minCellWidth = totalWidth * 0.01
+        if remainingCols > 0:
+            for i, colWidth in enumerate(newColWidths):
+                if colWidth is None:
+                    newColWidths[i] = max(
+                        minCellWidth, remainingWidth / remainingCols
+                    )  # - 0.1
+
+        # Bigger than totalWidth? Lets reduce the fix entries propotionally
+
+        if sum(newColWidths) > totalWidth:
+            quotient = totalWidth / sum(newColWidths)
+            for i in range(len(newColWidths)):
+                newColWidths[i] *= quotient
+
+        # To avoid rounding errors adjust one col with the difference
+        diff = sum(newColWidths) - totalWidth
+        if diff > 0:
+            newColWidths[0] -= diff
+
+        width, height = Table.wrap(self, availWidth, availHeight)
+        self._naturalRowHeights = list(self._rowHeights)
+        if self.minHeight and height < self.minHeight:
+            width, height = self._stretch(availWidth, availHeight)
+        return width, height
+
+    def _stretch(self, availWidth, availHeight):
+        """
+        Lay the table out again with its rows sharing what it lacks of its
+        minimum height, in proportion to their own; an empty row stays
+        empty unless every row is.
+
+        The stretched heights go in for this one layout and the declared
+        ones come back after it, so a second wrap starts from the content
+        again instead of from a table already stretched.
+        """
+        natural = self._naturalRowHeights
+        extra = self.minHeight - sum(natural)
+        total = sum(natural)
+        if total > 0:
+            stretched = [h + extra * h / total for h in natural]
+        else:
+            stretched = [self.minHeight / len(natural)] * len(natural)
+        declared = self._argH
+        # With no row left to measure, _calc_height takes _rowHeights as
+        # they are; it reads _argH only to see whether any is.
+        self._argH = self._rowHeights = stretched
+        try:
+            return Table.wrap(self, availWidth, availHeight)
+        finally:
+            self._argH = declared
+
+
+class PmlPageCount(IndexingFlowable):
+    def __init__(self) -> None:
+        super().__init__()
+        self.second_round = False
+
+    def isSatisfied(self):
+        s = self.second_round
+        self.second_round = True
+        return s
+
+    def drawOn(self, canvas, x, y, _sW=0):
+        pass
+
+
+def tocNotifyKind(name: str = "") -> str:
+    """
+    The ReportLab notification kind an entry bound for ``name`` travels as.
+
+    ReportLab already routes several tables of contents in one document, and
+    the whole of its mechanism is this string: ``BaseDocTemplate.notify``
+    broadcasts to every indexing flowable and each one keeps what matches its
+    own ``notifyKind``. Naming an index is therefore nothing more than giving
+    it a kind of its own.
+
+    An unnamed index keeps plain ``TOCEntry``, which is what ReportLab
+    documents and what a third party calling ``doc.notify("TOCEntry", ...)``
+    expects to reach. Both the emitter and the constructor come through here
+    on purpose: two f-strings that drifted apart would route every entry into
+    a kind nobody listens for, and an index that simply comes out empty is a
+    bug with no symptom to follow.
+    """
+    return f"TOCEntry:{name}" if name else "TOCEntry"
+
+
+def drawPageNumbersRTL(canvas, style, pages, dot) -> None:
+    """
+    Reportlab's drawPageNumbers for a right-to-left entry: the number flush
+    left, the fill from it to where the title ends.
+
+    drawPageNumbers measures from where the text stopped to the right margin.
+    A right-to-left title is set flush right, so there was no room left
+    there: the number shrank below a point and was drawn on top of the
+    title's last letter (#664). Here the room is what lies left of the
+    title's last line.
+    """
+    pagestr = ", ".join(str(p) for p, _ in pages)
+    end = canvas._curr_tx_info["line_x"]
+    y = canvas._curr_tx_info["cur_y"]
+
+    fontSize = style.fontSize
+    pagestrw = stringWidth(pagestr, style.fontName, fontSize)
+    while pagestrw > end and fontSize >= 1.0:
+        fontSize *= 0.9
+        pagestrw = stringWidth(pagestr, style.fontName, fontSize)
+
+    dots = 0
+    if dot:
+        dotw = stringWidth(dot, style.fontName, fontSize)
+        dots = max(int((end - pagestrw) / dotw), 0)
+
+    tx = canvas.beginText(0, y)
+    tx.setFont(style.fontName, fontSize)
+    tx.setFillColor(style.textColor)
+    tx.textLine(pagestr + dots * dot)
+    canvas.drawText(tx)
+
+    pagex = 0
+    commaw = stringWidth(", ", style.fontName, fontSize)
+    for p, key in pages:
+        w = stringWidth(str(p), style.fontName, fontSize)
+        if key:
+            canvas.linkRect(
+                "", key, (pagex, y, pagex + w, y + style.leading), relative=1
+            )
+        pagex += w + commaw
+
+
+def reserveForPageNumber(paragraph, style, pagestr: str, leader: str) -> None:
+    """
+    Keep the room for an entry's page number free on its last line.
+
+    drawPageNumbers puts the number after wherever the title stopped, and a
+    title that filled its last line left it nothing: the number shrank in 10%
+    steps to under a point (#664). The marker that calls it is a frag with no
+    width of its own, and the line breaker counts a marker's ``reserve``
+    against the word it rides on, so giving it the number's width plus one
+    unit of the fill moves the title's last word to a line of its own
+    whenever the two would not fit together. The reserve is free space to
+    the line's alignment, so a title set flush right (right to left) stays
+    flush right and keeps the room on its left, where its number goes.
+
+    Only the last line is narrowed. Chinese/Japanese line breaking does not
+    count the reserve, and keeps the old shrinking.
+    """
+    reserve = stringWidth(pagestr, style.fontName, style.fontSize) + stringWidth(
+        leader or " ", style.fontName, style.fontSize
+    )
+    for frag in paragraph.frags:
+        cbDefn = getattr(frag, "cbDefn", None)
+        if (
+            cbDefn is not None
+            and getattr(cbDefn, "kind", None) == "onDraw"
+            and getattr(cbDefn, "name", None) == "drawTOCEntryEnd"
+        ):
+            cbDefn.reserve = reserve
+
+
+class PmlTableOfContents(TableOfContents):
+    """
+    A table of contents whose page numbers are flush right, with an optional
+    fill between them and the entry.
+
+    This used to lay each entry out as a two-column table, the title in one
+    cell and the page number right-aligned in another of ``rightColumnWidth``
+    -- ReportLab's default 72pt, never overridden, which is why the number
+    stopped an inch short of the margin. A title in its own cell also cannot
+    be followed by anything, so there was nowhere for a fill to go, and a long
+    title ran into the number.
+
+    ReportLab already solves all of this, and the old wrap threw it away:
+    one column, an ``<onDraw>`` marker at the end of each entry, and
+    ``drawPageNumbers`` measuring from wherever the text left off to the right
+    margin. It repeats the fill string to cover the gap, sets the number flush
+    right and links it to the entry's destination. Where the title would fill
+    its last line, reserveForPageNumber breaks it a word earlier instead of
+    letting ReportLab shrink the number.
+    """
+
+    def __init__(self, **kwds) -> None:
+        # notifyKind travels through here into ReportLab, and is what makes
+        # one index of several keep only its own entries.
+        super().__init__(**kwds)
+
+        #: Fill used for a level whose stylesheet does not name one; set from
+        #: ``<pdf:toc leader="...">``. Empty means no fill.
+        #:
+        #: Per instance, not per class: a class attribute is invisible while
+        #: a document has a single index, but with two it lets the last
+        #: <pdf:toc> parsed set the fill for every index in the document.
+        self.defaultLeader: str = ""
+
+        #: Which multiBuild pass is being laid out. See wrap: the first pass
+        #: has no entries to draw yet, and what it draws instead must not be
+        #: what the reader ends up with.
+        self._buildPass: int = 0
+
+    def beforeBuild(self) -> None:
+        self._buildPass += 1
+        super().beforeBuild()
+
+    def isSatisfied(self) -> bool:
+        # A second pass even when the first settled it. An index nobody
+        # writes to has _entries == _lastEntries == [] as soon as pass one
+        # ends, so ReportLab stops there and saves the placeholder that wrap
+        # draws while it waits for real entries -- the words "Placeholder for
+        # table of contents", in the finished document. A document with a
+        # table of contents builds twice anyway; this only makes sure the
+        # empty one gets its second pass too, where it draws nothing.
+        return super().isSatisfied() and self._buildPass > 1
+
+    def leaderFor(self, style) -> str:
+        """The string repeated to fill the gap before the page number."""
+        # The level's own stylesheet wins over the tag's attribute.
+        return getattr(style, "tocLeader", None) or self.defaultLeader
+
+    def wrap(self, availWidth, availHeight):
+        """All table properties should be known by now."""
+        # we draw the LAST RUN's entries!  If there are
+        # none, we make some dummy data to keep the table
+        # from complaining
+        if len(self._lastEntries) == 0:
+            # ReportLab's placeholder is scaffolding for the pass that has no
+            # entries yet: it holds a row's worth of space so the page count
+            # the next pass measures is close. Past that pass it is just text
+            # nobody wrote, and an index no entry names -- easy to end up with
+            # now that indexes have names -- would print it in the finished
+            # document. Table([]) raises "must have at least a row and
+            # column", so an empty index cannot be an empty table; it has to
+            # be no table at all, which is what _table = None means to the
+            # split and drawOn below.
+            if self._buildPass > 1:
+                self._table = None
+                self.width = self.height = 0
+                return 0, 0
+            _tempEntries = [(0, "Placeholder for table of contents", 0, None)]
+        else:
+            _tempEntries = self._lastEntries
+
+        def drawTOCEntryEnd(canvas, kind, label):  # noqa: ARG001
+            """Draw the fill and the page number after an entry's text."""
+            page, level, key = label.split(",", 2)
+            style = self.levelStyles[int(level)]
+            pages = [(int(page), None if key == "None" else key)]
+            if getattr(style, "tocRTL", False):
+                drawPageNumbersRTL(canvas, style, pages, self.leaderFor(style))
+            else:
+                drawPageNumbers(
+                    canvas, style, pages, availWidth, availHeight, self.leaderFor(style)
+                )
+
+        self.canv.setNamedCB("drawTOCEntryEnd", drawTOCEntryEnd)
+
+        lastMargin = 0
+        tableData = []
+        tableStyle = [
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ]
+        for i, entry in enumerate(_tempEntries):
+            level, text, pageNum = entry[:3]
+            key = entry[3] if len(entry) > 3 else None
+            style = self.levelStyles[level]
+            if i:  # Not for first element
+                tableStyle.append(
+                    ("TOPPADDING", (0, i), (-1, i), max(lastMargin, style.spaceBefore))
+                )
+            lastMargin = style.spaceAfter
+            # Vertical space as padding on the row, not as ReportLab's
+            # Spacer rows: adopting those would move the vertical rhythm of
+            # every table of contents that already renders.
+            # ReportLab also wraps the title in <a href="#key">, which this
+            # copy of its paragraph renderer cannot take: its link plumbing
+            # predates the (n, link) pairs paraparser now produces for <a>,
+            # and _doLink would be handed a list. The page number carries the
+            # link instead -- drawPageNumbers emits it as a canvas linkRect,
+            # clear of the paragraph entirely.
+            marker = '<onDraw name="drawTOCEntryEnd" label="%d,%d,%s"/>' % (
+                pageNum,
+                level,
+                key,
+            )
+            # The marker sticks to the title's last word, so the room it
+            # reserves goes with that word to the next line when the line is
+            # full.
+            # The title is in the order it was written; the entry's lines are
+            # put in the order they are drawn in its own direction.
+            entry = Paragraph(
+                text.rstrip() + marker,
+                style,
+                dir="rtl" if getattr(style, "tocRTL", False) else "ltr",
+            )
+            reserveForPageNumber(entry, style, str(pageNum), self.leaderFor(style))
+            tableData.append([entry])
+
+        self._table = Table(
+            tableData, colWidths=(availWidth,), style=TableStyle(tableStyle)
+        )
+
+        self.width, self.height = self._table.wrapOn(self.canv, availWidth, availHeight)
+        return self.width, self.height
+
+    # Both of ReportLab's delegate straight to self._table, which wrap above
+    # leaves as None for an index with nothing to show.
+
+    def split(self, availWidth, availHeight):
+        if self._table is None:
+            return []
+        return super().split(availWidth, availHeight)
+
+    def drawOn(self, canvas, x, y, _sW=0) -> None:
+        if self._table is None:
+            return
+        super().drawOn(canvas, x, y, _sW)
+
+
+class PmlRightPageBreak(CondPageBreak):
+    def __init__(self) -> None:
+        pass
+
+    def wrap(self, availWidth, availHeight):
+        if not self.canv.getPageNumber() % 2:
+            self.width = availWidth
+            self.height = availHeight
+            return availWidth, availHeight
+        self.width = self.height = 0
+        return 0, 0
+
+
+class PmlLeftPageBreak(CondPageBreak):
+    def __init__(self) -> None:
+        pass
+
+    def wrap(self, availWidth, availHeight):
+        if self.canv.getPageNumber() % 2:
+            self.width = availWidth
+            self.height = availHeight
+            return availWidth, availHeight
+        self.width = self.height = 0
+        return 0, 0
+
+
+# --- Pdf Form
+
+
+class PmlDrawing(Drawing):
+    """
+    A drawing that keeps to the box it was given, and to the frame.
+
+    reportlab's Drawing is a fixed-size flowable holding contents of an
+    unrelated size: a chart asked to be 400 points wide inside a 200 point
+    canvas simply draws past it, over whatever sits alongside, and nothing
+    clips or warns. And a canvas wider than the frame it lands in overflows
+    the same way.
+
+    wrap() already multiplies by renderScale and renderScaledDrawing applies
+    it when the drawing is rendered, so fitting the width is a matter of
+    choosing the scale.
+    """
+
+    # Declared, not assigned: reportlab carries these on Drawing through its
+    # own _attrMap, which is untyped, so mypy would otherwise infer them from
+    # the self-referential assignments in fit_contents and give up.
+    width: float
+    height: float
+    renderScale: float
+
+    # A Drawing refuses attributes its map does not name; these are the
+    # vertical margins Platypus asks a flowable for.
+    _attrMap = AttrMap(
+        BASE=Drawing,
+        spaceBefore=AttrMapValue(isNumber, desc="Space above, as a flowable"),
+        spaceAfter=AttrMapValue(isNumber, desc="Space below, as a flowable"),
+    )
+
+    def wrap(self, availWidth: float, availHeight: float):
+        if availWidth > 0 and self.width > availWidth:
+            self.renderScale = availWidth / self.width
+        return super().wrap(availWidth, availHeight)
+
+    def fit_contents(self, description: str = "drawing") -> None:
+        """
+        Grow the box to hold whatever ended up in it, and say so.
+
+        Growing rather than clipping: the point is that the layout reserves
+        the room the chart actually takes, so the flowable after it is not
+        drawn over.
+        """
+        try:
+            x1, y1, x2, y2 = self.getBounds()
+        except (ValueError, AttributeError):  # an empty drawing has no bounds
+            return
+
+        if x1 < 0 or y1 < 0:
+            self.shift(max(-x1, 0), max(-y1, 0))
+            x2 += max(-x1, 0)
+            y2 += max(-y1, 0)
+
+        if x2 > self.width or y2 > self.height:
+            log.warning(
+                "The contents of a %s do not fit in its %gx%g box and need"
+                " %gx%g; making room for them",
+                description,
+                self.width,
+                self.height,
+                x2,
+                y2,
+            )
+            self.width = max(self.width, x2)
+            self.height = max(self.height, y2)
+
+
+class PmlInput(Flowable):
+    def __init__(
+        self,
+        name,
+        input_type="text",
+        width=10,
+        height=10,
+        default="",
+        options=None,
+        multiline=0,
+    ) -> None:
+        self.width = width
+        self.height = height
+        self.type = input_type
+        self.name = name
+        self.default = default
+        self.options = options if options is not None else []
+        self.multiline = multiline
+
+    def wrap(self, *args):
+        return self.width, self.height
+
+    def draw(self):
+        c = self.canv
+
+        c.saveState()
+        c.setFont("Helvetica", 10)
+        if self.type == "text":
+            pdfform.textFieldRelative(
+                c,
+                self.name,
+                0,
+                0,
+                self.width,
+                self.height,
+                # The value the markup gave the field. It was never passed on,
+                # so <input value="x"> and the contents of a <textarea> came
+                # out as empty fields.
+                value=self.default or "",
+                multiline=self.multiline,
+            )
+            c.rect(0, 0, self.width, self.height)
+        elif self.type == "hidden":
+            # A field with no size: it holds its value and takes no room,
+            # which is what a hidden input is for. Nothing was drawn at all
+            # before, so the value never reached the form.
+            pdfform.textFieldRelative(
+                c, self.name, 0, 0, 0, 0, value=self.default or ""
+            )
+        elif self.type == "radio":
+            c.rect(0, 0, self.width, self.height)
+        elif self.type == "checkbox":
+            if self.default:
+                pdfform.buttonFieldRelative(c, self.name, "Yes", 0, 0)
+            else:
+                pdfform.buttonFieldRelative(c, self.name, "Off", 0, 0)
+            c.rect(0, 0, self.width, self.height)
+        elif self.type == "select":
+            pdfform.selectFieldRelative(
+                c, self.name, self.default, self.options, 0, 0, self.width, self.height
+            )
+            c.rect(0, 0, self.width, self.height)
+
+        c.restoreState()

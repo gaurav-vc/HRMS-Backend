@@ -397,13 +397,13 @@ def provision_contact_person(site, origin=None, is_update=False):
         threading.Thread(target=send_async).start()
 
 
-from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from djangorestframework_camel_case.parser import CamelCaseMultiPartParser, CamelCaseFormParser, CamelCaseJSONParser
 
 class SiteViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Sites'
     queryset = Site.objects.all()
     serializer_class = SiteSerializer
-    parser_classes = (MultiPartParser, FormParser, JSONParser)
+    parser_classes = (CamelCaseMultiPartParser, CamelCaseFormParser, CamelCaseJSONParser)
     
 
     def get_permissions(self):

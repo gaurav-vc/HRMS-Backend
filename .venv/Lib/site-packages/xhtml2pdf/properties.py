@@ -1,0 +1,710 @@
+"""
+The CSS properties xhtml2pdf reads, and how.
+
+This is the whitelist CSSCollect walks. A property that is not here is parsed
+by the CSS engine, resolved through the cascade, stored in the ruleset -- and
+then never looked at, because nothing ever asks the cascade for it. That is a
+silent failure in both directions, and it has cost this library real bugs:
+-pdf-keep-in-frame-max-width was read in pisaLoop but never listed here, so its
+branch was unreachable; -pdf-outline-open was listed but its mapping was
+commented out; and the reference documentation drifted far enough to list
+"colordisplay", two properties run together, for years.
+
+The list used to be a whitespace-separated string. Making each property a row
+with its group, its consumer and -- where the mapping is uniform -- the frag
+attribute and converter that apply it means the whitelist and the code that
+acts on it cannot drift apart: the uniform mappings are generated from here
+rather than repeated as literal tuples.
+
+`frag` set means "the registry applies this one", through transform_attrs,
+unless `applied_by_hand` says CSS2Frag writes the attribute itself and the
+registry only resets it between elements. `frag` unset means the property has
+a hand-written branch and no reset, because its
+consumption is not a plain mapping: font-weight is a binary flag,
+text-decoration lights two flags from a list, margin-left accumulates into the
+running indent as well as writing to the frag, display decides isBlock, and the
+page-break properties emit flowables rather than touching the frag at all.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import TYPE_CHECKING, Any, NamedTuple
+
+from xhtml2pdf.util import (
+    AUTO,
+    NO_RADIUS,
+    NONE_LENGTH,
+    getBool,
+    getBorderRadius,
+    getColor,
+    getFlexAlign,
+    getFlexBasis,
+    getFlexDirection,
+    getFlexJustify,
+    getFlexWrap,
+    getInt,
+    getLengthOrAuto,
+    getNumber,
+    getOverflow,
+    getSize,
+    getTextOverflow,
+    getTocLeader,
+    getTocName,
+    transform_attrs,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+log = logging.getLogger(__name__)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ The registry
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#: Where a property is read. The two differ in more than tidiness: pisaContext
+#: .addTOC calls CSS2Frag directly for the .pdftoclevelN styles without going
+#: through pisaLoop, so a property moved between them changes what a table of
+#: contents picks up.
+FRAG = "frag"  # xhtml2pdf.parser.CSS2Frag
+LOOP = "loop"  # xhtml2pdf.parser.pisaLoop
+
+
+def as_declared(value):
+    """Converter for a property stored exactly as the stylesheet wrote it."""
+    return value
+
+
+#: `initial` left at this means the frag attribute is not reset per element.
+#: Frags are cloned parent to child, so an attribute that is not reset is
+#: inherited whether CSS says so or not. That is how the older properties have
+#: always behaved and documents depend on it; the flex ones are reset because
+#: a flex-grow that leaked from an item into its grandchildren would silently
+#: resize a nested container.
+KEEP = object()
+
+
+class CSSProperty(NamedTuple):
+    name: str
+    group: str
+    consumer: str = FRAG
+    #: Frag attribute this writes to, when the registry applies it.
+    frag: str | None = None
+    #: Converter called as convert(value) or convert(value, font_size).
+    convert: Callable | None = None
+    #: Pass the current font size to the converter, for em and % lengths.
+    relative_to_font_size: bool = False
+    #: Only read inside CSS2Frag's `if isBlock:` sections.
+    block_only: bool = False
+    #: CSS2Frag writes this frag attribute itself rather than through a
+    #: uniform group, so the registry only puts it back to `initial`. The
+    #: value it writes is not a length but the declaration as it was
+    #: written, which each consumer resolves against its own basis.
+    applied_by_hand: bool = False
+    note: str = ""
+    #: The frag attribute's value before the element's own declarations
+    #: apply; see KEEP.
+    initial: Any = KEEP
+
+
+CSS_PROPERTIES: tuple[CSSProperty, ...] = (
+    # ~ text ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    CSSProperty("color", "text", note="textColor, via getColor with a default"),
+    CSSProperty("font-family", "text", note="resolved through pisaContext.getFontName"),
+    CSSProperty(
+        "font-size", "text", note="relative to the parent size, floored at 1pt"
+    ),
+    CSSProperty("font-weight", "text", note="binary: bold from bold/bolder/500-900"),
+    CSSProperty("font-style", "text", note="binary: italic from italic/oblique"),
+    CSSProperty("text-decoration", "text", note="lights underline and strike"),
+    CSSProperty("line-height", "text", note="also recomputed when absent"),
+    CSSProperty("letter-spacing", "text", note="kept raw, resolved at draw time"),
+    CSSProperty("word-spacing", "text", note="kept raw, resolved at draw time"),
+    CSSProperty("text-transform", "text", note="uppercase/lowercase/capitalize"),
+    CSSProperty("text-align", "text", note="alignment, via getAlign"),
+    CSSProperty("vertical-align", "text", note="table cells and inline images"),
+    CSSProperty("white-space", "text", note="pre, pre-wrap, pre-line, nowrap"),
+    CSSProperty(
+        "text-overflow",
+        "text",
+        frag="textOverflow",
+        convert=getTextOverflow,
+        block_only=True,
+        initial="clip",
+        note="how a line wider than its block ends, with overflow not visible",
+    ),
+    CSSProperty(
+        "overflow-wrap",
+        "text",
+        consumer=LOOP,
+        note="break-word/anywhere split a word wider than its line",
+    ),
+    CSSProperty("word-wrap", "text", consumer=LOOP, note="overflow-wrap's old name"),
+    CSSProperty(
+        "word-break",
+        "text",
+        consumer=LOOP,
+        note="break-all breaks anywhere, as -pdf-word-wrap: CJK",
+    ),
+    CSSProperty(
+        "text-indent",
+        "text",
+        frag="firstLineIndent",
+        convert=getSize,
+        relative_to_font_size=True,
+        block_only=True,
+    ),
+    # ~ background ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    CSSProperty("background-color", "background", note="backColor"),
+    CSSProperty("background-image", "background", note="resolved to a file object"),
+    CSSProperty("background-repeat", "background"),
+    CSSProperty("background-position", "background"),
+    # ~ box ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    CSSProperty("display", "box", consumer=LOOP, note="block or none; decides isBlock"),
+    CSSProperty("margin-left", "box", note="accumulates into the running indent"),
+    CSSProperty("margin-right", "box", note="accumulates into the running indent"),
+    CSSProperty(
+        "margin-top",
+        "box",
+        frag="spaceBefore",
+        convert=getSize,
+        relative_to_font_size=True,
+        block_only=True,
+        initial=0,
+    ),
+    CSSProperty(
+        "margin-bottom",
+        "box",
+        frag="spaceAfter",
+        convert=getSize,
+        relative_to_font_size=True,
+        block_only=True,
+        initial=0,
+    ),
+    # CSS does not inherit width or height, so they go back to "not declared"
+    # before each element's own declarations apply. Without the reset a width
+    # on a block reached everything inside it: every flex item in a container
+    # took the container's own width and height as its own.
+    CSSProperty(
+        "width",
+        "box",
+        frag="width",
+        initial=None,
+        applied_by_hand=True,
+        note="images, table cells, flex items and barcodes",
+    ),
+    CSSProperty(
+        "height",
+        "box",
+        frag="height",
+        initial=None,
+        applied_by_hand=True,
+        note="images, table cells, flex items, barcodes, positioned boxes and"
+        " blocks, where it is the least the content takes",
+    ),
+    CSSProperty("zoom", "box", note="not CSS; scales images"),
+    CSSProperty(
+        "overflow",
+        "box",
+        frag="overflow",
+        convert=getOverflow,
+        block_only=True,
+        initial="visible",
+        note="hidden, clip, scroll and auto cut the lines wider than the block",
+    ),
+)
+
+#: padding-* and the twelve border-* properties, which differ only by side.
+CSS_PROPERTIES += tuple(
+    CSSProperty(
+        f"padding-{side.lower()}",
+        "box",
+        frag=f"padding{side}",
+        convert=getSize,
+        relative_to_font_size=True,
+        block_only=True,
+    )
+    for side in ("Left", "Right", "Top", "Bottom")
+)
+
+CSS_PROPERTIES += tuple(
+    prop
+    for side in ("Top", "Bottom", "Left", "Right")
+    for prop in (
+        CSSProperty(
+            f"border-{side.lower()}-color",
+            "box",
+            frag=f"border{side}Color",
+            convert=getColor,
+            block_only=True,
+        ),
+        CSSProperty(
+            f"border-{side.lower()}-style",
+            "box",
+            frag=f"border{side}Style",
+            convert=as_declared,
+            block_only=True,
+        ),
+        CSSProperty(
+            f"border-{side.lower()}-width",
+            "box",
+            frag=f"border{side}Width",
+            convert=getSize,
+            relative_to_font_size=True,
+            block_only=True,
+        ),
+    )
+)
+
+#: border-*-radius, one per corner. The shorthand is expanded by
+#: w3c/cssSpecial.py. Unlike the other border properties these reset per
+#: element, as CSS says: a radius that reached a card's children would draw
+#: every one of them rounded.
+CSS_PROPERTIES += tuple(
+    CSSProperty(
+        f"border-{vertical}-{horizontal}-radius",
+        "box",
+        frag=f"border{vertical.title()}{horizontal.title()}Radius",
+        convert=getBorderRadius,
+        relative_to_font_size=True,
+        block_only=True,
+        initial=NO_RADIUS,
+    )
+    for vertical, horizontal in (
+        ("top", "left"),
+        ("top", "right"),
+        ("bottom", "right"),
+        ("bottom", "left"),
+    )
+)
+
+CSS_PROPERTIES += (
+    # ~ lists ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    CSSProperty("list-style-type", "list", note="marker glyph or counter style"),
+    CSSProperty("list-style-image", "list", note="resolved to a file object"),
+    # ~ pagination ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    CSSProperty("page-break-before", "page", consumer=LOOP, note="emits a flowable"),
+    CSSProperty("page-break-after", "page", consumer=LOOP, note="emits a flowable"),
+    CSSProperty("page-break-inside", "page", consumer=LOOP, note="avoid only"),
+    CSSProperty("break-before", "page", consumer=LOOP, note="page-break-before"),
+    CSSProperty("break-after", "page", consumer=LOOP, note="page-break-after"),
+    CSSProperty("break-inside", "page", consumer=LOOP, note="page-break-inside"),
+    # ~ positioning ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Read by hand in pisaLoop; see xhtml2pdf/builders/position.py. The
+    # top/left/... of an @page or @frame rule never come through here:
+    # those rules are read by getFrameDimensions.
+    CSSProperty(
+        "position", "position", consumer=LOOP, note="relative, absolute, fixed"
+    ),
+    CSSProperty("top", "position", consumer=LOOP),
+    CSSProperty("right", "position", consumer=LOOP),
+    CSSProperty("bottom", "position", consumer=LOOP),
+    CSSProperty("left", "position", consumer=LOOP),
+    CSSProperty(
+        "z-index", "position", consumer=LOOP, note="orders absolute and fixed boxes"
+    ),
+    # ~ proprietary ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    CSSProperty("-pdf-page-break", "pdf", consumer=LOOP, note="before only"),
+    CSSProperty("-pdf-frame-break", "pdf", consumer=LOOP),
+    CSSProperty(
+        "-pdf-frame-align", "pdf", consumer=LOOP, note="bottom: at the frame's foot"
+    ),
+    CSSProperty("-pdf-next-page", "pdf", consumer=LOOP, note="names a page template"),
+    CSSProperty(
+        "-pdf-keep-with-next",
+        "pdf",
+        consumer=LOOP,
+        frag="keepWithNext",
+        convert=getBool,
+    ),
+    CSSProperty("-pdf-outline", "pdf", consumer=LOOP, frag="outline", convert=getBool),
+    CSSProperty(
+        "-pdf-outline-open", "pdf", consumer=LOOP, frag="outlineOpen", convert=getBool
+    ),
+    CSSProperty("-pdf-outline-level", "pdf", consumer=LOOP, note="an int, unguarded"),
+    CSSProperty("-pdf-line-spacing", "pdf", note="leadingSpace, added to the leading"),
+    CSSProperty(
+        "-pdf-toc-leader",
+        "pdf",
+        frag="tocLeader",
+        convert=getTocLeader,
+        block_only=True,
+        note=(
+            "FRAG on purpose: addTOC calls CSS2Frag for the .pdftoclevelN"
+            " styles, which is the only way author CSS reaches a table of"
+            " contents. block_only because that is the only FRAG set anything"
+            " applies, and addTOC passes isBlock=True"
+        ),
+    ),
+    CSSProperty(
+        "-pdf-toc-name",
+        "pdf",
+        consumer=LOOP,
+        frag="tocName",
+        convert=getTocName,
+        note=(
+            "which table of contents the entry belongs to; LOOP, unlike its"
+            " -pdf-toc-leader neighbour, because leader is read off the"
+            " .pdftoclevelN styles addTOC builds and this one off the entry,"
+            " and CSS2Frag must not be able to hand an index a name out of"
+            " its own level styles"
+        ),
+    ),
+    CSSProperty(
+        "-pdf-keep-in-frame-mode",
+        "pdf",
+        consumer=LOOP,
+        note="also read in tables.py, and from an @frame rule in context.py",
+    ),
+    CSSProperty("-pdf-keep-in-frame-max-width", "pdf", consumer=LOOP),
+    CSSProperty("-pdf-keep-in-frame-max-height", "pdf", consumer=LOOP),
+    CSSProperty("-pdf-word-wrap", "pdf", consumer=LOOP, note="CJK"),
+    # ~ generated content ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    CSSProperty(
+        "content",
+        "generated",
+        consumer=LOOP,
+        note="read off ::before and ::after only; see w3c/generated_content.py",
+    ),
+    CSSProperty("counter-reset", "generated", consumer=LOOP),
+    CSSProperty("counter-increment", "generated", consumer=LOOP),
+)
+
+#: Flexbox, CSS Flexible Box Layout Module Level 1. All LOOP: the container
+#: is built in pisaLoop, and addTOC's direct calls to CSS2Frag must not be
+#: able to hand a table of contents a flex property out of its level styles.
+#: None is block_only, so pisaLoop's LOOP_GROUPS pass applies them to every
+#: element; which elements they mean anything on is the container's business.
+CSS_PROPERTIES += (
+    # ~ flex container ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    CSSProperty(
+        "flex-direction",
+        "flex",
+        consumer=LOOP,
+        frag="flexDirection",
+        convert=getFlexDirection,
+        initial="row",
+    ),
+    CSSProperty(
+        "flex-wrap",
+        "flex",
+        consumer=LOOP,
+        frag="flexWrap",
+        convert=getFlexWrap,
+        initial="nowrap",
+    ),
+    CSSProperty(
+        "justify-content",
+        "flex",
+        consumer=LOOP,
+        frag="justifyContent",
+        convert=getFlexJustify,
+        initial="flex-start",
+    ),
+    CSSProperty(
+        "align-items",
+        "flex",
+        consumer=LOOP,
+        frag="alignItems",
+        convert=getFlexAlign,
+        initial="stretch",
+    ),
+    CSSProperty(
+        "align-content",
+        "flex",
+        consumer=LOOP,
+        frag="alignContent",
+        convert=getFlexAlign,
+        initial="stretch",
+        note="acts only when the container's cross size is definite",
+    ),
+    CSSProperty(
+        "row-gap",
+        "flex",
+        consumer=LOOP,
+        frag="rowGap",
+        convert=getLengthOrAuto,
+        relative_to_font_size=True,
+        initial=AUTO,
+        note="auto means normal, which is no gap",
+    ),
+    CSSProperty(
+        "column-gap",
+        "flex",
+        consumer=LOOP,
+        frag="columnGap",
+        convert=getLengthOrAuto,
+        relative_to_font_size=True,
+        initial=AUTO,
+    ),
+    # ~ flex item ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    CSSProperty(
+        "flex-grow",
+        "flex",
+        consumer=LOOP,
+        frag="flexGrow",
+        convert=getNumber,
+        initial=0.0,
+    ),
+    CSSProperty(
+        "flex-shrink",
+        "flex",
+        consumer=LOOP,
+        frag="flexShrink",
+        convert=getNumber,
+        initial=1.0,
+    ),
+    CSSProperty(
+        "flex-basis",
+        "flex",
+        consumer=LOOP,
+        frag="flexBasis",
+        convert=getFlexBasis,
+        relative_to_font_size=True,
+        initial=AUTO,
+    ),
+    CSSProperty(
+        "align-self",
+        "flex",
+        consumer=LOOP,
+        frag="alignSelf",
+        convert=getFlexAlign,
+        initial="auto",
+    ),
+    CSSProperty(
+        "order", "flex", consumer=LOOP, frag="flexOrder", convert=getInt, initial=0
+    ),
+    # ~ sizing ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    CSSProperty(
+        "min-width",
+        "box",
+        consumer=LOOP,
+        frag="minWidth",
+        convert=getLengthOrAuto,
+        relative_to_font_size=True,
+        initial=AUTO,
+        note="flex items only",
+    ),
+    CSSProperty(
+        "max-width",
+        "box",
+        consumer=LOOP,
+        frag="maxWidth",
+        convert=getLengthOrAuto,
+        relative_to_font_size=True,
+        initial=NONE_LENGTH,
+        note="flex items only",
+    ),
+    CSSProperty(
+        "min-height",
+        "box",
+        consumer=LOOP,
+        frag="minHeight",
+        convert=getLengthOrAuto,
+        relative_to_font_size=True,
+        initial=AUTO,
+        note="flex items only",
+    ),
+    CSSProperty(
+        "max-height",
+        "box",
+        consumer=LOOP,
+        frag="maxHeight",
+        convert=getLengthOrAuto,
+        relative_to_font_size=True,
+        initial=NONE_LENGTH,
+        note="flex items only",
+    ),
+)
+
+
+#: What CSSCollect asks the cascade for, in registry order.
+PROPERTY_NAMES: tuple[str, ...] = tuple(prop.name for prop in CSS_PROPERTIES)
+
+#: Membership test for the same. A shorthand is expanded before it gets this
+#: far, so only the names it expands into appear.
+SUPPORTED_PROPERTIES: frozenset[str] = frozenset(PROPERTY_NAMES)
+
+PROPERTIES_BY_NAME: dict[str, CSSProperty] = {
+    prop.name: prop for prop in CSS_PROPERTIES
+}
+
+#: Frag attribute -> initial value, for every property that declares one.
+NON_INHERITED_FRAG_INITIALS: dict[str, Any] = {
+    prop.frag: prop.initial
+    for prop in CSS_PROPERTIES
+    if prop.frag is not None and prop.initial is not KEEP
+}
+
+
+def reset_non_inherited(frag) -> None:
+    """
+    Put the non-inherited frag attributes back to their initial values.
+
+    pisaLoop calls this on the fresh clone pushFrag made, before the
+    element's own declarations apply, so a value set on the parent does not
+    reach the child unless the child declares it too. getParaFrag calls it
+    on the root frag so the attributes exist from the start.
+
+    A frag whose class already holds the initial value (see
+    context._with_defaults) drops its own copy instead of writing another.
+    """
+    own = frag.__dict__
+    defaults = type(frag)
+    for name, value in NON_INHERITED_FRAG_INITIALS.items():
+        if getattr(defaults, name, _NO_DEFAULT) is value:
+            own.pop(name, None)
+        else:
+            setattr(frag, name, value)
+
+
+_NO_DEFAULT = object()
+
+
+#: Values that cannot change once made, so a frag can share its class's copy
+#: of an equal one instead of keeping its own.
+_IMMUTABLE = (str, int, float, bool, type(None))
+
+
+def compact_frag(frag) -> None:
+    """
+    Drop what `frag` holds that its class already holds, the same value.
+
+    CSS2Frag and the tags write a value for much of what they read even when
+    it comes out as the default, so an element's frag would carry a few dozen
+    copies of the class's own values into every clone made from it. Only
+    immutable values go: a list equal today could be appended to tomorrow.
+    """
+    defaults = type(frag)
+    own = frag.__dict__
+    for name, value in list(own.items()):
+        if type(value) in _IMMUTABLE:
+            default = getattr(defaults, name, _NO_DEFAULT)
+            # repr tells 0.0 from -0.0, which compare equal and print apart.
+            if type(default) is type(value) and repr(default) == repr(value):
+                del own[name]
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ The uniform mappings, grouped for transform_attrs
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class UniformGroup(NamedTuple):
+    """One transform_attrs call: a converter and the pairs it applies."""
+
+    convert: Callable
+    relative_to_font_size: bool
+    pairs: tuple[tuple[str, str], ...]
+
+
+def _build_groups(consumer: str, *, block_only: bool) -> tuple[UniformGroup, ...]:
+    """
+    Collect the registry-driven properties into one group per converter.
+
+    transform_attrs applies each pair independently, so properties that share a
+    converter can share a call whatever order they are in. That folds what used
+    to be three separate calls for margins, paddings and border widths -- all
+    getSize against the font size -- into one.
+    """
+    grouped: dict[tuple[Callable, bool], list[tuple[str, str]]] = {}
+    for prop in CSS_PROPERTIES:
+        if prop.frag is None or prop.convert is None or prop.consumer != consumer:
+            continue
+        if prop.block_only != block_only:
+            continue
+        key = (prop.convert, prop.relative_to_font_size)
+        grouped.setdefault(key, []).append((prop.frag, prop.name))
+
+    return tuple(
+        UniformGroup(convert, relative, tuple(pairs))
+        for (convert, relative), pairs in grouped.items()
+    )
+
+
+#: Applied by CSS2Frag inside its `if isBlock:` section.
+FRAG_BLOCK_GROUPS: tuple[UniformGroup, ...] = _build_groups(FRAG, block_only=True)
+
+#: Applied by pisaLoop, for every element rather than blocks alone.
+LOOP_GROUPS: tuple[UniformGroup, ...] = _build_groups(LOOP, block_only=False)
+
+
+def apply_uniform_groups(frag, css_attrs, groups: tuple[UniformGroup, ...]) -> None:
+    """Apply every registry-driven mapping in `groups` to `frag`."""
+    for group in groups:
+        transform_attrs(
+            frag,
+            group.pairs,
+            css_attrs,
+            group.convert,
+            extras=frag.fontSize if group.relative_to_font_size else None,
+        )
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~ The properties collected for one element
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#: Names already reported, so one unregistered property does not fill the log
+#: with a line per element.
+_unregistered_seen: set[str] = set()
+
+
+class CSSAttrs(dict):
+    """
+    The CSS properties collected for one element, by CSSCollect.
+
+    Asking about a name that is not in the registry is a bug in the caller
+    rather than a missing declaration: CSSCollect only ever fills in
+    registered names, so the answer is always "absent" and the code that asked
+    quietly does nothing. That is precisely how -pdf-keep-in-frame-max-width
+    stayed unreachable -- the branch was written, the `in` test said False, and
+    nothing anywhere said why.
+
+    Guarding against that is tests/test_parser.py, which reads the names this
+    package asks for out of its own source and checks each against the
+    registry. Not this class: it is looked up several times per property per
+    element, so it stays a bare dict -- no Python-level method in front of a
+    lookup, and not UserDict either. _CheckedCSSAttrs is the same guard at
+    runtime, for a name only a computed lookup could produce.
+    """
+
+
+class _CheckedCSSAttrs(CSSAttrs):
+    """
+    CSSAttrs that says out loud when it is asked for an unregistered name.
+
+    Set XHTML2PDF_CHECK_CSS_PROPERTIES to render with this in place. The
+    static check in the test suite covers every name written as a literal, so
+    this is only needed to catch a name built at runtime.
+    """
+
+    @staticmethod
+    def _check(key) -> None:
+        if key in SUPPORTED_PROPERTIES or key in _unregistered_seen:
+            return
+        _unregistered_seen.add(key)
+        log.warning(
+            "CSS property %r is read but not registered in xhtml2pdf.properties, "
+            "so CSSCollect never collects it and the code reading it can never "
+            "fire",
+            key,
+        )
+
+    def __contains__(self, key) -> bool:
+        self._check(key)
+        return super().__contains__(key)
+
+    def __getitem__(self, key):
+        self._check(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self._check(key)
+        return super().get(key, default)
+
+
+if os.environ.get("XHTML2PDF_CHECK_CSS_PROPERTIES"):
+    CSSAttrs = _CheckedCSSAttrs  # type: ignore[misc]

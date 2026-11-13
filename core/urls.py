@@ -36,6 +36,7 @@ urlpatterns = [
     path('api/ot/', include('ot_engine.urls')),
     path('api/org-engine/', include('org_engine.urls')),
     path('api/', include('announcements.urls')),
+    path('api/v1/superadmin/telemetry/', include('core.telemetry_urls')),
     
     # OpenAPI Schema & Swagger Docs
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),

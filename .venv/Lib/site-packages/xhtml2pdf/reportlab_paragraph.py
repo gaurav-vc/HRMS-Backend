@@ -1,0 +1,2925 @@
+# Copyright ReportLab Europe Ltd. 2000-2008
+# see license.txt for license details
+# history http://www.reportlab.co.uk/cgi-bin/viewcvs.cgi/public/reportlab/trunk/reportlab/platypus/paragraph.py
+# Modifications by Dirk Holtwick, 2008
+from __future__ import annotations
+
+import re
+import sys
+from copy import deepcopy
+from operator import truth
+from string import whitespace
+from typing import TYPE_CHECKING
+from urllib.parse import unquote
+
+from reportlab.graphics import renderPDF
+from reportlab.lib.abag import ABag
+from reportlab.lib.colors import Color
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
+from reportlab.lib.textsplit import ALL_CANNOT_START
+from reportlab.pdfbase.pdfmetrics import getAscentDescent
+from reportlab.platypus.flowables import Flowable
+from reportlab.platypus.paraparser import ParaParser
+from reportlab.rl_settings import _FUZZ
+
+from xhtml2pdf.bidi import (
+    CONTROL_CHARS,
+    display_order,
+    get_display,
+    mirrored,
+    needs_bidi,
+)
+from xhtml2pdf.util import (
+    drawBoxBackground,
+    drawBoxBorders,
+    font_has_glyph,
+    getSize,
+    roundedClip,
+    stringWidth,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+PARAGRAPH_DEBUG = False
+LEADING_FACTOR = 1.0
+
+_wsc_re_split = re.compile(
+    "[%s]+"
+    % re.escape(
+        "\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f"
+        " \x85\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u200b\u2028\u2029\u202f\u205f\u3000"
+    )
+).split
+
+
+def split(text, delim=None):
+    if isinstance(text, bytes):
+        text = text.decode("utf8")
+    if isinstance(delim, bytes):
+        delim = delim.decode("utf8")
+    elif delim is None and "\xa0" in text:
+        return [uword.encode("utf8") for uword in _wsc_re_split(text)]
+    return [uword.encode("utf8") for uword in text.split(delim)]
+
+
+def _text_key(text):
+    """
+    A fragment's text as the line cache compares it.
+
+    A page number or count is an object whose value each layout pass sets
+    anew; its string is what the lines were broken with.
+    """
+    if text is None or isinstance(text, str | bytes):
+        return text
+    return str(text)
+
+
+def strip(text):
+    if isinstance(text, bytes):
+        text = text.decode("utf8")
+    return text.strip().encode("utf8")
+
+
+class ParaLines(ABag):
+    """
+    class ParaLines contains the broken into lines representation of Paragraphs
+    kind=0  Simple
+    fontName, fontSize, textColor apply to whole Paragraph
+    lines   [(extraSpace1,words1),....,(extraspaceN,wordsN)].
+
+    kind==1 Complex
+    lines   [FragLine1,...,FragLineN]
+    """
+
+
+class FragLine(ABag):
+    """
+    class FragLine contains a styled line (ie a line with more than one style)::
+
+    extraSpace  unused space for justification only
+    wordCount   1+spaces in line for justification purposes
+    words       [ParaFrags] style text lumps to be concatenated together
+    fontSize    maximum fontSize seen on the line; not used at present,
+                but could be used for line spacing.
+    """
+
+
+# our one and only parser
+# XXXXX if the parser has any internal state using only one is probably a BAD idea!
+_parser = ParaParser()
+
+
+def _lineClean(L):
+    return b" ".join(filter(truth, split(strip(L))))
+
+
+def cleanBlockQuotedText(text, joiner=b" "):
+    """
+    This is an internal utility which takes triple-
+    quoted text form within the document and returns
+    (hopefully) the paragraph the user intended originally.
+    """
+    L = filter(truth, map(_lineClean, split(text, "\n")))
+    return joiner.join(L)
+
+
+def setXPos(tx, dx):
+    if dx > 1e-6 or dx < -1e-6:
+        tx.setXPos(dx)
+
+
+def _leftDrawParaLine(tx, offset, _extraspace, words, _last=0):
+    setXPos(tx, offset)
+    tx._textOut(b" ".join(words), 1)
+    setXPos(tx, -offset)
+    return offset
+
+
+def _centerDrawParaLine(tx, offset, extraspace, words, _last=0):
+    m = offset + 0.5 * extraspace
+    setXPos(tx, m)
+    tx._textOut(b" ".join(words), 1)
+    setXPos(tx, -m)
+    return m
+
+
+def _rightDrawParaLine(tx, offset, extraspace, words, _last=0):
+    m = offset + extraspace
+    setXPos(tx, m)
+    tx._textOut(b" ".join(words), 1)
+    setXPos(tx, -m)
+    return m
+
+
+def _justifyDrawParaLine(tx, offset, extraspace, words, last=0):
+    setXPos(tx, offset)
+    text = b" ".join(words)
+    if last:
+        # last one, left align
+        tx._textOut(text, 1)
+    else:
+        nSpaces = len(words) - 1
+        if nSpaces:
+            tx.setWordSpace(extraspace / float(nSpaces))
+            tx._textOut(text, 1)
+            tx.setWordSpace(0)
+        else:
+            tx._textOut(text, 1)
+    setXPos(tx, -offset)
+    return offset
+
+
+def imgVRange(h, va, fontSize, line_ascent=None, line_descent=None):
+    """
+    Return bottom,top offsets relative to baseline(0).
+
+    CSS 2.1 10.8.1 separates the two pairs of keywords: `text-top` and
+    `text-bottom` align with the edges of the parent's content area -- its
+    font's ascent and descent -- while `top` and `bottom` align with the
+    edges of the whole line box, which is taller as soon as anything on the
+    line is. The line box is only known once the line has been assembled, so
+    `line_ascent`/`line_descent` are passed in when it is: while measuring
+    they are absent and `top`/`bottom` reserve the same room `text-top` and
+    `text-bottom` do, which is the height of the box either way.
+    """
+    if va == "baseline":
+        iyo = 0
+    elif va == "top" and line_ascent is not None:
+        iyo = line_ascent - h
+    elif va == "bottom" and line_descent is not None:
+        iyo = line_descent
+    elif va in {"text-top", "top"}:
+        iyo = fontSize - h
+    elif va == "middle":
+        iyo = fontSize - (1.2 * fontSize + h) * 0.5
+    elif va in {"text-bottom", "bottom"}:
+        iyo = fontSize - 1.2 * fontSize
+    elif va == "super":
+        iyo = 0.5 * fontSize
+    elif va == "sub":
+        iyo = -0.5 * fontSize
+    elif hasattr(va, "normalizedValue"):
+        iyo = va.normalizedValue(fontSize)
+    else:
+        iyo = va
+    return iyo, iyo + h
+
+
+_56 = 5.0 / 6
+_16 = 1.0 / 6
+
+
+def _maxLeadingExtent(line, leading):
+    """
+    The ascent and descent a line is given with autoLeading "max": the
+    leading split 5/6 above the baseline and 1/6 below, each part widened to
+    the font's own where that is taller.
+
+    One function for drawing (_putFragLine) and for measuring (wrap, split).
+    They used to measure max(ascent - descent, leading) instead, which is
+    less whenever the font's ascent wins above and its descent below -- a
+    TTF taller than 1.2em with a line-height over 1.2 -- so a paragraph was
+    drawn taller than it said it was, and the next block ran over its last
+    lines, by about a point per line.
+    """
+    return max(_56 * leading, line.ascent), max(_16 * leading, -line.descent)
+
+
+def _flush_text_object(tx, x0, cur_y):
+    """
+    Write what the text object holds so far to the canvas, and start it again.
+
+    PDFTextObject buffers its operators until canvas.drawText, so anything
+    drawn on the canvas mid-line would land in the stream *before* the
+    line's text. Closing the block here (BT ... ET) and opening a new one
+    keeps the stream in reading order. Only the text matrix has to be set
+    again: font, spacing, rise and colour are part of the graphics state and
+    survive an ET.
+    """
+    if not any(" Tj" in op or " TJ" in op for op in tx._code):
+        # Nothing shown yet: the text object can go on as it is, and what it
+        # shows later lands after the canvas drawing anyway.
+        return
+    tx._code.append("ET")
+    tx._canvas._code.append(" ".join(tx._code))
+    tx._code = ["BT"]
+    tx.setTextOrigin(x0, cur_y)
+    # The decorations _do_post_text paints between two blocks set the fill
+    # colour without restoring it; the next run of text must say its own.
+    tx.XtraState.textColor = None
+
+
+def _putFragLine(cur_x, tx, line):
+    xs = tx.XtraState
+    cur_y = xs.cur_y
+    x0 = tx._x0
+    autoLeading = xs.autoLeading
+    leading = xs.leading
+    cur_x += xs.leftIndent
+    line_x = cur_x
+    dal = autoLeading in {"min", "max"}
+    if dal:
+        if autoLeading == "max":
+            ascent, descent = _maxLeadingExtent(line, leading)
+        else:
+            ascent = line.ascent
+            descent = -line.descent
+        leading = ascent + descent
+    if tx._leading != leading:
+        tx.setLeading(leading)
+    if dal:
+        olb = tx._olb
+        if olb is not None:
+            xcy = olb - ascent
+            if tx._oleading != leading:
+                cur_y += leading - tx._oleading
+            if abs(xcy - cur_y) > 1e-8:
+                cur_y = xcy
+                tx.setTextOrigin(x0, cur_y)
+                xs.cur_y = cur_y
+        tx._olb = cur_y - descent
+        tx._oleading = leading
+
+    # Letter and word spacing. Both are resolved against the font size, so
+    # that an em or a percentage means something; without a base getSize logs
+    # "not a float" and returns 0.
+    if xs.style.letterSpacing != "normal":
+        tx.setCharSpace(getSize("".join(xs.style.letterSpacing), xs.style.fontSize))
+
+    # Word spacing is on the same footing as letter spacing: the width
+    # ReportLab measured the line with does not know about it, so a very wide
+    # value can overrun, which is the approximation letter spacing already
+    # makes here.
+    if getattr(xs.style, "wordSpacing", "normal") != "normal":
+        tx.setWordSpace(getSize("".join(xs.style.wordSpacing), xs.style.fontSize))
+
+    ws = getattr(tx, "_wordSpace", 0)
+    nSpaces = 0
+    words = line.words
+
+    # Where this line begins in the page's stream. Its decorations are
+    # painted once the line is done, and go in here, under its text.
+    xs.lineCodeStart = len(tx._canvas._code)
+
+    # An inline box left open by the previous line carries on from the start
+    # of this one, without a left edge: CSS box-decoration-break: slice.
+    xs.lineAscent = getattr(line, "ascent", xs.style.fontSize)
+    xs.lineDescent = getattr(line, "descent", -0.2 * xs.style.fontSize)
+    for box in xs.inlineBoxes:
+        box.x = cur_x
+        box.first = False
+
+    for f in words:
+        if hasattr(f, "cbDefn"):
+            cbDefn = f.cbDefn
+            kind = cbDefn.kind
+            if kind == "img":
+                # draw image cbDefn,cur_y,cur_x
+                w = cbDefn.width
+                h = cbDefn.height
+                txfs = tx._fontsize
+                if txfs is None:
+                    txfs = xs.style.fontSize
+                iy0, iy1 = imgVRange(
+                    h, cbDefn.valign, txfs, xs.lineAscent, xs.lineDescent
+                )
+                cur_x_s = cur_x + nSpaces * ws
+                drawing = cbDefn.image.getDrawing(w, h)
+                with roundedClip(tx._canvas, cbDefn.image, cur_x_s, cur_y + iy0, w, h):
+                    if drawing:
+                        renderPDF.draw(drawing, tx._canvas, cur_x_s, cur_y + iy0)
+                    else:
+                        tx._canvas.drawImage(
+                            cbDefn.image.getImage(),
+                            cur_x_s,
+                            cur_y + iy0,
+                            w,
+                            h,
+                            mask="auto",
+                        )
+                # An image inside <a href>. The links of a line are gathered
+                # from its text, and an image has none, so a linked image
+                # made no link at all; its own rectangle is the link.
+                if f.link:
+                    _doLink(
+                        tx, f.link, (cur_x_s, cur_y + iy0, cur_x_s + w, cur_y + iy0 + h)
+                    )
+                cur_x += w
+                cur_x_s += w
+                setXPos(tx, cur_x_s - tx._x0)
+            elif kind == "barcode":
+                barcode = cbDefn.barcode
+                w = cbDefn.width
+                h = cbDefn.height
+                txfs = tx._fontsize
+                if txfs is None:
+                    txfs = xs.style.fontSize
+                iy0, iy1 = imgVRange(
+                    h, cbDefn.valign, txfs, xs.lineAscent, xs.lineDescent
+                )
+                cur_x_s = cur_x + nSpaces * ws
+                barcode.draw(canvas=tx._canvas, xoffset=cur_x_s)
+                cur_x += w
+                cur_x_s += w
+                setXPos(tx, cur_x_s - tx._x0)
+            elif kind == "box":
+                # An inline-block: a flowable that is one word of the line.
+                # The text so far goes to the canvas first, then the box,
+                # then the line carries on in a fresh text object, so the
+                # box's own text sits between its neighbours in the stream.
+                w = cbDefn.width
+                h = cbDefn.height
+                txfs = tx._fontsize
+                if txfs is None:
+                    txfs = xs.style.fontSize
+                iy0, iy1 = imgVRange(
+                    h, cbDefn.valign, txfs, xs.lineAscent, xs.lineDescent
+                )
+                cur_x_s = cur_x + nSpaces * ws
+                _flush_text_object(tx, x0, cur_y)
+                cbDefn.flowable.drawOn(tx._canvas, cur_x_s, cur_y + iy0)
+                cur_x += w
+                cur_x_s += w
+                setXPos(tx, cur_x_s - tx._x0)
+            elif kind == "inlineBox":
+                # The edge of an inline element with a box of its own. The
+                # open edge notes where the box starts; the close edge turns
+                # it into a span for _do_post_text to paint. Both advance the
+                # line by the padding and border they carry.
+                cur_x_s = cur_x + nSpaces * ws
+                if cbDefn.edge == "open":
+                    # A box reopened after a page break has no left edge.
+                    xs.inlineBoxes.append(
+                        ABag(
+                            style=cbDefn.style,
+                            x=cur_x_s + cbDefn.inset,
+                            first=not getattr(cbDefn, "continued", False),
+                        )
+                    )
+                elif xs.inlineBoxes:
+                    box = xs.inlineBoxes.pop()
+                    x2 = cur_x_s + cbDefn.advance - cbDefn.inset
+                    # A close edge that only ends the box on this line, as a
+                    # right-to-left line ends a box it carries on to the
+                    # next one, draws no edge.
+                    last = not getattr(cbDefn, "continued", False)
+                    xs.inlineBoxSpans.append((box.x, x2, box.style, box.first, last))
+                cur_x += cbDefn.advance
+                cur_x_s += cbDefn.advance
+                setXPos(tx, cur_x_s - tx._x0)
+            else:
+                name = cbDefn.name
+                if kind == "anchor":
+                    tx._canvas.bookmarkHorizontal(name, cur_x, cur_y + leading)
+                else:
+                    # setNamedCB is how ReportLab has registered these since
+                    # long before this copy was taken; the plain attribute is
+                    # the older form and is kept as a fallback.
+                    func = tx._canvas.getNamedCB(name) or getattr(
+                        tx._canvas, name, None
+                    )
+                    if not func:
+                        msg = f"Missing {kind} callback attribute '{name}'"
+                        raise AttributeError(msg)
+                    # Where the text has reached, which is what a callback
+                    # that fills the rest of the line needs -- the table of
+                    # contents draws its leader and page number from here.
+                    # line_x is where the line began, which is where the text
+                    # of a right-to-left line ends.
+                    tx._canvas._curr_tx_info = {
+                        "tx": tx,
+                        "cur_x": cur_x,
+                        "line_x": line_x,
+                        "cur_y": cur_y,
+                        "leading": leading,
+                        "xs": tx.XtraState,
+                    }
+                    try:
+                        func(tx._canvas, kind, cbDefn.label)
+                    finally:
+                        del tx._canvas._curr_tx_info
+            if f is words[-1]:
+                if not tx._fontname:
+                    tx.setFont(xs.style.fontName, xs.style.fontSize)
+                    tx._textOut("", 1)
+                elif kind in {"img", "box"}:
+                    tx._textOut("", 1)
+        else:
+            cur_x_s = cur_x + nSpaces * ws
+            if (tx._fontname, tx._fontsize) != (f.fontName, f.fontSize):
+                tx._setFont(f.fontName, f.fontSize)
+            if xs.textColor != f.textColor:
+                xs.textColor = f.textColor
+                tx.setFillColor(f.textColor)
+            if xs.rise != f.rise:
+                xs.rise = f.rise
+                tx.setRise(f.rise)
+            text = f.text
+            tx._textOut(text, f is words[-1])  # cheap textOut
+
+            # XXX Modified for XHTML2PDF
+            # Background colors (done like underline)
+            if hasattr(f, "backColor") and (
+                xs.backgroundColor != f.backColor or xs.backgroundFontSize != f.fontSize
+            ):
+                if xs.backgroundColor is not None:
+                    xs.backgrounds.append(
+                        (
+                            xs.background_x,
+                            cur_x_s,
+                            xs.backgroundColor,
+                            xs.backgroundFontSize,
+                        )
+                    )
+                xs.background_x = cur_x_s
+                xs.backgroundColor = f.backColor
+                xs.backgroundFontSize = f.fontSize
+
+            # Underline
+            if not (hasattr(xs, "underline") and xs.underline) and (
+                hasattr(f, "underline") and f.underline
+            ):
+                xs.underline = 1
+                xs.underline_x = cur_x_s
+                xs.underlineColor = f.textColor
+            elif xs.underline:
+                if not f.underline:
+                    xs.underline = 0
+                    xs.underlines.append((xs.underline_x, cur_x_s, xs.underlineColor))
+                    xs.underlineColor = None
+                elif xs.textColor != xs.underlineColor:
+                    xs.underlines.append((xs.underline_x, cur_x_s, xs.underlineColor))
+                    xs.underlineColor = xs.textColor
+                    xs.underline_x = cur_x_s
+
+            # Strike
+            if not (hasattr(xs, "strike") and xs.strike) and (
+                hasattr(f, "strike") and f.strike
+            ):
+                xs.strike = 1
+                xs.strike_x = cur_x_s
+                xs.strikeColor = f.textColor
+                # XXX Modified for XHTML2PDF
+                xs.strikeFontSize = f.fontSize
+            elif xs.strike:
+                if not f.strike:
+                    xs.strike = 0
+                    # XXX Modified for XHTML2PDF
+                    xs.strikes.append(
+                        (xs.strike_x, cur_x_s, xs.strikeColor, xs.strikeFontSize)
+                    )
+                    xs.strikeColor = None
+                    xs.strikeFontSize = None
+                elif xs.textColor != xs.strikeColor:
+                    xs.strikes.append(
+                        (xs.strike_x, cur_x_s, xs.strikeColor, xs.strikeFontSize)
+                    )
+                    xs.strikeColor = xs.textColor
+                    xs.strikeFontSize = f.fontSize
+                    xs.strike_x = cur_x_s
+            if f.link and not xs.link:
+                if not xs.link:
+                    xs.link = f.link
+                    xs.link_x = cur_x_s
+                    xs.linkColor = xs.textColor
+            elif xs.link:
+                if not f.link:
+                    xs.links.append((xs.link_x, cur_x_s, xs.link, xs.linkColor))
+                    xs.link = None
+                    xs.linkColor = None
+                elif f.link != xs.link or xs.textColor != xs.linkColor:
+                    xs.links.append((xs.link_x, cur_x_s, xs.link, xs.linkColor))
+                    xs.link = f.link
+                    xs.link_x = cur_x_s
+                    xs.linkColor = xs.textColor
+            txtlen = tx._canvas.stringWidth(text, tx._fontname, tx._fontsize)
+            cur_x += txtlen
+            try:
+                nSpaces += text.count(" ")
+            except Exception:
+                nSpaces += text.decode("utf8").count(" ")
+    cur_x_s = cur_x + (nSpaces - 1) * ws
+
+    # XXX Modified for XHTML2PDF
+    # Underline
+    if xs.underline:
+        xs.underlines.append((xs.underline_x, cur_x_s, xs.underlineColor))
+
+    # XXX Modified for XHTML2PDF
+    # Backcolor
+    if words and hasattr(f, "backColor") and xs.backgroundColor is not None:
+        xs.backgrounds.append(
+            (xs.background_x, cur_x_s, xs.backgroundColor, xs.backgroundFontSize)
+        )
+
+    # XXX Modified for XHTML2PDF
+    # Strike
+    if xs.strike:
+        xs.strikes.append((xs.strike_x, cur_x_s, xs.strikeColor, xs.strikeFontSize))
+
+    if xs.link:
+        xs.links.append((xs.link_x, cur_x_s, xs.link, xs.linkColor))
+
+    # Boxes still open run to the end of the line, without a right edge.
+    for box in xs.inlineBoxes:
+        xs.inlineBoxSpans.append((box.x, cur_x_s, box.style, box.first, False))
+
+    if tx._x0 != x0:
+        setXPos(tx, x0 - tx._x0)
+
+
+def _leftDrawParaLineX(tx, offset, line, _last=0):
+    setXPos(tx, offset)
+    _putFragLine(offset, tx, line)
+    setXPos(tx, -offset)
+
+
+def _centerDrawParaLineX(tx, offset, line, _last=0):
+    m = offset + 0.5 * line.extraSpace
+    setXPos(tx, m)
+    _putFragLine(m, tx, line)
+    setXPos(tx, -m)
+
+
+def _rightDrawParaLineX(tx, offset, line, _last=0):
+    m = offset + line.extraSpace
+    setXPos(tx, m)
+    _putFragLine(m, tx, line)
+    setXPos(tx, -m)
+
+
+def _justifyDrawParaLineX(tx, offset, line, last=0):
+    setXPos(tx, offset)
+    extraSpace = line.extraSpace
+    nSpaces = line.wordCount - 1
+    if (
+        last
+        or not nSpaces
+        or abs(extraSpace) <= 1e-8
+        or (hasattr(line, "lineBreak") and line.lineBreak)
+    ):
+        _putFragLine(offset, tx, line)  # no space modification
+    else:
+        tx.setWordSpace(extraSpace / float(nSpaces))
+        _putFragLine(offset, tx, line)
+        tx.setWordSpace(0)
+    setXPos(tx, -offset)
+
+
+def _sameFrag(f, g):
+    """Returns 1 if two ParaFrags map out the same."""
+    if (
+        hasattr(f, "cbDefn")
+        or hasattr(g, "cbDefn")
+        or hasattr(f, "lineBreak")
+        or hasattr(g, "lineBreak")
+    ):
+        return 0
+    for a in _SAME_FRAG_ATTRIBUTES:
+        x = getattr(f, a, None)
+        y = getattr(g, a, None)
+        # Frags of one render mostly share their values, and a colour's == is
+        # a method call that builds two tuples.
+        if x is not y and x != y:
+            return 0
+    return 1
+
+
+_SAME_FRAG_ATTRIBUTES = (
+    "fontName",
+    "fontSize",
+    "textColor",
+    "backColor",
+    "rise",
+    "underline",
+    "strike",
+    "link",
+)
+
+
+def _breakable(f) -> bool:
+    """Whether a piece's text may be broken between any two characters."""
+    return getattr(f, "splitLongWords", False) and not hasattr(f, "cbDefn")
+
+
+def _chunkWord(pieces, maxWidth):
+    """
+    Split one word, given as its (frag, text) pieces, into words no wider than
+    maxWidth, in the fragword shape _getFragWords returns.
+
+    The word may only be broken between two characters of breakable pieces:
+    the text of an element without overflow-wrap that is glued to one with
+    it, a "." after a link or a "(" before it, stays with the character it
+    touches. A marker is kept, with the room it takes.
+    """
+    # Runs that cannot be broken, each a list of (frag, text, width).
+    runs: list[list] = []
+    previous = False
+    for f, text in pieces:
+        if isinstance(text, bytes):
+            text = text.decode("utf8")
+        if hasattr(f, "cbDefn"):
+            cb = f.cbDefn
+            atoms = [(f, text, getattr(cb, "advance", 0) + getattr(cb, "reserve", 0))]
+            breakable = False
+        elif _breakable(f):
+            atoms = [(f, ch, stringWidth(ch, f.fontName, f.fontSize)) for ch in text]
+            breakable = True
+        else:
+            atoms = [(f, text, stringWidth(text, f.fontName, f.fontSize))]
+            breakable = False
+        for atom in atoms:
+            if not runs or (breakable and previous):
+                runs.append([atom])
+            else:
+                runs[-1].append(atom)
+            previous = breakable
+
+    chunks = []
+    chunk: list = []
+    width = 0
+    for run in runs:
+        runWidth = sum(atom[2] for atom in run)
+        if chunk and width + runWidth > maxWidth:
+            chunks.append([width, *chunk])
+            chunk, width = [], 0
+        for f, text, _w in run:
+            if chunk and chunk[-1][0] is f and text and chunk[-1][1]:
+                chunk[-1] = (f, chunk[-1][1] + text)
+            else:
+                chunk.append((f, text))
+        width += runWidth
+    if chunk:
+        chunks.append([width, *chunk])
+    return chunks
+
+
+def _splitLongWords(fragWords, maxWidth):
+    """
+    Break each word wider than maxWidth whose text says it may be broken
+    (overflow-wrap: break-word), into pieces that fit.
+
+    A piece fills a line of its own, so the space a line break stands for
+    is never put between two of them, and the last one is followed by the
+    space the word was followed by. Only the text that may be broken is
+    broken; a word with a line break in it is left alone.
+    """
+    if maxWidth <= 0:
+        return fragWords
+    result = []
+    for word in fragWords:
+        pieces = word[1:]
+        if (
+            word[0] > maxWidth
+            and any(_breakable(f) for f, _text in pieces)
+            and not any(hasattr(f, "lineBreak") for f, _text in pieces)
+        ):
+            result.extend(_chunkWord(pieces, maxWidth))
+        else:
+            result.append(word)
+    return result
+
+
+def _reserved(words) -> float:
+    """
+    The room the markers on a line reserve, which counts as free space.
+
+    The line breaker counted it so that the line leaves it free, but nothing
+    is drawn there by the text: aligning the line as though it were text
+    would put the room on the wrong side of a line set flush right.
+    """
+    return sum(getattr(getattr(w, "cbDefn", None), "reserve", 0) for w in words)
+
+
+#: What text-overflow: ellipsis ends a cut line with, and what it falls back
+#: on in a face without that glyph.
+ELLIPSIS = "\u2026"
+
+
+def _overflowMark(mode: str, fontName: str) -> str:
+    """The text `mode` puts where it cuts a line, in `fontName`."""
+    if mode != "ellipsis":
+        return ""
+    return ELLIPSIS if font_has_glyph(fontName, ELLIPSIS) else "..."
+
+
+def _fitText(text: str, fontName: str, fontSize: float, room: float) -> str:
+    """The longest start of `text` no wider than `room`."""
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if stringWidth(text[:middle], fontName, fontSize) <= room:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low]
+
+
+def _cutText(text: str, fontName: str, fontSize: float, room: float, mode: str):
+    """`text` cut to `room`, mark included, and its width; ("", 0) if no room."""
+    mark = _overflowMark(mode, fontName)
+    markWidth = stringWidth(mark, fontName, fontSize)
+    if markWidth > room:
+        return "", 0.0
+    kept = _fitText(text, fontName, fontSize, room - markWidth).rstrip()
+    text = kept + mark
+    return text, stringWidth(text, fontName, fontSize)
+
+
+def _pieceWidth(frag) -> float:
+    """How wide one fragment of a broken line is."""
+    cbDefn = getattr(frag, "cbDefn", None)
+    if cbDefn is not None:
+        return getattr(cbDefn, "width", 0) or getattr(cbDefn, "advance", 0)
+    return stringWidth(frag.text, frag.fontName, frag.fontSize)
+
+
+def _cutLines(blPara, maxWidths, mode: str) -> bool:
+    """
+    Cut each line of `blPara` wider than its width, as text-overflow does.
+
+    `mode` is "clip", which drops what does not fit, or "ellipsis", which
+    also ends the line with one. The cut falls between two characters: no
+    glyph is drawn in part. Returns whether any line was cut.
+    """
+    cut = False
+    for lineno, line in enumerate(blPara.lines):
+        maxWidth = maxWidths[min(lineno, len(maxWidths) - 1)]
+        if blPara.kind == 0:
+            extraSpace, words = line
+            if extraSpace >= -_FUZZ:
+                continue
+            text, width = _cutText(
+                " ".join(words), blPara.fontName, blPara.fontSize, maxWidth, mode
+            )
+            blPara.lines[lineno] = (maxWidth - width, text.split(" "))
+            cut = True
+            continue
+        pieces = line.words
+        widths = [_pieceWidth(g) for g in pieces]
+        if sum(widths) <= maxWidth + _FUZZ:
+            continue
+        kept: list = []
+        used = 0.0
+        for g, width in zip(pieces, widths, strict=True):
+            if hasattr(g, "lineBreak"):
+                continue
+            if hasattr(g, "cbDefn"):
+                if used + width > maxWidth:
+                    break
+                kept.append(g)
+                used += width
+                continue
+            room = maxWidth - used
+            mark = _overflowMark(mode, g.fontName)
+            if width + stringWidth(mark, g.fontName, g.fontSize) <= room:
+                kept.append(g)
+                used += width
+                continue
+            text = g.text.decode("utf8") if isinstance(g.text, bytes) else g.text
+            text, width = _cutText(text, g.fontName, g.fontSize, room, mode)
+            if text:
+                g = g.clone()
+                g.text = text
+                kept.append(g)
+                used += width
+            break
+        kept.extend(g for g in pieces if hasattr(g, "lineBreak"))
+        line.words = kept
+        line.extraSpace = maxWidth - used + _reserved(kept)
+        cut = True
+    return cut
+
+
+def _getFragWords(frags):
+    """
+    Given a Parafrag list return a list of fragwords
+    [[size, (f00,w00), ..., (f0n,w0n)],....,[size, (fm0,wm0), ..., (f0n,wmn)]]
+    each pair f,w represents a style and some string
+    each sublist represents a word.
+    """
+    R = []
+    W = []
+    n = 0
+    hangingStrip = False
+    for f in frags:
+        text = f.text
+        if isinstance(text, bytes):
+            text = text.decode("utf8")
+
+        # of paragraphs
+        if text:
+            if hangingStrip:
+                hangingStrip = False
+                # Collapsible white space only: a non-breaking space at the
+                # start of a line stays, as in a browser.
+                text = text.lstrip(whitespace)
+            S = split(text)
+            if S == []:
+                S = [""]
+            # The strip above can leave nothing: a fragment of only
+            # whitespace after a <br/>, with an inline box's marker already
+            # in W.
+            if W != [] and text and text[0] in whitespace:
+                W.insert(0, n)
+                R.append(W)
+                W = []
+                n = 0
+
+            for w in S[:-1]:
+                W.append((f, w))
+                n += stringWidth(w, f.fontName, f.fontSize)
+                W.insert(0, n)
+                R.append(W)
+                W = []
+                n = 0
+
+            w = S[-1]
+            W.append((f, w))
+            n += stringWidth(w, f.fontName, f.fontSize)
+            if text and text[-1] in whitespace:
+                W.insert(0, n)
+                R.append(W)
+                W = []
+                n = 0
+        elif hasattr(f, "cbDefn"):
+            w = getattr(f.cbDefn, "width", 0)
+            if w:
+                if W != []:
+                    W.insert(0, n)
+                    R.append(W)
+                    W = []
+                    n = 0
+                R.append([w, (f, "")])
+            else:
+                # A marker rides along with the word it sits in. An inline
+                # box's edge brings its padding and border with it: no word of
+                # its own, but width the line breaker has to count. A
+                # reserve is room kept free after the word for something the
+                # marker's callback draws there (a table of contents' page
+                # number); see _reserved.
+                W.append((f, ""))
+                n += getattr(f.cbDefn, "advance", 0) + getattr(f.cbDefn, "reserve", 0)
+        elif hasattr(f, "lineBreak"):
+            # pass the frag through.  The line breaker will scan for it.
+            if W != []:
+                W.insert(0, n)
+                R.append(W)
+                W = []
+                n = 0
+            R.append([0, (f, "")])
+            hangingStrip = True
+
+    if W != []:
+        W.insert(0, n)
+        R.append(W)
+
+    return R
+
+
+def _split_blParaSimple(blPara, start: int, stop: int) -> list:
+    f = blPara.clone()
+    for a in ("lines", "kind", "text"):
+        if hasattr(f, a):
+            delattr(f, a)
+
+    f.words = []
+    for line in blPara.lines[start:stop]:
+        for w in line[1]:
+            f.words.append(w)
+    return [f]
+
+
+def _split_blParaHard(blPara, start: int, stop: int) -> list:
+    f = []
+    lines = blPara.lines[start:stop]
+    for line in lines:
+        for w in line.words:
+            f.append(w)  # noqa: PERF402
+        if line is not lines[-1]:
+            i = len(f) - 1
+            while (
+                i >= 0
+                and hasattr(f[i], "cbDefn")
+                and not getattr(f[i].cbDefn, "width", 0)
+            ):
+                i -= 1
+            if i >= 0:
+                g = f[i]
+                if not g.text:
+                    g.text = " "
+                else:
+                    if isinstance(g.text, bytes):
+                        g.text = g.text.decode("utf8")
+                    if g.text[-1] != " ":
+                        g.text += " "
+    return f
+
+
+def _reopen_inline_boxes(lines) -> list:
+    """
+    Open markers for the inline boxes `lines` leave unclosed.
+
+    When a paragraph is split between pages, the marker that opened a box
+    stays in the first part and its close marker goes to the second, so the
+    second part would paint no box until the close marker popped an empty
+    stack. These lead the second part's frags instead: the same box, with
+    no left edge and nothing to advance the line by, since the padding and
+    border of the open edge were paid on the first page.
+    """
+    unclosed = []
+    for line in lines:
+        for word in getattr(line, "words", ()):
+            cbDefn = getattr(word, "cbDefn", None)
+            if cbDefn is None or getattr(cbDefn, "kind", None) != "inlineBox":
+                continue
+            if cbDefn.edge == "open":
+                unclosed.append(word)
+            elif unclosed:
+                unclosed.pop()
+    reopened = []
+    for marker in unclosed:
+        # clone() without arguments keeps the cbDefn object itself, and the
+        # first page's marker must go on carrying its edge.
+        carrier = marker.clone()
+        carrier.text = ""
+        carrier.cbDefn = ABag(
+            kind="inlineBox",
+            edge="open",
+            style=marker.cbDefn.style,
+            advance=0.0,
+            inset=0.0,
+            continued=True,
+        )
+        reopened.append(carrier)
+    return reopened
+
+
+# Bidirectional text, line by line.
+#
+# The frags of a paragraph hold their text in logical order, the order it is
+# typed in, and lines are broken in that order. Only a line about to be drawn
+# is put in visual order, the whole line at once: a paragraph cannot be, as
+# its first line is the start of its text whichever way it runs, and a frag
+# cannot be on its own, as an entity or a <b> in the middle of a sentence
+# splits the sentence into frags that must still be ordered as one.
+
+#: What an image, a barcode or an inline-block counts as among the characters
+#: of its line: one object replacement character, a neutral, as a browser
+#: treats an atomic inline.
+_OBJECT = "￼"
+
+
+def _inline_box_edge(word, edge: str, *, continued: bool):
+    """A copy of the inline-box marker `word` for `edge`, of zero advance."""
+    carrier = word.clone()
+    carrier.text = ""
+    carrier.cbDefn = ABag(
+        kind="inlineBox",
+        edge=edge,
+        style=word.cbDefn.style,
+        advance=0.0,
+        inset=0.0,
+        continued=continued,
+    )
+    return carrier
+
+
+def _with_edge(word, edge: str):
+    """`word`, an inline-box marker, acting as the other edge of its box."""
+    cbDefn = word.cbDefn
+    flipped = word.clone()
+    flipped.cbDefn = ABag(
+        kind="inlineBox",
+        edge=edge,
+        style=cbDefn.style,
+        advance=cbDefn.advance,
+        inset=cbDefn.inset,
+        continued=getattr(cbDefn, "continued", False),
+    )
+    return flipped
+
+
+def _is_box_edge(word, edge: str) -> bool:
+    cbDefn = getattr(word, "cbDefn", None)
+    return (
+        cbDefn is not None
+        and getattr(cbDefn, "kind", None) == "inlineBox"
+        and cbDefn.edge == edge
+    )
+
+
+def _self_contained(lines) -> list[list]:
+    """
+    The words of each line, every inline box opened and closed in it.
+
+    A box left open at the end of a line is drawn on into the next from its
+    left margin; once a line is reversed, its left margin is where the line
+    ends. So each line closes what it leaves open and opens what it found
+    open, with markers of no advance that draw no edge (continued), and the
+    box is finished on each line by itself.
+    """
+    result = []
+    open_boxes: list = []
+    for line in lines:
+        words = [_inline_box_edge(box, "open", continued=True) for box in open_boxes]
+        for word in line.words:
+            if _is_box_edge(word, "open"):
+                open_boxes.append(word)
+            elif _is_box_edge(word, "close") and open_boxes:
+                open_boxes.pop()
+            words.append(word)
+        words.extend(
+            _inline_box_edge(box, "close", continued=True)
+            for box in reversed(open_boxes)
+        )
+        result.append(words)
+    return result
+
+
+def _visual_words(words, base_dir: str) -> list:
+    """
+    The frags of one line in the order they are drawn, left to right.
+
+    The line's text is reordered as one string (UAX #9, rules L1 to L4), and
+    each run of characters that comes from one frag and stays together
+    becomes a copy of that frag. An image, a barcode or an inline-block is
+    one character. A marker of no width -- an anchor, a callback, the edge
+    of an inline box -- has no character: it goes next to the character it
+    is attached to, the next one for what opens and the previous one for
+    what closes, on the side that comes first in that character's
+    direction. An inline box whose close edge then lies left of its open
+    edge, as in a right-to-left run, has its two edges exchanged.
+    """
+    chars: list[str] = []
+    owner: list[int] = []
+    before: dict[int, list[int]] = {}
+    after: dict[int, list[int]] = {}
+    pending: list[int] = []
+    last = -1
+    for index, word in enumerate(words):
+        cbDefn = getattr(word, "cbDefn", None)
+        if cbDefn is not None and getattr(cbDefn, "width", None):
+            chars.append(_OBJECT)
+            owner.append(index)
+        elif cbDefn is not None:
+            if (cbDefn.kind == "inlineBox" and cbDefn.edge == "close") or (
+                cbDefn.kind not in {"inlineBox", "anchor"}
+            ):
+                (after.setdefault(last, []) if last >= 0 else pending).append(index)
+            else:
+                pending.append(index)
+            continue
+        else:
+            text = word.text
+            if isinstance(text, bytes):
+                text = text.decode("utf8")
+            for char in text:
+                chars.append(char)
+                owner.append(index)
+        if len(chars) - 1 > last:
+            if pending:
+                before.setdefault(last + 1, []).extend(pending)
+                pending = []
+            last = len(chars) - 1
+    text = "".join(chars)
+    order, levels = display_order(text, base_dir)
+
+    def markers(indices: list[int]) -> list:
+        return [words[i] for i in indices]
+
+    visual: list = []
+    run_owner = -1
+    run_chars: list[str] = []
+
+    def flush() -> None:
+        nonlocal run_owner, run_chars
+        if run_chars:
+            visual.append(words[run_owner].clone(text="".join(run_chars)))
+        run_owner, run_chars = -1, []
+
+    for position in order:
+        rtl = levels[position] & 1
+        # Markers attached to this character: what opens goes on its
+        # starting side, what closes on its ending one.
+        lead = markers(before.get(position, []))
+        trail = markers(after.get(position, []))
+        left, right = (trail[::-1], lead[::-1]) if rtl else (lead, trail)
+        if left:
+            flush()
+            visual.extend(left)
+        char = text[position]
+        word = words[owner[position]]
+        if char == _OBJECT and getattr(getattr(word, "cbDefn", None), "width", None):
+            flush()
+            visual.append(word)
+        elif char not in CONTROL_CHARS:
+            if owner[position] != run_owner:
+                flush()
+                run_owner = owner[position]
+            run_chars.append(mirrored(char, levels[position]))
+        if right:
+            flush()
+            visual.extend(right)
+    flush()
+    # Markers with no character after them, and the empty frags that carry a
+    # line's font or its line break, end the line as in logical order.
+    visual += markers(pending)
+    visual += [w for w in words if not hasattr(w, "cbDefn") and not w.text]
+    text_words = [w for w in visual if not hasattr(w, "cbDefn")]
+    if text_words and visual[-1] is not text_words[-1]:
+        # The last word of a line is what moves the text on to the next one,
+        # and only a word of text does.
+        visual.append(text_words[-1].clone(text=""))
+    return _paired_edges(visual)
+
+
+def _visual_text_words(words, base_dir: str) -> list:
+    """The words of a line of one style, in the order they are drawn."""
+    as_bytes = bool(words) and isinstance(words[0], bytes)
+    line = " ".join(w.decode("utf8") if as_bytes else w for w in words)
+    visual = get_display(line, base_dir).split(" ")
+    return [w.encode("utf8") for w in visual] if as_bytes else visual
+
+
+def _paired_edges(visual: list) -> list:
+    """`visual` with each inline box opened on its left and closed on its right."""
+    stack: list[int] = []
+    pairs: list[tuple[int, int]] = []
+    for index, word in enumerate(visual):
+        if _is_box_edge(word, "open"):
+            stack.append(index)
+        elif _is_box_edge(word, "close") and stack:
+            pairs.append((stack.pop(), index))
+    # A close met before its open: the opens that were never closed, and the
+    # closes that found nothing to close, are the edges of reversed boxes.
+    opens = sorted(stack)
+    closes = []
+    depth = 0
+    for index, word in enumerate(visual):
+        if _is_box_edge(word, "open"):
+            depth += 1
+        elif _is_box_edge(word, "close"):
+            if depth:
+                depth -= 1
+            else:
+                closes.append(index)
+    if not opens and not closes:
+        return visual
+    result = list(visual)
+    for index in closes:
+        result[index] = _with_edge(visual[index], "open")
+    for index in opens:
+        result[index] = _with_edge(visual[index], "close")
+    return result
+
+
+def _bulletWidth(bulletText, style) -> float:
+    if isinstance(bulletText, str):
+        return stringWidth(bulletText, style.bulletFontName, style.bulletFontSize)
+    return sum(
+        (
+            f.image.drawWidth
+            if hasattr(f, "image")
+            else stringWidth(f.text, f.fontName, f.fontSize)
+        )
+        for f in bulletText
+    )
+
+
+def _drawBulletRTL(canvas, offset, cur_y, bulletText, style, width):
+    """
+    Draw the marker of a right-to-left list item, on the right.
+
+    The mirror of _drawBullet: the marker ends where a left-to-right one
+    starts, at the edge of the margin the list is indented by, here the
+    right one. It used to be drawn on the left of a right-aligned item.
+    """
+    # In visual order: "1." in a right-to-left line reads ".1", as a browser
+    # draws it.
+    if isinstance(bulletText, str):
+        bulletText = get_display(bulletText, base_dir="R")
+    else:
+        bulletText = [
+            (
+                f
+                if hasattr(f, "image")
+                else f.clone(text=get_display(f.text, base_dir="R"))
+            )
+            for f in reversed(bulletText)
+        ]
+    y = cur_y + getattr(style, "bulletOffsetY", 0)
+    x = width - getattr(style, "bulletRightIndent", 0) - _bulletWidth(bulletText, style)
+    tx2 = canvas.beginText(x, y)
+    tx2.setFont(style.bulletFontName, style.bulletFontSize)
+    tx2.setFillColor(
+        (hasattr(style, "bulletColor") and style.bulletColor) or style.textColor
+    )
+    if isinstance(bulletText, str):
+        tx2.textOut(bulletText)
+    else:
+        for f in bulletText:
+            if hasattr(f, "image"):
+                image = f.image
+                canvas.drawImage(
+                    image.getImage(), tx2.getX(), y, image.drawWidth, image.drawHeight
+                )
+                tx2.moveCursor(image.drawWidth, 0)
+            else:
+                tx2.setFont(f.fontName, f.fontSize)
+                tx2.setFillColor(f.textColor)
+                tx2.textOut(f.text)
+    canvas.drawText(tx2)
+    return offset
+
+
+def _drawBullet(canvas, offset, cur_y, bulletText, style):
+    """Draw a bullet text could be a simple string or a frag list."""
+    tx2 = canvas.beginText(
+        style.bulletIndent, cur_y + getattr(style, "bulletOffsetY", 0)
+    )
+    tx2.setFont(style.bulletFontName, style.bulletFontSize)
+    tx2.setFillColor(
+        (hasattr(style, "bulletColor") and style.bulletColor) or style.textColor
+    )
+    if isinstance(bulletText, str):
+        tx2.textOut(bulletText)
+    else:
+        for f in bulletText:
+            if hasattr(f, "image"):
+                image = f.image
+                width = image.drawWidth
+                height = image.drawHeight
+                gap = style.bulletFontSize * 0.25
+                x = style.leftIndent - width - gap
+                y = cur_y + getattr(style, "bulletOffsetY", 0)
+                # An SVG marker is drawn as vectors, like an inline SVG image.
+                drawing = image.getDrawing(width, height)
+                if drawing:
+                    renderPDF.draw(drawing, canvas, x, y)
+                else:
+                    canvas.drawImage(image.getImage(), x, y, width, height)
+            else:
+                tx2.setFont(f.fontName, f.fontSize)
+                tx2.setFillColor(f.textColor)
+                tx2.textOut(f.text)
+    canvas.drawText(tx2)
+    # AR making definition lists a bit less ugly
+    # bulletEnd = tx2.getX()
+    bulletEnd = tx2.getX() + style.bulletFontSize * 0.6
+    return max(offset, bulletEnd - style.leftIndent)
+
+
+def _handleBulletWidth(bulletText, style, maxWidths, *, rtl=False):
+    """Work out bullet width and adjust maxWidths[0] if neccessary."""
+    if bulletText and rtl:
+        # The same overrun, measured from the right.
+        bulletLeft = (
+            getattr(style, "bulletRightIndent", 0)
+            + _bulletWidth(bulletText, style)
+            + 0.6 * style.bulletFontSize
+        )
+        if bulletLeft > style.rightIndent:
+            maxWidths[0] -= bulletLeft - style.rightIndent
+    elif bulletText:
+        if isinstance(bulletText, str):
+            bulletWidth = stringWidth(
+                bulletText, style.bulletFontName, style.bulletFontSize
+            )
+        else:
+            # it's a list of fragments
+            bulletWidth = 0
+            for f in bulletText:
+                bulletWidth += stringWidth(f.text, f.fontName, f.fontSize)
+        bulletRight = style.bulletIndent + bulletWidth + 0.6 * style.bulletFontSize
+        indent = style.leftIndent + style.firstLineIndent
+        if bulletRight > indent:
+            # ..then it overruns, and we have less space available on line 1
+            maxWidths[0] -= bulletRight - indent
+
+
+def splitLines0(frags, widths):
+    """
+    Given a list of ParaFrags we return a list of ParaLines.
+
+    each ParaLine has
+    1)  ExtraSpace
+    2)  blankCount
+    3)  [textDefns....]
+        each text definition is a (ParaFrag, start, limit) triplet
+    """
+    # initialise the algorithm
+    lineNum = 0
+    maxW = widths[lineNum]
+    i = -1
+    line = len(frags)
+    lim = start = 0
+    text = frags[0]
+    while True:
+        # find a non whitespace character
+        while i < line:
+            while start < lim and text[start] == " ":
+                start += 1
+            if start == lim:
+                i += 1
+                if i == line:
+                    break
+                start = 0
+                f = frags[i]
+                text = f.text
+                lim = len(text)
+            else:
+                break  # we found one
+
+        if start == lim:
+            break  # if we didn't find one we are done
+
+        # start of a line
+        g = (None, None, None)
+        line = []
+        cLen = 0
+        nSpaces = 0
+        while cLen < maxW:
+            j = text.find(" ", start)
+            if j < 0:
+                j = lim
+            w = stringWidth(text[start:j], f.fontName, f.fontSize)
+            cLen += w
+            if cLen > maxW and line != []:
+                cLen -= w
+                # this is the end of the line
+                while g.text[lim] == " ":
+                    lim -= 1
+                    nSpaces -= 1
+                break
+            if j < 0:
+                j = lim
+            if g[0] is f:
+                g[2] = j  # extend
+            else:
+                g = (f, start, j)
+                line.append(g)
+            if j == lim:
+                i += 1
+
+
+def _do_under_line(i, t_off, ws, tx, lm=-0.125):
+    y = (
+        tx.XtraState.cur_y
+        - i * tx.XtraState.style.leading
+        + lm * tx.XtraState.f.fontSize
+    )
+    textlen = tx._canvas.stringWidth(
+        b" ".join(tx.XtraState.lines[i][1]), tx._fontname, tx._fontsize
+    )
+    tx._canvas.line(t_off, y, t_off + textlen + ws, y)
+
+
+_scheme_re = re.compile(r"^[a-zA-Z][-+a-zA-Z0-9]+$")
+
+
+def _doRelativeLink(canvas, link, rect):
+    """
+    Link to another file, named relative to this one: <a href="other.pdf">.
+
+    It used to be no link at all. A PDF is opened with a /GoToR action, as
+    the vendor "pdf:" scheme already did, which a viewer resolves against the
+    directory of the PDF holding the link; anything else -- page.html, a
+    PDF with a fragment, which /GoToR cannot carry -- is a /URI with the
+    reference as written, the way a browser would keep it.
+    """
+    path, _, fragment = link.partition("#")
+    if not fragment and path.lower().endswith(".pdf"):
+        canvas.linkURL(unquote(path), rect, relative=1, kind="GoToR")
+    else:
+        canvas.linkURL(link, rect, relative=1, kind="URI")
+
+
+def _doLink(tx, link, rect):
+    parts = link.split(":", 1)
+    scheme = (len(parts) == 2 and parts[0].lower()) or ""
+    if _scheme_re.match(scheme) and scheme != "document":
+        kind = (scheme.lower() == "pdf" and "GoToR") or "URI"
+        if kind == "GoToR":
+            link = parts[1]
+        tx._canvas.linkURL(link, rect, relative=1, kind=kind)
+    elif scheme != "document" and not link.startswith("#"):
+        _doRelativeLink(tx._canvas, link, rect)
+    else:
+        if link[0] == "#":
+            link = link[1:]
+            scheme = ""
+        tx._canvas.linkRect(
+            "", (scheme != "document" and link) or parts[1], rect, relative=1
+        )
+
+
+def _do_link_line(i, t_off, ws, tx):
+    xs = tx.XtraState
+    leading = xs.style.leading
+    y = xs.cur_y - i * leading - xs.f.fontSize / 8.0  # 8.0 factor copied from para.py
+    text = b" ".join(xs.lines[i][1])
+    textlen = tx._canvas.stringWidth(text, tx._fontname, tx._fontsize)
+    _doLink(tx, xs.link, (t_off, y, t_off + textlen + ws, y + leading))
+
+
+# XXX Modified for XHTML2PDF
+def _do_post_text(tx):
+    """
+    Try to find out what the variables mean:
+
+    tx         A structure containing more information about paragraph ???
+
+    leading    Height of lines
+    ff         1/8 of the font size
+    y0         The "baseline" postion ???
+    y          1/8 below the baseline
+    """
+    xs = tx.XtraState
+    leading = xs.style.leading
+    autoLeading = xs.autoLeading
+    f = xs.f
+    if autoLeading == "max":
+        # leading = max(leading, f.fontSize)
+        leading = max(leading, LEADING_FACTOR * f.fontSize)
+    elif autoLeading == "min":
+        leading = LEADING_FACTOR * f.fontSize
+    ff = 0.125 * f.fontSize
+    y0 = xs.cur_y
+    y = y0 - ff
+    canvas_code = tx._canvas._code
+    mark = len(canvas_code)
+
+    # Inline boxes: padding, border and background around the line's
+    # ascent and descent. CSS 2.1 10.8: they do not change the line's
+    # height, so a tall padding overlaps the neighbouring lines, as in a
+    # browser. A box cut by a line break has no edge at the cut.
+    #
+    # A span is recorded when its box closes, so a nested box comes before
+    # the one around it; painted in that order the outer background covered
+    # the inner box. CSS paints them from the outside in: wider first, and
+    # of two alike the one recorded later, which encloses the other.
+    spans = list(getattr(xs, "inlineBoxSpans", ()))
+    order = sorted(range(len(spans)), key=lambda i: (spans[i][0] - spans[i][1], -i))
+    for x1, x2, box_style, first, last in (spans[i] for i in order):
+        top = y0 + xs.lineAscent + box_style.paddingTop + box_style.border("Top")
+        bottom = (
+            y0 + xs.lineDescent - box_style.paddingBottom - box_style.border("Bottom")
+        )
+        sides = ["Top", "Bottom"]
+        if first:
+            sides.append("Left")
+        if last:
+            sides.append("Right")
+        if box_style.backColor or box_style.backgroundImage:
+            drawBoxBackground(
+                tx._canvas, x1, bottom, x2 - x1, top - bottom, box_style, sides=sides
+            )
+        if any(box_style.border(side) for side in sides):
+            drawBoxBorders(
+                tx._canvas, x1, bottom, x2 - x1, top - bottom, box_style, sides=sides
+            )
+    xs.inlineBoxSpans = []
+
+    # Background. In its own graphics state: a colour with an alpha sets the
+    # fill opacity too, and the line's text, which resets only the colour,
+    # came out as translucent as its background.
+    for x1, x2, c, fs in xs.backgrounds:
+        inlineFF = fs * 0.125
+        gap = inlineFF * 1.25
+        tx._canvas.saveState()
+        tx._canvas.setFillColor(c)
+        tx._canvas.rect(x1, y - gap, x2 - x1, fs + 1, fill=1, stroke=0)
+        tx._canvas.restoreState()
+    xs.backgrounds = []
+    xs.background = 0
+    xs.backgroundColor = None
+    xs.backgroundFontSize = None
+
+    # Underline
+    yUnderline = y0 - 1.5 * ff
+    tx._canvas.setLineWidth(ff * 0.75)
+    csc = None
+    for x1, x2, c in xs.underlines:
+        if c != csc:
+            tx._canvas.setStrokeColor(c)
+            csc = c
+        tx._canvas.line(x1, yUnderline, x2, yUnderline)
+    xs.underlines = []
+    xs.underline = 0
+    xs.underlineColor = None
+
+    # Strike
+    for x1, x2, c, fs in xs.strikes:
+        inlineFF = fs * 0.125
+        ys = y0 + 2 * inlineFF
+        if c != csc:
+            tx._canvas.setStrokeColor(c)
+            csc = c
+        tx._canvas.setLineWidth(inlineFF * 0.75)
+        tx._canvas.line(x1, ys, x2, ys)
+    xs.strikes = []
+    xs.strike = 0
+    xs.strikeColor = None
+
+    yl = y + leading
+    for x1, x2, link, _c in xs.links:
+        # No automatic underlining for links, never!
+        _doLink(tx, link, (x1, y, x2, yl))
+    xs.links = []
+    xs.link = None
+    xs.linkColor = None
+
+    # Everything painted here goes under the line's text. The text object is
+    # written to the stream in blocks -- one more each time something is
+    # drawn in the middle of a line -- so the decorations, which are known
+    # only now, are moved back to where the line began.
+    start = getattr(xs, "lineCodeStart", None)
+    if start is not None and start < mark < len(canvas_code):
+        painted = canvas_code[mark:]
+        del canvas_code[mark:]
+        canvas_code[start:start] = painted
+    xs.cur_y -= leading
+
+
+def textTransformFrags(frags, style):
+    tt = style.textTransform
+    if tt:
+        tt = tt.lower()
+        if tt == "lowercase":
+            tt = str.lower
+        elif tt == "uppercase":
+            tt = str.upper
+        elif tt == "capitalize":
+            tt = str.title
+        elif tt == "none":
+            return
+        else:
+            raise ValueError(
+                "ParaStyle.textTransform value %r is invalid" % style.textTransform
+            )
+        n = len(frags)
+        if n == 1:
+            # single fragment the easy case
+            frags[0].text = tt(frags[0].text.decode("utf8")).encode("utf8")
+        elif tt is str.title:
+            pb = True
+            for f in frags:
+                t = f.text
+                if not t:
+                    continue
+                u = t.decode("utf8")
+                if u.startswith(" ") or pb:
+                    u = tt(u)
+                else:
+                    i = u.find(" ")
+                    if i >= 0:
+                        u = u[:i] + tt(u[i:])
+                pb = u.endswith(" ")
+                f.text = u.encode("utf8")
+        else:
+            for f in frags:
+                t = f.text
+                if not t:
+                    continue
+                f.text = tt(t.decode("utf8")).encode("utf8")
+
+
+class cjkU(str):  # noqa: SLOT000
+    """simple class to hold the frag corresponding to a str."""
+
+    def __new__(cls, value, frag, _encoding):
+        self = str.__new__(cls, value)
+        self._frag = frag
+        if hasattr(frag, "cbDefn"):
+            w = getattr(frag.cbDefn, "width", 0)
+            self._width = w
+        else:
+            self._width = stringWidth(value, frag.fontName, frag.fontSize)
+        return self
+
+    frag = property(lambda self: self._frag)
+    width = property(lambda self: self._width)
+
+
+def makeCJKParaLine(U, extraSpace, calcBounds):
+    words = []
+    CW = []
+    f0 = FragLine()
+    maxSize = maxAscent = minDescent = 0
+    for u in U:
+        f = u.frag
+        fontSize = f.fontSize
+        if calcBounds:
+            cbDefn = getattr(f, "cbDefn", None)
+            if getattr(cbDefn, "width", 0):
+                descent, ascent = imgVRange(cbDefn.height, cbDefn.valign, fontSize)
+            else:
+                ascent, descent = getAscentDescent(f.fontName, fontSize)
+        else:
+            ascent, descent = getAscentDescent(f.fontName, fontSize)
+        maxSize = max(maxSize, fontSize)
+        maxAscent = max(maxAscent, ascent)
+        minDescent = min(minDescent, descent)
+        if not _sameFrag(f0, f):
+            f0 = f0.clone()
+            f0.text = "".join(CW)
+            words.append(f0)
+            CW = []
+            f0 = f
+        CW.append(u)
+    if CW:
+        f0 = f0.clone()
+        f0.text = "".join(CW)
+        words.append(f0)
+    return FragLine(
+        kind=1,
+        extraSpace=extraSpace,
+        wordCount=1,
+        words=words[1:],
+        fontSize=maxSize,
+        ascent=maxAscent,
+        descent=minDescent,
+    )
+
+
+def cjkFragSplit(frags, maxWidths, calcBounds, encoding="utf8"):
+    """This attempts to be wordSplit for frags using the dumb algorithm."""
+    U = []  # get a list of single glyphs with their widths etc etc
+    for f in frags:
+        text = f.text
+        if not isinstance(text, str):
+            text = text.decode(encoding)
+        if text:
+            U.extend([cjkU(t, f, encoding) for t in text])
+        else:
+            U.append(cjkU(text, f, encoding))
+
+    lines = []
+    widthUsed = lineStartPos = 0
+    maxWidth = maxWidths[0]
+
+    for i, u in enumerate(U):
+        w = u.width
+        widthUsed += w
+        lineBreak = hasattr(u.frag, "lineBreak")
+        endLine = (widthUsed > maxWidth + _FUZZ and widthUsed > 0) or lineBreak
+        if endLine:
+            if lineBreak:
+                continue
+            extraSpace = maxWidth - widthUsed + w
+            # This is the most important of the Japanese typography rules.
+            # if next character cannot start a line, wrap it up to this line so it hangs
+            # in the right margin. We won't do two or more though - that's unlikely and
+            # would result in growing ugliness.
+            nextChar = u
+            if nextChar in ALL_CANNOT_START:
+                extraSpace -= w
+                i += 1
+            lines.append(makeCJKParaLine(U[lineStartPos:i], extraSpace, calcBounds))
+            try:
+                maxWidth = maxWidths[len(lines)]
+            except IndexError:
+                maxWidth = maxWidths[-1]  # use the last one
+
+            lineStartPos = i
+            widthUsed = w
+            i -= 1
+        # any characters left?
+    if widthUsed > 0:
+        lines.append(
+            makeCJKParaLine(U[lineStartPos:], maxWidth - widthUsed, calcBounds)
+        )
+
+    return ParaLines(kind=1, lines=lines)
+
+
+class Paragraph(Flowable):
+    """
+    Paragraph(text, style, bulletText=None, caseSensitive=1)
+    text a string of stuff to go into the paragraph.
+    style is a style definition as in reportlab.lib.styles.
+    bulletText is an optional bullet defintion.
+    caseSensitive set this to 0 if you want the markup tags and their attributes to be case-insensitive.
+
+    This class is a flowable that can format a block of text
+    into a paragraph with a given style.
+
+    The paragraph Text can contain XML-like markup including the tags:
+    <b> ... </b> - bold
+    <i> ... </i> - italics
+    <u> ... </u> - underline
+    <strike> ... </strike> - strike through
+    <super> ... </super> - superscript
+    <sub> ... </sub> - subscript
+    <font name=fontfamily/fontname color=colorname size=float>
+    <onDraw name=callable label="a label">
+    <link>link text</link>
+    attributes of links
+    size/fontSize=num
+    name/face/fontName=name
+    fg/textColor/color=color
+    backcolor/backColor/bgcolor=color
+    dest/destination/target/href/link=target
+    <a>anchor text</a>
+    attributes of anchors
+    fontSize=num
+    fontName=name
+    fg/textColor/color=color
+    backcolor/backColor/bgcolor=color
+    href=href
+    <a name="anchorpoint"/>
+    <unichar name="unicode character name"/>
+    <unichar value="unicode code point"/>
+    <img src="path" width="1in" height="1in" valign="bottom"/>
+
+    The whole may be surrounded by <para> </para> tags
+
+    The <b> and <i> tags will work for the built-in fonts (Helvetica
+    /Times / Courier).  For other fonts you need to register a family
+    of 4 fonts using reportlab.pdfbase.pdfmetrics.registerFont; then
+    use the addMapping function to tell the library that these 4 fonts
+    form a family e.g.
+    from reportlab.lib.fonts import addMapping
+    addMapping('Vera', 0, 0, 'Vera')    #normal
+    addMapping('Vera', 0, 1, 'Vera-Italic')    #italic
+    addMapping('Vera', 1, 0, 'Vera-Bold')    #bold
+    addMapping('Vera', 1, 1, 'Vera-BoldItalic')    #italic and bold
+
+    It will also be able to handle any MathML specified Greek characters.
+    """
+
+    def __init__(
+        self,
+        text,
+        style,
+        bulletText=None,
+        frags=None,
+        caseSensitive=1,
+        encoding="utf8",
+        dir="ltr",  # noqa: A002
+    ) -> None:
+        self.dir = dir
+        self.caseSensitive = caseSensitive
+        self.encoding = encoding
+        self._setup(text, style, bulletText, frags, cleanBlockQuotedText)
+
+    def __repr__(self) -> str:
+        n = type(self).__name__
+        L = [n + "("]
+        keys = self.__dict__.keys()
+        for k in keys:
+            v = getattr(self, k)
+            rk = repr(k)
+            rv = repr(v)
+            rk = "  " + rk.replace("\n", "\n  ")
+            rv = "    " + rk.replace("\n", "\n    ")
+            L.extend((rk, rv))
+        L.append(") #" + n)
+        return "\n".join(L)
+
+    def _setup(self, text, style, bulletText, frags, cleaner):
+        if frags is None:
+            text = cleaner(text)
+            _parser.caseSensitive = self.caseSensitive
+            style, frags, bulletTextFrags = _parser.parse(text, style)
+            if frags is None:
+                msg = f"xml parser error ({_parser.errors[0]}) in paragraph beginning\n'{text[: min(30, len(text))]}'"
+                raise ValueError(msg)
+            textTransformFrags(frags, style)
+            if bulletTextFrags:
+                bulletText = bulletTextFrags
+
+        # AR hack
+        self.text = text
+        self.frags = frags
+        self.style = style
+        self.bulletText = bulletText
+        self.debug = PARAGRAPH_DEBUG  # turn this on to see a pretty one with all the margins etc.
+
+    def wrap(self, availWidth, availHeight):
+        if self.debug:
+            print(id(self), "wrap")
+            try:
+                print(repr(self.getPlainText()[:80]))
+            except Exception:
+                print("???")
+
+        # work out widths array for breaking
+        self.width = availWidth
+        style = self.style
+        leftIndent = style.leftIndent
+        first_line_width = (
+            availWidth - (leftIndent + style.firstLineIndent) - style.rightIndent
+        )
+        later_widths = availWidth - leftIndent - style.rightIndent
+
+        blPara = self._brokenLines(first_line_width, later_widths)
+        self.blPara = blPara
+        autoLeading = getattr(self, "autoLeading", getattr(style, "autoLeading", ""))
+        leading = style.leading
+        if blPara.kind == 1 and autoLeading not in {"", "off"}:
+            height = 0
+            if autoLeading == "max":
+                for line in blPara.lines:
+                    height += sum(_maxLeadingExtent(line, leading))
+            elif autoLeading == "min":
+                for line in blPara.lines:
+                    height += line.ascent - line.descent
+            else:
+                raise ValueError("invalid autoLeading value %r" % autoLeading)
+        else:
+            if autoLeading == "max":
+                leading = max(leading, LEADING_FACTOR * style.fontSize)
+            elif autoLeading == "min":
+                leading = LEADING_FACTOR * style.fontSize
+            height = len(blPara.lines) * leading
+        self.height = height
+
+        return self.width, height
+
+    def _brokenLines(self, first_line_width, later_widths):
+        """
+        The lines broken at these widths, remembered while nothing changes.
+
+        A paragraph is asked to wrap at the same width over and over: a table
+        sizes and then places each cell, a frame measures what it then adds,
+        and multiBuild lays the whole story out once per pass. Breaking the
+        lines is what that costs, so the last answer is kept with what it was
+        computed from -- the widths, and each fragment's identity, text and
+        inline object size, which _calcImageMaxSizes changes with the height
+        offered -- and handed back while they still match. breakLines leaves
+        nothing else behind than its answer and self.width.
+        """
+        style = self.style
+        key = (
+            first_line_width,
+            later_widths,
+            style.wordWrap,
+            getattr(style, "textOverflow", None),
+            getattr(self, "autoLeading", getattr(style, "autoLeading", "")),
+            self.dir,
+            tuple(
+                (
+                    id(f),
+                    _text_key(getattr(f, "text", None)),
+                    getattr(getattr(f, "cbDefn", None), "width", None),
+                    getattr(getattr(f, "cbDefn", None), "height", None),
+                )
+                for f in self.frags
+            ),
+        )
+        cached = self.__dict__.get("_brokenLinesCache")
+        if (
+            cached is not None
+            and cached[0] == key
+            and not getattr(self, "_splitpara", 0)
+        ):
+            self.width = cached[2]
+            self.height = 0
+            return cached[1]
+        width = self.width
+        if style.wordWrap == "CJK":
+            # use Asian text wrap algorithm to break characters
+            blPara = self.breakLinesCJK([first_line_width, later_widths])
+        else:
+            blPara = self.breakLines([first_line_width, later_widths])
+        textOverflow = getattr(style, "textOverflow", None)
+        if textOverflow and _cutLines(
+            blPara, [first_line_width, later_widths], textOverflow
+        ):
+            self.width = width
+        self._brokenLinesCache = (key, blPara, self.width)
+        return blPara
+
+    def minWidth(self):
+        """Attempt to determine a minimum sensible width."""
+        frags = self.frags
+        nFrags = len(frags)
+        if not nFrags:
+            return 0
+        if nFrags == 1:
+            f = frags[0]
+            fS = f.fontSize
+            fN = f.fontName
+            words = (hasattr(f, "text") and split(f.text, " ")) or f.words
+
+            def func(w: list, fS=fS, fN=fN) -> float:
+                return stringWidth(w, fN, fS)
+
+        else:
+            words = _getFragWords(frags)
+
+            def func(w: list, fS=None, fN=None) -> float:  # noqa: ARG001
+                return w[0]
+
+        return max(map(func, words))
+
+    def _get_split_blParaFunc(self) -> Callable:
+        return _split_blParaSimple if self.blPara.kind == 0 else _split_blParaHard
+
+    def split(self, availWidth, availHeight):
+        if self.debug:
+            print(id(self), "split")
+
+        if len(self.frags) <= 0:
+            return []
+
+        # the split information is all inside self.blPara
+        if not hasattr(self, "blPara"):
+            self.wrap(availWidth, availHeight)
+
+        blPara = self.blPara
+        style = self.style
+        autoLeading = getattr(self, "autoLeading", getattr(style, "autoLeading", ""))
+        leading = style.leading
+        lines = blPara.lines
+        if blPara.kind == 1 and autoLeading not in {"", "off"}:
+            s = height = 0
+            if autoLeading == "max":
+                for i, line in enumerate(blPara.lines):
+                    h = sum(_maxLeadingExtent(line, leading))
+                    n = height + h
+                    if n > availHeight + 1e-8:
+                        break
+                    height = n
+                    s = i + 1
+            elif autoLeading == "min":
+                for i, line in enumerate(blPara.lines):
+                    n = height + line.ascent - line.descent
+                    if n > availHeight + 1e-8:
+                        break
+                    height = n
+                    s = i + 1
+            else:
+                raise ValueError("invalid autoLeading value %r" % autoLeading)
+        else:
+            line = leading
+            if autoLeading == "max":
+                line = max(leading, LEADING_FACTOR * style.fontSize)
+            elif autoLeading == "min":
+                line = LEADING_FACTOR * style.fontSize
+            s = int(availHeight / line)
+            height = s * line
+
+        n = len(lines)
+        allowWidows = getattr(self, "allowWidows", getattr(self, "allowWidows", 1))
+        allowOrphans = getattr(self, "allowOrphans", getattr(self, "allowOrphans", 0))
+        if not allowOrphans and s <= 1:  # orphan?
+            del self.blPara
+            return []
+        if n <= s:
+            return [self]
+        if not allowWidows and n == s + 1:  # widow?
+            if (allowOrphans and n == 3) or n > 3:
+                s -= 1  # give the widow some company
+            else:
+                del self.blPara  # no room for adjustment; force the whole para onwards
+                return []
+        func = self._get_split_blParaFunc()
+
+        P1 = type(self)(
+            None,
+            style,
+            bulletText=self.bulletText,
+            frags=func(blPara, 0, s),
+            dir=self.dir,
+        )
+        # this is a major hack
+        P1.blPara = ParaLines(
+            kind=1, lines=blPara.lines[0:s], aH=availHeight, aW=availWidth
+        )
+        P1._JustifyLast = 1
+        P1._splitpara = 1
+        P1.height = height
+        P1.width = availWidth
+        if style.firstLineIndent != 0:
+            style = deepcopy(style)
+            style.firstLineIndent = 0
+        frags = func(blPara, s, n)
+        if blPara.kind == 1:
+            # XXX Modified for XHTML2PDF: inline boxes open at the cut
+            frags = _reopen_inline_boxes(blPara.lines[:s]) + frags
+        P2 = type(self)(None, style, bulletText=None, frags=frags, dir=self.dir)
+        for a in (
+            "autoLeading",  # possible attributes that might be directly on self.
+        ):
+            if hasattr(self, a):
+                setattr(P1, a, getattr(self, a))
+                setattr(P2, a, getattr(self, a))
+        return [P1, P2]
+
+    def draw(self):
+        # call another method for historical reasons.  Besides, I
+        # suspect I will be playing with alternate drawing routines
+        # so not doing it here makes it easier to switch.
+        self.drawPara(self.debug)
+
+    def breakLines(self, width):
+        """
+        Returns a broken line structure. There are two cases.
+
+        A) For the simple case of a single formatting input fragment the output is
+            A fragment specifier with
+                - kind = 0
+                - fontName, fontSize, leading, textColor
+                - lines=  A list of lines
+
+                        Each line has two items.
+
+                        1. unused width in points
+                        2. word list
+
+        B) When there is more than one input formatting fragment the output is
+            A fragment specifier with
+               - kind = 1
+               - lines=  A list of fragments each having fields
+                            - extraspace (needed for justified)
+                            - fontSize
+                            - words=word list
+                                each word is itself a fragment with
+                                various settings
+
+        This structure can be used to easily draw paragraphs with the various alignments.
+        You can supply either a single width or a list of widths; the latter will have its
+        last item repeated until necessary. A 2-element list is useful when there is a
+        different first line indent; a longer list could be created to facilitate custom wraps
+        around irregular objects.
+        """
+        if self.debug:
+            print(id(self), "breakLines")
+
+        maxWidths = [width] if not isinstance(width, tuple | list) else width
+        lines = []
+        lineno = 0
+        style = self.style
+
+        # for bullets, work out width and ensure we wrap the right amount onto line one
+        _handleBulletWidth(self.bulletText, style, maxWidths, rtl=self.dir == "rtl")
+
+        maxWidth = maxWidths[0]
+
+        self.height = 0
+        autoLeading = getattr(self, "autoLeading", getattr(style, "autoLeading", ""))
+        calcBounds = autoLeading not in {"", "off"}
+        frags = self.frags
+        nFrags = len(frags)
+        if nFrags == 1 and not hasattr(frags[0], "cbDefn"):
+            f = frags[0]
+            fontSize = f.fontSize
+            fontName = f.fontName
+            ascent, descent = getAscentDescent(fontName, fontSize)
+            words = (hasattr(f, "text") and split(f.text, " ")) or f.words
+            if getattr(f, "splitLongWords", False):
+                fragWords = [
+                    [stringWidth(w, fontName, fontSize), (f, w)] for w in words
+                ]
+                words = [
+                    piece[1][1] for piece in _splitLongWords(fragWords, min(maxWidths))
+                ]
+            spaceWidth = stringWidth(" ", fontName, fontSize, self.encoding)
+            cLine = []
+            currentWidth = -spaceWidth  # hack to get around extra space for word 1
+            for word in words:
+                # this underscores my feeling that Unicode throughout would be easier!
+                wordWidth = stringWidth(word, fontName, fontSize, self.encoding)
+                newWidth = currentWidth + spaceWidth + wordWidth
+                if newWidth <= maxWidth or not cLine:
+                    # fit one more on this line
+                    cLine.append(word)
+                    currentWidth = newWidth
+                else:
+                    self.width = max(currentWidth, self.width)
+                    # end of line
+                    lines.append((maxWidth - currentWidth, cLine))
+                    cLine = [word]
+                    currentWidth = wordWidth
+                    lineno += 1
+                    try:
+                        maxWidth = maxWidths[lineno]
+                    except IndexError:
+                        maxWidth = maxWidths[-1]  # use the last one
+
+            # deal with any leftovers on the final line
+            if cLine != []:
+                self.width = max(currentWidth, self.width)
+                lines.append((maxWidth - currentWidth, cLine))
+
+            return f.clone(
+                kind=0, lines=lines, ascent=ascent, descent=descent, fontSize=fontSize
+            )
+        if nFrags <= 0:
+            return ParaLines(
+                kind=0,
+                fontSize=style.fontSize,
+                fontName=style.fontName,
+                textColor=style.textColor,
+                ascent=style.fontSize,
+                descent=-0.2 * style.fontSize,
+                lines=[],
+            )
+        if hasattr(self, "blPara") and getattr(self, "_splitpara", 0):
+            # NB this is an utter hack that awaits the proper information
+            # preserving splitting algorithm
+            return self.blPara
+        n = 0
+        words = []
+        # No reversing here. Right-to-left text arrives in visual order,
+        # because the bidirectional algorithm has already run over it, and a
+        # right-to-left line is laid out by aligning it to the right rather
+        # than by turning its words around. What used to happen instead was a
+        # str[::-1] of each fragment plus two reversals of the word order,
+        # which flipped the Latin words of a right-to-left document letter by
+        # letter -- "and Latin text" came out "dna nitaL txet".
+        frag_words = _getFragWords(frags)
+        if any(getattr(f, "splitLongWords", False) for f in frags):
+            frag_words = _splitLongWords(frag_words, min(maxWidths))
+        for w in frag_words:
+            f = w[-1][0]
+            fontName = f.fontName
+            fontSize = f.fontSize
+            spaceWidth = stringWidth(" ", fontName, fontSize)
+
+            if not words:
+                currentWidth = -spaceWidth  # hack to get around extra space for word 1
+                maxSize = fontSize
+                maxAscent, minDescent = getAscentDescent(fontName, fontSize)
+
+            wordWidth = w[0]
+            f = w[1][0]
+            if wordWidth > 0:
+                newWidth = currentWidth + spaceWidth + wordWidth
+            else:
+                newWidth = currentWidth
+
+            # test to see if this frag is a line break. If it is we will only act on it
+            # if the current width is non-negative or the previous thing was a deliberate lineBreak
+            lineBreak = hasattr(f, "lineBreak")
+            endLine = (newWidth > maxWidth and n > 0) or lineBreak
+            if not endLine:
+                if lineBreak:
+                    continue  # throw it away
+                nText = w[1][1] if isinstance(w[1][1], str) else str(w[1][1], "utf-8")
+
+                # A word that starts with a marker (an anchor) still puts
+                # text on the line, after which the next word may wrap.
+                if any(piece[1] for piece in w[1:]):
+                    n += 1
+                fontSize = f.fontSize
+                if calcBounds:
+                    cbDefn = getattr(f, "cbDefn", None)
+                    if getattr(cbDefn, "width", 0):
+                        descent, ascent = imgVRange(
+                            cbDefn.height, cbDefn.valign, fontSize
+                        )
+                    else:
+                        ascent, descent = getAscentDescent(f.fontName, fontSize)
+                else:
+                    ascent, descent = getAscentDescent(f.fontName, fontSize)
+                maxSize = max(maxSize, fontSize)
+                maxAscent = max(maxAscent, ascent)
+                minDescent = min(minDescent, descent)
+                if not words:
+                    g = f.clone()
+                    words = [g]
+                    g.text = nText
+                elif not _sameFrag(g, f):
+                    if currentWidth > 0 and (
+                        (nText and not nText.startswith(" ")) or hasattr(f, "cbDefn")
+                    ):
+                        if hasattr(g, "cbDefn"):
+                            i = len(words) - 1
+                            while i >= 0:
+                                wi = words[i]
+                                cbDefn = getattr(wi, "cbDefn", None)
+                                if cbDefn and not getattr(cbDefn, "width", 0):
+                                    i -= 1
+                                    continue
+                                space = " " if isinstance(wi.text, str) else b" "
+                                if not wi.text.endswith(space):
+                                    wi.text += space
+                                break
+                        else:
+                            space = " " if isinstance(g.text, str) else b" "
+                            if not g.text.endswith(space):
+                                g.text += space
+                    g = f.clone()
+                    words.append(g)
+                    g.text = nText
+                else:
+                    if isinstance(g.text, bytes):
+                        g.text = g.text.decode("utf8")
+                    if isinstance(nText, bytes):
+                        nText = nText.decode("utf8")
+                    if nText and not nText.startswith(" "):
+                        g.text += " " + nText
+
+                for i in w[2:]:
+                    g = i[0].clone()
+                    g.text = i[1]
+                    words.append(g)
+                    fontSize = g.fontSize
+                    if calcBounds:
+                        cbDefn = getattr(g, "cbDefn", None)
+                        if getattr(cbDefn, "width", 0):
+                            descent, ascent = imgVRange(
+                                cbDefn.height, cbDefn.valign, fontSize
+                            )
+                        else:
+                            ascent, descent = getAscentDescent(g.fontName, fontSize)
+                    else:
+                        ascent, descent = getAscentDescent(g.fontName, fontSize)
+                    maxSize = max(maxSize, fontSize)
+                    maxAscent = max(maxAscent, ascent)
+                    minDescent = min(minDescent, descent)
+
+                currentWidth = newWidth
+            else:  # either it won't fit, or it's a lineBreak tag
+                if lineBreak:
+                    g = f.clone()
+                    words.append(g)
+
+                self.width = max(currentWidth, self.width)
+                # end of line
+                lines.append(
+                    FragLine(
+                        extraSpace=maxWidth - currentWidth + _reserved(words),
+                        wordCount=n,
+                        lineBreak=lineBreak,
+                        words=words,
+                        fontSize=maxSize,
+                        ascent=maxAscent,
+                        descent=minDescent,
+                    )
+                )
+
+                # start new line
+                lineno += 1
+                try:
+                    maxWidth = maxWidths[lineno]
+                except IndexError:
+                    maxWidth = maxWidths[-1]  # use the last one
+
+                if lineBreak:
+                    n = 0
+                    words = []
+                    continue
+
+                currentWidth = wordWidth
+                n = 1
+                g = f.clone()
+                maxSize = g.fontSize
+                if calcBounds:
+                    cbDefn = getattr(g, "cbDefn", None)
+                    if getattr(cbDefn, "width", 0):
+                        minDescent, maxAscent = imgVRange(
+                            cbDefn.height, cbDefn.valign, maxSize
+                        )
+                    else:
+                        maxAscent, minDescent = getAscentDescent(g.fontName, maxSize)
+                else:
+                    maxAscent, minDescent = getAscentDescent(g.fontName, maxSize)
+                words = [g]
+                g.text = w[1][1]
+
+                for i in w[2:]:
+                    g = i[0].clone()
+                    g.text = i[1]
+                    words.append(g)
+                    fontSize = g.fontSize
+                    if calcBounds:
+                        cbDefn = getattr(g, "cbDefn", None)
+                        if getattr(cbDefn, "width", 0):
+                            descent, ascent = imgVRange(
+                                cbDefn.height, cbDefn.valign, fontSize
+                            )
+                        else:
+                            ascent, descent = getAscentDescent(g.fontName, fontSize)
+                    else:
+                        ascent, descent = getAscentDescent(g.fontName, fontSize)
+                    maxSize = max(maxSize, fontSize)
+                    maxAscent = max(maxAscent, ascent)
+                    minDescent = min(minDescent, descent)
+
+        # deal with any leftovers on the final line
+        if words != []:
+            self.width = max(currentWidth, self.width)
+            lines.append(
+                ParaLines(
+                    extraSpace=(maxWidth - currentWidth + _reserved(words)),
+                    wordCount=n,
+                    words=words,
+                    fontSize=maxSize,
+                    ascent=maxAscent,
+                    descent=minDescent,
+                )
+            )
+        return ParaLines(kind=1, lines=lines)
+
+    def breakLinesCJK(self, width):
+        """
+        Initially, the dumbest possible wrapping algorithm.
+        Cannot handle font variations.
+        """
+        if self.debug:
+            print(id(self), "breakLinesCJK")
+
+        maxWidths = width if isinstance(width, list | tuple) else [width]
+        style = self.style
+
+        # for bullets, work out width and ensure we wrap the right amount onto line one
+        _handleBulletWidth(self.bulletText, style, maxWidths, rtl=self.dir == "rtl")
+        if len(self.frags) > 1:
+            autoLeading = getattr(
+                self, "autoLeading", getattr(style, "autoLeading", "")
+            )
+            calcBounds = autoLeading not in {"", "off"}
+            return cjkFragSplit(self.frags, maxWidths, calcBounds, self.encoding)
+
+        if not len(self.frags):
+            return ParaLines(
+                kind=0,
+                fontSize=style.fontSize,
+                fontName=style.fontName,
+                textColor=style.textColor,
+                lines=[],
+                ascent=style.fontSize,
+                descent=-0.2 * style.fontSize,
+            )
+        f = self.frags[0]
+        if 1 and hasattr(self, "blPara") and getattr(self, "_splitpara", 0):
+            # NB this is an utter hack that awaits the proper information
+            # preserving splitting algorithm
+            return f.clone(kind=0, lines=self.blPara.lines)
+        lines = []
+
+        self.height = 0
+
+        f = self.frags[0]
+
+        text = f.text if hasattr(f, "text") else "".join(getattr(f, "words", []))
+
+        from reportlab.lib.textsplit import wordSplit
+
+        lines = wordSplit(text, maxWidths[0], f.fontName, f.fontSize)
+        # the paragraph drawing routine assumes multiple frags per line, so we need an
+        # extra list like this
+        #  [space, [text]]
+        #
+        wrappedLines = [(sp, [line]) for (sp, line) in lines]
+        return f.clone(
+            kind=0, lines=wrappedLines, ascent=f.fontSize, descent=-0.2 * f.fontSize
+        )
+
+    def beginText(self, x, y):
+        return self.canv.beginText(x, y)
+
+    def displayLines(self) -> list:
+        """
+        The lines of this paragraph in the order they are drawn in.
+
+        blPara keeps its lines in logical order, the order the text is
+        stored in: a paragraph split between pages is made again from them,
+        and must not be reversed twice. Each line is put in visual order on
+        its own, the whole line at once, with the paragraph's direction as
+        its base (UAX #9, rules L1 to L4). A paragraph with nothing to
+        reorder gets its own lines back.
+
+        Levels are resolved line by line rather than over the paragraph, so a
+        neutral or a bracket pair on either side of a line break does not
+        see the other side. That differs from UAX #9 only there.
+        """
+        blPara = self.blPara
+        base_dir = "R" if self.dir == "rtl" else "L"
+        cached = getattr(self, "_displayCache", None)
+        if cached is not None and cached[0] is blPara and cached[1] == base_dir:
+            return cached[2]
+        lines = blPara.lines
+        texts = (
+            frag.text
+            for frag in self.frags
+            if isinstance(getattr(frag, "text", None), str)
+        )
+        if any(needs_bidi(text, base_dir) for text in texts):
+            if blPara.kind == 0:
+                lines = [
+                    (extraspace, _visual_text_words(words, base_dir))
+                    for extraspace, words in lines
+                ]
+            else:
+                lines = [
+                    line.clone(words=_visual_words(words, base_dir))
+                    for line, words in zip(lines, _self_contained(lines), strict=True)
+                ]
+        self._displayCache = (blPara, base_dir, lines)
+        return lines
+
+    def drawPara(self, debug=0):
+        """
+        Draws a paragraph according to the given style.
+        Returns the final y position at the bottom. Not safe for
+        paragraphs without spaces e.g. Japanese; wrapping
+        algorithm will go infinite.
+        """
+        if self.debug:
+            print(id(self), "drawPara", self.blPara.kind)
+
+        # stash the key facts locally for speed
+        canvas = self.canv
+        style = self.style
+        blPara = self.blPara
+        lines = self.displayLines()
+        leading = style.leading
+        autoLeading = getattr(self, "autoLeading", getattr(style, "autoLeading", ""))
+
+        # work out the origin for line 1
+        leftIndent = style.leftIndent
+        cur_x = leftIndent
+
+        if debug:
+            bw = 0.5
+            bc = Color(1, 1, 0)
+            bg = Color(0.9, 0.9, 0.9)
+        else:
+            bw = getattr(style, "borderWidth", None)
+            bc = getattr(style, "borderColor", None)
+            bg = style.backColor
+
+        # if has a background or border, draw it
+        if bg or (bc and bw):
+            canvas.saveState()
+            op = canvas.rect
+            kwds = {"fill": 0, "stroke": 0}
+            if bc and bw:
+                canvas.setStrokeColor(bc)
+                canvas.setLineWidth(bw)
+                kwds["stroke"] = 1
+                br = getattr(style, "borderRadius", 0)
+                if br and not debug:
+                    op = canvas.roundRect
+                    kwds["radius"] = br
+            if bg:
+                canvas.setFillColor(bg)
+                kwds["fill"] = 1
+            bp = getattr(style, "borderPadding", 0)
+            op(
+                leftIndent - bp,
+                -bp,
+                self.width - (leftIndent + style.rightIndent) + 2 * bp,
+                self.height + 2 * bp,
+                **kwds,
+            )
+            canvas.restoreState()
+
+        nLines = len(lines)
+        bulletText = self.bulletText
+        if nLines > 0:
+            _offsets = getattr(self, "_offsets", [0])
+            _offsets += (nLines - len(_offsets)) * [_offsets[-1]]
+            canvas.saveState()
+            alignment = style.alignment
+            offset = style.firstLineIndent + _offsets[0]
+            lim = nLines - 1
+            noJustifyLast = not (hasattr(self, "_JustifyLast") and self._JustifyLast)
+
+            if blPara.kind == 0:
+                if alignment == TA_LEFT:
+                    dpl = _leftDrawParaLine
+                elif alignment == TA_CENTER:
+                    dpl = _centerDrawParaLine
+                elif self.style.alignment == TA_RIGHT:
+                    dpl = _rightDrawParaLine
+                elif self.style.alignment == TA_JUSTIFY:
+                    dpl = _justifyDrawParaLine
+                f = blPara
+                cur_y = self.height - getattr(
+                    f, "ascent", f.fontSize
+                )  # TODO fix XPreformatted to remove this hack
+                if bulletText:
+                    if self.dir == "rtl":
+                        offset = _drawBulletRTL(
+                            canvas, offset, cur_y, bulletText, style, self.width
+                        )
+                    else:
+                        offset = _drawBullet(canvas, offset, cur_y, bulletText, style)
+
+                # set up the font etc.
+                canvas.setFillColor(f.textColor)
+
+                tx = self.beginText(cur_x, cur_y)
+                if autoLeading == "max":
+                    leading = max(leading, LEADING_FACTOR * f.fontSize)
+                elif autoLeading == "min":
+                    leading = LEADING_FACTOR * f.fontSize
+
+                # now the font for the rest of the paragraph
+                tx.setFont(f.fontName, f.fontSize, leading)
+                ws = getattr(tx, "_wordSpace", 0)
+                t_off = dpl(tx, offset, ws, lines[0][1], noJustifyLast and nLines == 1)
+                if (
+                    (hasattr(f, "underline") and f.underline)
+                    or f.link
+                    or (hasattr(f, "strike") and f.strike)
+                ):
+                    xs = tx.XtraState = ABag()
+                    xs.cur_y = cur_y
+                    xs.f = f
+                    xs.style = style
+                    xs.lines = lines
+                    xs.underlines = []
+                    xs.underlineColor = None
+                    # XXX Modified for XHTML2PDF
+                    xs.backgrounds = []
+                    xs.backgroundColor = None
+                    xs.backgroundFontSize = None
+                    xs.strikes = []
+                    xs.strikeColor = None
+                    # XXX Modified for XHTML2PDF
+                    xs.strikeFontSize = None
+                    xs.links = []
+                    xs.link = f.link
+                    canvas.setStrokeColor(f.textColor)
+                    dx = t_off + leftIndent
+                    if dpl != _justifyDrawParaLine:
+                        ws = 0
+                    # XXX Never underline!
+                    underline = f.underline
+                    strike = f.strike
+                    link = f.link
+                    if underline:
+                        _do_under_line(0, dx, ws, tx)
+                    if strike:
+                        _do_under_line(0, dx, ws, tx, lm=0.125)
+                    if link:
+                        _do_link_line(0, dx, ws, tx)
+
+                    # now the middle of the paragraph, aligned with the left margin which is our origin.
+                    for i in range(1, nLines):
+                        ws = lines[i][0]
+                        t_off = dpl(
+                            tx, _offsets[i], ws, lines[i][1], noJustifyLast and i == lim
+                        )
+                        if dpl != _justifyDrawParaLine:
+                            ws = 0
+                        if underline:
+                            _do_under_line(i, t_off + leftIndent, ws, tx)
+                        if strike:
+                            _do_under_line(i, t_off + leftIndent, ws, tx, lm=0.125)
+                        if link:
+                            _do_link_line(i, t_off + leftIndent, ws, tx)
+                else:
+                    for i in range(1, nLines):
+                        dpl(
+                            tx,
+                            _offsets[i],
+                            lines[i][0],
+                            lines[i][1],
+                            noJustifyLast and i == lim,
+                        )
+            else:
+                f = lines[0]
+                cur_y = self.height - getattr(
+                    f, "ascent", f.fontSize
+                )  # TODO fix XPreformatted to remove this hack
+                # default?
+                dpl = _leftDrawParaLineX
+                if bulletText:
+                    if self.dir == "rtl":
+                        offset = _drawBulletRTL(
+                            canvas, offset, cur_y, bulletText, style, self.width
+                        )
+                    else:
+                        offset = _drawBullet(canvas, offset, cur_y, bulletText, style)
+                if alignment == TA_LEFT:
+                    dpl = _leftDrawParaLineX
+                elif alignment == TA_CENTER:
+                    dpl = _centerDrawParaLineX
+                elif self.style.alignment == TA_RIGHT:
+                    dpl = _rightDrawParaLineX
+                elif self.style.alignment == TA_JUSTIFY:
+                    dpl = _justifyDrawParaLineX
+                else:
+                    raise ValueError("bad align %s" % repr(alignment))
+
+                # set up the font etc.
+                tx = self.beginText(cur_x, cur_y)
+                xs = tx.XtraState = ABag()
+                xs.textColor = None
+                # XXX Modified for XHTML2PDF
+                xs.backColor = None
+                xs.rise = 0
+                xs.underline = 0
+                xs.underlines = []
+                xs.underlineColor = None
+                # XXX Modified for XHTML2PDF
+                xs.background = 0
+                xs.backgrounds = []
+                xs.backgroundColor = None
+                xs.backgroundFontSize = None
+                xs.strike = 0
+                xs.strikes = []
+                xs.strikeColor = None
+                # XXX Modified for XHTML2PDF
+                xs.strikeFontSize = None
+                xs.links = []
+                xs.link = None
+                # XXX Modified for XHTML2PDF: inline boxes, open across lines
+                xs.inlineBoxes = []
+                xs.inlineBoxSpans = []
+                xs.lineAscent = 0
+                xs.lineDescent = 0
+                xs.leading = style.leading
+                xs.leftIndent = leftIndent
+                tx._leading = None
+                tx._olb = None
+                xs.cur_y = cur_y
+                xs.f = f
+                xs.style = style
+                xs.autoLeading = autoLeading
+
+                tx._fontname, tx._fontsize = None, None
+                dpl(tx, offset, lines[0], noJustifyLast and nLines == 1)
+                _do_post_text(tx)
+
+                # now the middle of the paragraph, aligned with the left margin which is our origin.
+                for i in range(1, nLines):
+                    f = lines[i]
+                    dpl(tx, _offsets[i], f, noJustifyLast and i == lim)
+                    _do_post_text(tx)
+
+            canvas.drawText(tx)
+            canvas.restoreState()
+
+    def getPlainText(self, identify=None):
+        """
+        Convenience function for templates which want access
+        to the raw text, without XML tags.
+        """
+        frags = getattr(self, "frags", None)
+        if frags:
+            # the brackets used to wrap frag.text, so this joined a sequence of
+            # one-element lists and raised TypeError on every call
+            return "".join(frag.text for frag in frags if hasattr(frag, "text"))
+        if identify:
+            text = getattr(self, "text", None)
+            if text is None:
+                text = repr(self)
+            return text
+        return ""
+
+    def getActualLineWidths0(self):
+        """
+        Convenience function; tells you how wide each line
+        actually is.  For justified styles, this will be
+        the same as the wrap width; for others it might be
+        useful for seeing if paragraphs will fit in spaces.
+        """
+        assert hasattr(self, "width"), "Cannot call this method before wrap()"
+        if self.blPara.kind:
+
+            def func(frag, w=self.width):
+                return w - frag.extraSpace
+
+        else:
+
+            def func(frag, w=self.width):
+                return w - frag[0]
+
+        return map(func, self.blPara.lines)
+
+
+if __name__ == "__main__":  # NORUNTESTS
+
+    def dumpParagraphLines(P):
+        print(f"dumpParagraphLines(<Paragraph @ {id(P)}>)")
+        lines = P.blPara.lines
+        for i, line in enumerate(lines):
+            line = lines[i]
+            words = line.words if hasattr(line, "words") else line[1]
+            nwords = len(words)
+            wordcount = getattr(line, "wordCount", "Unknown")
+            print(f"line{i}: {nwords}({wordcount})\n  ")
+            for w in range(nwords):
+                text = getattr(words[w], "text", words[w])
+                print(f"{w}:'{text}'")
+            print()
+
+    def fragDump(w):
+        attrs = (
+            "fontName",
+            "fontSize",
+            "textColor",
+            "rise",
+            "underline",
+            "strike",
+            "link",
+            "cbDefn",
+            "lineBreak",
+        )
+        attr_list = [f"'{w[1]}'"] + [
+            f"{a}={getattr(w[0], a)!r}" for a in attrs if hasattr(w[0], a)
+        ]
+        return ", ".join(attr_list)
+
+    def dumpParagraphFrags(P):
+        print(
+            f"dumpParagraphFrags(<Paragraph @ {id(P)}>) minWidth() = {P.minWidth():.2f}"
+        )
+        frags = P.frags
+        n = len(frags)
+        for frag in range(n):
+            detail = " ".join(
+                [
+                    f"{k}={getattr(frags[frag], k)}"
+                    for k in frags[frag].__dict__
+                    if k != text
+                ]
+            )
+            print(f"frag{frag}: '{frags[frag].text}' {detail}")
+
+        cum = 0
+        for fragword, W in enumerate(_getFragWords(frags)):
+            cum += W[0]
+            print(f"fragword{fragword}: cum={cum:3d} size={W[0]}")
+            for w in W[1:]:
+                print(f"({fragDump(w)})")
+            print()
+
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import cm
+
+    TESTS = sys.argv[1:]
+    if TESTS == []:
+        TESTS = ["4"]
+
+    def flagged(i, TESTS=TESTS):
+        return "all" in TESTS or "*" in TESTS or str(i) in TESTS
+
+    styleSheet = getSampleStyleSheet()
+    B = styleSheet["BodyText"]
+    style = ParagraphStyle("discussiontext", parent=B)
+    style.fontName = "Helvetica"
+    if flagged(1):
+        text = """The <font name=courier color=green>CMYK</font> or subtractive method follows the way a printer
+mixes three pigments (cyan, magenta, and yellow) to form colors.
+Because mixing chemicals is more difficult than combining light there
+is a fourth parameter for darkness.  For example a chemical
+combination of the <font name=courier color=green>CMY</font> pigments generally never makes a perfect
+black -- instead producing a muddy color -- so, to get black printers
+don't use the <font name=courier color=green>CMY</font> pigments but use a direct black ink.  Because
+<font name=courier color=green>CMYK</font> maps more directly to the way printer hardware works it may
+be the case that &amp;| &amp; | colors specified in <font name=courier color=green>CMYK</font> will provide better fidelity
+and better control when printed.
+"""
+        P = Paragraph(text, style)
+        dumpParagraphFrags(P)
+        aW, aH = 456.0, 42.8
+        w, h = P.wrap(aW, aH)
+        dumpParagraphLines(P)
+        S = P.split(aW, aH)
+        for s in S:
+            s.wrap(aW, aH)
+            dumpParagraphLines(s)
+            aH = 500
+
+    if flagged(2):
+        P = Paragraph(
+            """Price<super><font color="red">*</font></super>""", styleSheet["Normal"]
+        )
+        dumpParagraphFrags(P)
+        w, h = P.wrap(24, 200)
+        dumpParagraphLines(P)
+
+    if flagged(3):
+        text = """Dieses Kapitel bietet eine schnelle <b><font color=red>Programme :: starten</font></b>
+<onDraw name=myIndex label="Programme :: starten">
+<b><font color=red>Eingabeaufforderung :: (&gt;&gt;&gt;)</font></b>
+<onDraw name=myIndex label="Eingabeaufforderung :: (&gt;&gt;&gt;)">
+<b><font color=red>&gt;&gt;&gt; (Eingabeaufforderung)</font></b>
+<onDraw name=myIndex label="&gt;&gt;&gt; (Eingabeaufforderung)">
+Einf&#xfc;hrung in Python <b><font color=red>Python :: Einf&#xfc;hrung</font></b>
+<onDraw name=myIndex label="Python :: Einf&#xfc;hrung">.
+Das Ziel ist, die grundlegenden Eigenschaften von Python darzustellen, ohne
+sich zu sehr in speziellen Regeln oder Details zu verstricken. Dazu behandelt
+dieses Kapitel kurz die wesentlichen Konzepte wie Variablen, Ausdr&#xfc;cke,
+Kontrollfluss, Funktionen sowie Ein- und Ausgabe. Es erhebt nicht den Anspruch,
+umfassend zu sein."""
+        P = Paragraph(text, styleSheet["Code"])
+        dumpParagraphFrags(P)
+        w, h = P.wrap(6 * 72, 9.7 * 72)
+        dumpParagraphLines(P)
+
+    if flagged(4):
+        text = """Die eingebaute Funktion <font name=Courier>range(i, j [, stride])</font><onDraw name=myIndex label="eingebaute Funktionen::range()"><onDraw name=myIndex label="range() (Funktion)"><onDraw name=myIndex label="Funktionen::range()"> erzeugt eine Liste von Ganzzahlen und f&#xfc;llt sie mit Werten <font name=Courier>k</font>, f&#xfc;r die gilt: <font name=Courier>i &lt;= k &lt; j</font>. Man kann auch eine optionale Schrittweite angeben. Die eingebaute Funktion <font name=Courier>xrange()</font><onDraw name=myIndex label="eingebaute Funktionen::xrange()"><onDraw name=myIndex label="xrange() (Funktion)"><onDraw name=myIndex label="Funktionen::xrange()"> erf&#xfc;llt einen &#xe4;hnlichen Zweck, gibt aber eine unver&#xe4;nderliche Sequenz vom Typ <font name=Courier>XRangeType</font><onDraw name=myIndex label="XRangeType"> zur&#xfc;ck. Anstatt alle Werte in der Liste abzuspeichern, berechnet diese Liste ihre Werte, wann immer sie angefordert werden. Das ist sehr viel speicherschonender, wenn mit sehr langen Listen von Ganzzahlen gearbeitet wird. <font name=Courier>XRangeType</font> kennt eine einzige Methode, <font name=Courier>s.tolist()</font><onDraw name=myIndex label="XRangeType::tolist() (Methode)"><onDraw name=myIndex label="s.tolist() (Methode)"><onDraw name=myIndex label="Methoden::s.tolist()">, die seine Werte in eine Liste umwandelt."""
+        aW = 420
+        aH = 64.4
+        P = Paragraph(text, B)
+        dumpParagraphFrags(P)
+        w, h = P.wrap(aW, aH)
+        print("After initial wrap", w, h)
+        dumpParagraphLines(P)
+        S = P.split(aW, aH)
+        dumpParagraphFrags(S[0])
+        w0, h0 = S[0].wrap(aW, aH)
+        print("After split wrap", w0, h0)
+        dumpParagraphLines(S[0])
+
+    if flagged(5):
+        text = f"<para> {chr(163)} <![CDATA[</font></b>& {chr(163)} < >]]></para>"
+        P = Paragraph(text, styleSheet["Code"])
+        dumpParagraphFrags(P)
+        w, h = P.wrap(6 * 72, 9.7 * 72)
+        dumpParagraphLines(P)
+
+    if flagged(6):
+        for text in [
+            """Here comes <FONT FACE="Helvetica" SIZE="14pt">Helvetica 14</FONT> with <STRONG>strong</STRONG> <EM>emphasis</EM>.""",
+            """Here comes <font face="Helvetica" size="14pt">Helvetica 14</font> with <Strong>strong</Strong> <em>emphasis</em>.""",
+            """Here comes <font face="Courier" size="3cm">Courier 3cm</font> and normal again.""",
+        ]:
+            P = Paragraph(text, styleSheet["Normal"], caseSensitive=0)
+            dumpParagraphFrags(P)
+            w, h = P.wrap(6 * 72, 9.7 * 72)
+            dumpParagraphLines(P)
+
+    if flagged(7):
+        text = """<para align="CENTER" fontSize="24" leading="30"><b>Generated by:</b>Dilbert</para>"""
+        P = Paragraph(text, styleSheet["Code"])
+        dumpParagraphFrags(P)
+        w, h = P.wrap(6 * 72, 9.7 * 72)
+        dumpParagraphLines(P)
+
+    if flagged(8):
+        text = """- bullet 0<br/>- bullet 1<br/>- bullet 2<br/>- bullet 3<br/>- bullet 4<br/>- bullet 5"""
+        P = Paragraph(text, styleSheet["Normal"])
+        dumpParagraphFrags(P)
+        w, h = P.wrap(6 * 72, 9.7 * 72)
+        dumpParagraphLines(P)
+        S = P.split(6 * 72, h / 2.0)
+        print(len(S))
+        dumpParagraphLines(S[0])
+        dumpParagraphLines(S[1])
+
+    if flagged(9):
+        text = """Furthermore, the fundamental error of
+regarding <img src="../docs/images/testimg.gif" width="3" height="7"/> functional notions as
+categorial delimits a general
+convention regarding the forms of the<br/>
+grammar. I suggested that these results
+would follow from the assumption that"""
+        P = Paragraph(
+            text, ParagraphStyle("aaa", parent=styleSheet["Normal"], align=TA_JUSTIFY)
+        )
+        dumpParagraphFrags(P)
+        w, h = P.wrap(6 * cm - 12, 9.7 * 72)
+        dumpParagraphLines(P)
+
+    if flagged(10):
+        text = """a b c\xc2\xa0d e f"""
+        P = Paragraph(
+            text, ParagraphStyle("aaa", parent=styleSheet["Normal"], align=TA_JUSTIFY)
+        )
+        dumpParagraphFrags(P)
+        w, h = P.wrap(6 * cm - 12, 9.7 * 72)
+        dumpParagraphLines(P)
