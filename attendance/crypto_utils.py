@@ -1,16 +1,24 @@
 import os
 import json
 import base64
+import hashlib
+from django.conf import settings
 from cryptography.fernet import Fernet
 from typing import Dict, Any
 
+def _get_master_kek() -> bytes:
+    """Derives or retrieves the Master Key Encryption Key (KEK) dynamically."""
+    custom_kek = getattr(settings, 'HRMS_MASTER_KEK', None)
+    if custom_kek:
+        return custom_kek.encode('utf-8') if isinstance(custom_kek, str) else custom_kek
+    secret = getattr(settings, 'SECRET_KEY', 'default-hrms-dev-secret-key-32b!')
+    return base64.urlsafe_b64encode(hashlib.sha256(secret.encode('utf-8')).digest())
+
 class AWSKMSMock:
     """
-    Mock implementation of AWS Key Management Service (KMS).
-    In production, this would use boto3.client('kms').
+    KMS Envelope Encryption implementation.
+    Uses master KEK derived from environment/settings for DEK encryption.
     """
-    _MASTER_KEK = b'r3v8j1nK_QvX9wzG7L4P2tM5c8H1kF4=' # Mock Key Encryption Key
-    
     @classmethod
     def generate_data_key(cls) -> tuple[bytes, bytes]:
         """
@@ -18,9 +26,8 @@ class AWSKMSMock:
         Returns (Plaintext DEK, Encrypted DEK).
         """
         plaintext_dek = Fernet.generate_key()
-        # In reality, KMS encrypts the DEK. We mock it by XOR or just returning base64.
-        # For this prototype, we'll just base64 encode it as the "encrypted" version.
-        encrypted_dek = base64.b64encode(plaintext_dek)
+        master_cipher = Fernet(_get_master_kek())
+        encrypted_dek = master_cipher.encrypt(plaintext_dek)
         return plaintext_dek, encrypted_dek
         
     @classmethod
@@ -28,8 +35,8 @@ class AWSKMSMock:
         """
         Decrypts the DEK using the master KEK.
         """
-        # Mock decryption
-        return base64.b64decode(encrypted_dek)
+        master_cipher = Fernet(_get_master_kek())
+        return master_cipher.decrypt(encrypted_dek)
 
 class CryptoService:
     """

@@ -874,103 +874,106 @@ class AttendanceViewSet(viewsets.ViewSet):
                 
             now = timezone.now()
             
-            daily_att = None
-            if verification_status == 'VERIFIED':
-                today = now.date()
-                daily_att, created = DailyAttendance.objects.get_or_create(
-                    employee=employee,
-                    attendance_date=today,
-                    defaults={
-                        'site': matched_site,
-                        'organization': employee.entity,
-                    }
-                )
-                
-                if punch_type == 'IN':
-                    if not daily_att.first_check_in:
-                        daily_att.first_check_in = now
-                        from .models import ShiftAssignment
-                        import datetime
-                        shift_assignment = ShiftAssignment.objects.filter(employee=employee, date=today).first()
-                        
-                        shift_start_dt = None
-                        if shift_assignment and shift_assignment.shift:
-                            shift = shift_assignment.shift
-                            shift_start_dt = datetime.datetime.combine(today, shift.start_time)
-                            if timezone.is_naive(shift_start_dt):
-                                shift_start_dt = timezone.make_aware(shift_start_dt)
-                        else:
-                            shift_start_dt = now.replace(hour=9, minute=30, second=0, microsecond=0)
-                            if timezone.is_naive(shift_start_dt):
-                                shift_start_dt = timezone.make_aware(shift_start_dt)
-
-                        # Evaluate punctuality slabs dynamically
-                        punct_res = evaluate_punctuality_slabs(employee, now, shift_start_dt)
-                        if punct_res["matched"]:
-                            daily_att.attendance_status = punct_res["status"]
-                            daily_att.late_deduction_amount = punct_res["penalty_amount"]
-                            daily_att.punctuality_penalty_details = punct_res["details"]
+            from django.db import transaction
+            with transaction.atomic():
+                daily_att = None
+                if verification_status == 'VERIFIED':
+                    today = now.date()
+                    daily_att, created = DailyAttendance.objects.select_for_update().get_or_create(
+                        employee=employee,
+                        attendance_date=today,
+                        defaults={
+                            'site': matched_site,
+                            'entity': employee.entity,
+                            'organization': employee.organization,
+                        }
+                    )
+                    
+                    if punch_type == 'IN':
+                        if not daily_att.first_check_in:
+                            daily_att.first_check_in = now
+                            from .models import ShiftAssignment
+                            import datetime
+                            shift_assignment = ShiftAssignment.objects.filter(employee=employee, date=today).first()
                             
-                            from organisation.models import PunctualityPenaltyLog
-                            PunctualityPenaltyLog.objects.create(
-                                daily_attendance=daily_att,
-                                slab=punct_res["slab"],
-                                penalty_amount=punct_res["penalty_amount"],
-                                penalty_type=punct_res["penalty_type"],
-                                punch_time=now,
-                                shift_start=shift_start_dt,
-                                minutes_late=int(max(0, punct_res["minutes_offset"]))
-                            )
-                        else:
-                            # Standard fallback if no custom slab policy applies
+                            shift_start_dt = None
                             if shift_assignment and shift_assignment.shift:
                                 shift = shift_assignment.shift
-                                cutoff_dt = shift_start_dt + datetime.timedelta(minutes=shift.grace_minutes)
-                                if now > cutoff_dt:
-                                    daily_att.attendance_status = 'Late'
-                                else:
-                                    daily_att.attendance_status = 'Present'
+                                shift_start_dt = datetime.datetime.combine(today, shift.start_time)
+                                if timezone.is_naive(shift_start_dt):
+                                    shift_start_dt = timezone.make_aware(shift_start_dt)
                             else:
-                                if now > shift_start_dt:
-                                    daily_att.attendance_status = 'Late'
+                                shift_start_dt = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                                if timezone.is_naive(shift_start_dt):
+                                    shift_start_dt = timezone.make_aware(shift_start_dt)
+
+                            # Evaluate punctuality slabs dynamically
+                            punct_res = evaluate_punctuality_slabs(employee, now, shift_start_dt)
+                            if punct_res["matched"]:
+                                daily_att.attendance_status = punct_res["status"]
+                                daily_att.late_deduction_amount = punct_res["penalty_amount"]
+                                daily_att.punctuality_penalty_details = punct_res["details"]
+                                
+                                from organisation.models import PunctualityPenaltyLog
+                                PunctualityPenaltyLog.objects.create(
+                                    daily_attendance=daily_att,
+                                    slab=punct_res["slab"],
+                                    penalty_amount=punct_res["penalty_amount"],
+                                    penalty_type=punct_res["penalty_type"],
+                                    punch_time=now,
+                                    shift_start=shift_start_dt,
+                                    minutes_late=int(max(0, punct_res["minutes_offset"]))
+                                )
+                            else:
+                                # Standard fallback if no custom slab policy applies
+                                if shift_assignment and shift_assignment.shift:
+                                    shift = shift_assignment.shift
+                                    cutoff_dt = shift_start_dt + datetime.timedelta(minutes=shift.grace_minutes)
+                                    if now > cutoff_dt:
+                                        daily_att.attendance_status = 'Late'
+                                    else:
+                                        daily_att.attendance_status = 'Present'
                                 else:
-                                    daily_att.attendance_status = 'Present'
-                else:
-                    daily_att.last_check_out = now
-                    
-                if daily_att.first_check_in and daily_att.last_check_out:
-                    duration = daily_att.last_check_out - daily_att.first_check_in
-                    hours = duration.total_seconds() / 3600
-                    daily_att.total_work_hours = round(hours, 2)
-                    daily_att.overtime_hours = daily_att.compute_overtime(hours)
-                    if hours >= 8:
-                        if daily_att.attendance_status not in ['Late']:
-                            daily_att.attendance_status = 'Present'
-                    elif hours >= 4:
-                        daily_att.attendance_status = 'Half Day'
+                                    if now > shift_start_dt:
+                                        daily_att.attendance_status = 'Late'
+                                    else:
+                                        daily_att.attendance_status = 'Present'
                     else:
-                        daily_att.attendance_status = 'Absent'
+                        daily_att.last_check_out = now
                         
-                daily_att.save()
-            else:
-                daily_att, _ = DailyAttendance.objects.get_or_create(
+                    if daily_att.first_check_in and daily_att.last_check_out:
+                        duration = daily_att.last_check_out - daily_att.first_check_in
+                        hours = duration.total_seconds() / 3600
+                        daily_att.total_work_hours = round(hours, 2)
+                        daily_att.overtime_hours = daily_att.compute_overtime(hours)
+                        if hours >= 8:
+                            if daily_att.attendance_status not in ['Late']:
+                                daily_att.attendance_status = 'Present'
+                        elif hours >= 4:
+                            daily_att.attendance_status = 'Half Day'
+                        else:
+                            daily_att.attendance_status = 'Absent'
+                            
+                    daily_att.save()
+                else:
+                    daily_att, _ = DailyAttendance.objects.select_for_update().get_or_create(
+                        employee=employee,
+                        attendance_date=now.date(),
+                        defaults={'site': matched_site, 'entity': employee.entity, 'organization': employee.organization}
+                    )
+                    
+                punch = PunchLog.objects.create(
                     employee=employee,
-                    attendance_date=now.date(),
-                    defaults={'site': matched_site, 'organization': employee.entity}
+                    daily_attendance=daily_att,
+                    punch_time=now,
+                    punch_type=punch_type,
+                    source=source,
+                    latitude=lat_str,
+                    longitude=lng_str,
+                    qr_token=qr_token,
+                    verification_status=verification_status,
+                    ip_address=request.META.get('REMOTE_ADDR')
                 )
-                
-            punch = PunchLog.objects.create(
-                employee=employee,
-                daily_attendance=daily_att,
-                punch_time=now,
-                punch_type=punch_type,
-                source=source,
-                latitude=lat_str,
-                longitude=lng_str,
-                qr_token=qr_token,
-                verification_status=verification_status,
-                ip_address=request.META.get('REMOTE_ADDR')
-            )
             
             if verification_status == 'PENDING_ML_INSTALL':
                 return Response({"message": "Punch recorded securely. Pending ML biometric verification.", "status": verification_status}, status=202)
@@ -1133,7 +1136,8 @@ class AttendanceViewSet(viewsets.ViewSet):
 
                     defaults_dict = {
                         'site': employee.site,
-                        'organization': employee.entity,
+                        'entity': employee.entity,
+                        'organization': employee.organization,
                         'first_check_in': check_in,
                         'last_check_out': check_out,
                         'attendance_status': status
@@ -1270,7 +1274,8 @@ class AttendanceViewSet(viewsets.ViewSet):
                 attendance_date=target_date,
                 defaults={
                     'site': emp.site,
-                    'organization': emp.entity,
+                    'entity': emp.entity,
+                    'organization': emp.organization,
                     'attendance_status': 'Absent'
                 }
             )
@@ -1427,6 +1432,19 @@ class DailyAttendanceViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     serializer_class = DailyAttendanceSerializer
     permission_classes = [IsAuthenticated]
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        return qs.select_related(
+            'employee',
+            'employee__designation',
+            'employee__department',
+            'employee__entity',
+            'employee__site',
+            'site',
+            'entity',
+            'organization',
+        ).prefetch_related('punches')
+
     def destroy(self, request, *args, **kwargs):
         from payroll.service import LockService
         from django.db import transaction
@@ -1527,40 +1545,43 @@ class RegularizationViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             raise CustomAPIException(trace)
         
     def perform_update(self, serializer):
-        instance = serializer.save()
-        # If approved, update the DailyAttendance
-        if instance.status == 'Approved':
-            daily_att, _ = DailyAttendance.objects.get_or_create(
-                employee=instance.employee,
-                attendance_date=instance.attendance_date,
-                defaults={
-                    'site': instance.employee.site,
-                    'organization': instance.employee.entity,
-                }
-            )
-            daily_att.first_check_in = instance.requested_check_in
-            daily_att.last_check_out = instance.requested_check_out
-            
-            # Recalculate rules on regularization
-            shift_start = instance.requested_check_in.replace(hour=9, minute=30, second=0, microsecond=0)
-            if instance.requested_check_in > shift_start:
-                daily_att.attendance_status = 'Late'
-            else:
-                daily_att.attendance_status = 'Present'
-            
-            duration = daily_att.last_check_out - daily_att.first_check_in
-            hours = duration.total_seconds() / 3600
-            daily_att.total_work_hours = round(hours, 2)
-            daily_att.overtime_hours = daily_att.compute_overtime(hours)
-            if hours >= 8:
-                if daily_att.attendance_status not in ['Late']:
-                    daily_att.attendance_status = 'Present'
-            elif hours >= 4:
-                daily_att.attendance_status = 'Half Day'
-            else:
-                daily_att.attendance_status = 'Absent'
+        from django.db import transaction
+        with transaction.atomic():
+            instance = serializer.save()
+            # If approved, update the DailyAttendance
+            if instance.status == 'Approved':
+                daily_att, _ = DailyAttendance.objects.select_for_update().get_or_create(
+                    employee=instance.employee,
+                    attendance_date=instance.attendance_date,
+                    defaults={
+                        'site': instance.employee.site,
+                        'entity': instance.employee.entity,
+                        'organization': instance.employee.organization,
+                    }
+                )
+                daily_att.first_check_in = instance.requested_check_in
+                daily_att.last_check_out = instance.requested_check_out
                 
-            daily_att.save()
+                # Recalculate rules on regularization
+                shift_start = instance.requested_check_in.replace(hour=9, minute=30, second=0, microsecond=0)
+                if instance.requested_check_in > shift_start:
+                    daily_att.attendance_status = 'Late'
+                else:
+                    daily_att.attendance_status = 'Present'
+                
+                duration = daily_att.last_check_out - daily_att.first_check_in
+                hours = duration.total_seconds() / 3600
+                daily_att.total_work_hours = round(hours, 2)
+                daily_att.overtime_hours = daily_att.compute_overtime(hours)
+                if hours >= 8:
+                    if daily_att.attendance_status not in ['Late']:
+                        daily_att.attendance_status = 'Present'
+                elif hours >= 4:
+                    daily_att.attendance_status = 'Half Day'
+                else:
+                    daily_att.attendance_status = 'Absent'
+                    
+                daily_att.save()
 
 from .models import ShiftDefinition, ShiftAssignment
 from .serializers import ShiftDefinitionSerializer, ShiftAssignmentSerializer

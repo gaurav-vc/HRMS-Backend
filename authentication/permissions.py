@@ -1,12 +1,29 @@
 from rest_framework import permissions
 
 
+def coerce_permission_bool(val):
+    """
+    Canonically coerces any dynamic permission value (bool, int, str) to a strict boolean.
+    Accepts True, 1, 'true', '1', 'yes', 't' (case-insensitive, trimmed).
+    Returns False for all other values (including None, False, 0, 'false', '0', 'no', '').
+    """
+    if val is True or val == 1:
+        return True
+    if isinstance(val, str):
+        return val.strip().lower() in ('true', '1', 'yes', 't')
+    return False
+
+
 def _is_truthy(val):
-    return val in (True, 'true', 'True', 1, '1')
+    return coerce_permission_bool(val)
 
 
 def _has_view_perm(val):
-    return val in (True, 'true', 'True', 1, '1', 'self', 'selected_entities', 'all')
+    if val is True or val == 1:
+        return True
+    if isinstance(val, str):
+        return val.strip().lower() in ('true', '1', 'yes', 't', 'self', 'selected_entities', 'all')
+    return False
 
 
 def check_user_permission(user, permission_name):
@@ -275,76 +292,103 @@ def _get_tenant_site(user):
     """
     Returns the primary Main Site (created in Super Admin Sites with is_sub_site=False)
     that acts as the root multi-tenant boundary for `user`.
+    Memoized per request on user._cached_tenant_site.
     """
     if not user or not user.is_authenticated:
         return None
 
+    if hasattr(user, '_cached_tenant_site'):
+        return user._cached_tenant_site
+
     from organisation.models import Site
 
-    # 1. Direct contact email match for Main Site (Super Admin Site)
-    main_site = Site.objects.filter(contact_email=user.email, is_sub_site=False).first()
-    if main_site:
-        return main_site
+    user_email = (user.email or '').strip().lower()
+
+    # 1. Direct contact email match for Main Site (Super Admin Site, case-insensitive)
+    if user_email:
+        main_site = Site.objects.filter(contact_email__iexact=user_email, is_sub_site=False).first()
+        if main_site:
+            user._cached_tenant_site = main_site
+            return main_site
 
     # 2. Match via employee profile
     employee = getattr(user, 'employee_profile', None)
+    if not employee and user_email:
+        from employees.models import Employee
+        employee = Employee.objects.filter(email__iexact=user_email).first()
+        if employee:
+            user.employee_profile = employee
+
     if employee:
         # Check employee's primary site
         if employee.site:
+            res = employee.site
             if not employee.site.is_sub_site:
-                return employee.site
-            # If assigned to a sub-site, find parent main site
-            if employee.site.parent_site:
-                return employee.site.parent_site
-            enrolled_main = employee.enrolled_sites.filter(is_sub_site=False).first()
-            if enrolled_main:
-                return enrolled_main
-            if employee.site.branch:
-                branch_main = Site.objects.filter(branch=employee.site.branch, is_sub_site=False).first()
-                if branch_main:
-                    return branch_main
-            if employee.site.organization:
-                org_main = Site.objects.filter(organization=employee.site.organization, is_sub_site=False).first()
-                if org_main:
-                    return org_main
-            return employee.site
+                res = employee.site
+            elif employee.site.parent_site:
+                res = employee.site.parent_site
+            else:
+                enrolled_main = employee.enrolled_sites.filter(is_sub_site=False).first()
+                if enrolled_main:
+                    res = enrolled_main
+                elif employee.site.branch:
+                    branch_main = Site.objects.filter(branch=employee.site.branch, is_sub_site=False).first()
+                    res = branch_main if branch_main else employee.site
+                elif employee.site.organization:
+                    org_main = Site.objects.filter(organization=employee.site.organization, is_sub_site=False).first()
+                    res = org_main if org_main else employee.site
+            user._cached_tenant_site = res
+            return res
 
         # Check enrolled sites for main site
         enrolled_main = employee.enrolled_sites.filter(is_sub_site=False).first()
         if enrolled_main:
+            user._cached_tenant_site = enrolled_main
             return enrolled_main
 
         # Fallback if employee has no direct site: resolve from branch or entity or organization
         if employee.branch_id:
             branch_main = Site.objects.filter(branch_id=employee.branch_id, is_sub_site=False).first()
             if branch_main:
+                user._cached_tenant_site = branch_main
                 return branch_main
             branch_site = Site.objects.filter(branch_id=employee.branch_id).first()
             if branch_site:
-                return branch_site.parent_site if (branch_site.is_sub_site and branch_site.parent_site) else branch_site
+                res = branch_site.parent_site if (branch_site.is_sub_site and branch_site.parent_site) else branch_site
+                user._cached_tenant_site = res
+                return res
 
         if employee.entity_id:
             entity_site = Site.objects.filter(branch__entity_id=employee.entity_id, is_sub_site=False).first()
             if entity_site:
+                user._cached_tenant_site = entity_site
                 return entity_site
             entity_site_any = Site.objects.filter(branch__entity_id=employee.entity_id).first()
             if entity_site_any:
-                return entity_site_any.parent_site if (entity_site_any.is_sub_site and entity_site_any.parent_site) else entity_site_any
+                res = entity_site_any.parent_site if (entity_site_any.is_sub_site and entity_site_any.parent_site) else entity_site_any
+                user._cached_tenant_site = res
+                return res
 
         if employee.organization_id:
             org_main = Site.objects.filter(organization_id=employee.organization_id, is_sub_site=False).first()
             if org_main:
+                user._cached_tenant_site = org_main
                 return org_main
             org_any = Site.objects.filter(organization_id=employee.organization_id).first()
             if org_any:
-                return org_any.parent_site if (org_any.is_sub_site and org_any.parent_site) else org_any
+                res = org_any.parent_site if (org_any.is_sub_site and org_any.parent_site) else org_any
+                user._cached_tenant_site = res
+                return res
 
     # 3. Fallback: any site matching contact email
-    contact_site = Site.objects.filter(contact_email=user.email).first()
-    if contact_site:
-        if contact_site.is_sub_site and contact_site.parent_site:
-            return contact_site.parent_site
-        return contact_site
+    if user_email:
+        contact_site = Site.objects.filter(contact_email__iexact=user_email).first()
+        if contact_site:
+            res = contact_site.parent_site if (contact_site.is_sub_site and contact_site.parent_site) else contact_site
+            user._cached_tenant_site = res
+            return res
+
+    user._cached_tenant_site = None
     return None
 
 
@@ -353,9 +397,13 @@ def _get_tenant_scope(user):
     Returns (all_tenant_site_ids, tenant_branch_ids, tenant_entity_ids, tenant_site)
     for strict multi-tenant boundary enforcement.
     Prevents silent query collapse when employee.site is None.
+    Memoized per request on user._cached_tenant_scope.
     """
     if not user or not user.is_authenticated:
         return set(), set(), set(), None
+
+    if hasattr(user, '_cached_tenant_scope'):
+        return user._cached_tenant_scope
 
     from organisation.models import Site, Branch, Entity
     from django.db.models import Q
@@ -378,7 +426,7 @@ def _get_tenant_scope(user):
         if tenant_site.branch_id:
             all_site_ids.update(legacy_subs.filter(branch_id=tenant_site.branch_id).values_list('id', flat=True))
         if tenant_site.contact_email:
-            all_site_ids.update(legacy_subs.filter(contact_email=tenant_site.contact_email).values_list('id', flat=True))
+            all_site_ids.update(legacy_subs.filter(contact_email__iexact=tenant_site.contact_email.strip()).values_list('id', flat=True))
 
         if tenant_site.organization_id:
             org_entities = Entity.objects.filter(organization_id=tenant_site.organization_id).values_list('id', flat=True)
@@ -429,7 +477,9 @@ def _get_tenant_scope(user):
     if not tenant_site and all_site_ids:
         tenant_site = Site.objects.filter(id__in=all_site_ids, is_sub_site=False).first() or Site.objects.filter(id__in=all_site_ids).first()
 
-    return all_site_ids, branch_ids, entity_ids, tenant_site
+    scope_res = (all_site_ids, branch_ids, entity_ids, tenant_site)
+    user._cached_tenant_scope = scope_res
+    return scope_res
 
 
 def _get_admin_sites(user):
@@ -944,6 +994,12 @@ class DataIsolationMixin:
         if the frontend didn't provide it, and prevent cross-tenant IDOR injection 
         if the client supplied foreign keys belonging to another tenant.
         """
+        # Defensive check: If the underlying viewset does not support creation
+        # (e.g., ReadOnlyModelViewSet), return 405 Method Not Allowed instead of 500 AttributeError.
+        if not hasattr(super(), 'create'):
+            from rest_framework.exceptions import MethodNotAllowed
+            raise MethodNotAllowed(request.method)
+
         if request.user.is_authenticated and not request.user.is_superuser:
             model = self.get_queryset().model
             from organisation.models import Site
@@ -999,15 +1055,9 @@ class DataIsolationMixin:
                 if hasattr(model, 'site') and not mutable_data.get('site') and target_site:
                     mutable_data['site'] = target_site
                     modified = True
-                if hasattr(model, 'organization') and not mutable_data.get('organization'):
-                    org_field = model._meta.get_field('organization')
-                    if org_field.is_relation and org_field.related_model.__name__ == 'Entity':
-                        if target_entity:
-                            mutable_data['organization'] = target_entity
-                            modified = True
-                    elif target_org:
-                        mutable_data['organization'] = target_org
-                        modified = True
+                if hasattr(model, 'organization') and not mutable_data.get('organization') and target_org:
+                    mutable_data['organization'] = target_org
+                    modified = True
                 if hasattr(model, 'entity') and not mutable_data.get('entity') and target_entity:
                     mutable_data['entity'] = target_entity
                     modified = True
@@ -1021,7 +1071,10 @@ class DataIsolationMixin:
                 headers = self.get_success_headers(serializer.data)
                 return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
                     
-        return super().create(request, *args, **kwargs)
+        if hasattr(super(), 'create'):
+            return super().create(request, *args, **kwargs)
+        from rest_framework.exceptions import MethodNotAllowed
+        raise MethodNotAllowed(request.method)
 
 # ---------------------------------------------------------------------------
 # Dynamic CRUD Permission

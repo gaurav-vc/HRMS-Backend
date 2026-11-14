@@ -7,23 +7,28 @@ from .serializers import OrganizationSerializer, InvoiceSerializer
 from django.core.mail import send_mail
 from django.conf import settings
 from django.contrib.auth.models import User
+import logging
 import random
 import string
 import threading
 from django.core.mail import send_mail
 from django.conf import settings
 
+logger = logging.getLogger(__name__)
+
 def send_mail_sync(subject, message, recipient_list):
     try:
+        sender = getattr(settings, 'DEFAULT_FROM_EMAIL', None) or getattr(settings, 'EMAIL_HOST_USER', None) or 'noreply@hrms.local'
         send_mail(
             subject,
             message,
-            getattr(settings, 'EMAIL_HOST_USER', 'noreply@vibecopilot.ai'),
+            sender,
             recipient_list,
             fail_silently=False
         )
+        logger.info(f"Provisioning notification sent to {recipient_list}")
     except Exception as e:
-        raise Exception(f"SMTP Error: {str(e)}")
+        logger.warning(f"Could not deliver email to {recipient_list} (SMTP not configured or refused): {str(e)}")
 
 def generate_random_password(length=12):
     characters = string.ascii_letters + string.digits + "!@#$%^&*"
@@ -35,12 +40,14 @@ def provision_organization_admin(org):
         if org.sub_domain and '@' in org.sub_domain:
             email = org.sub_domain
         elif org.sub_domain:
-            domain_part = org.sub_domain.replace('https://', '').replace('.peoplepulse.com', '')
-            email = f"admin@{domain_part}.peoplepulse.com"
+            domain_part = org.sub_domain.replace('https://', '').replace('http://', '').strip('/')
+            email = f"admin@{domain_part}" if '@' not in domain_part else domain_part
         else:
             return
             
     password = generate_random_password()
+    portal_url = getattr(settings, 'HRMS_PORTAL_URL', 'http://127.0.0.1:8000')
+    brand = getattr(org, 'branding_text', None) or org.name
     
     user = User.objects.filter(username=email).first()
     if user:
@@ -48,7 +55,7 @@ def provision_organization_admin(org):
             user.set_password(password)
             user.save()
         subject = f"You have been assigned as Admin for {org.name}"
-        message = f"Hello Admin,\n\nYou have been assigned as the Admin for {org.name}.\n\nWebsite URL: https://hrms.vibesandbox.live\nLogin ID: {email}\nPassword: {password if not user.is_superuser else '[Your existing password]'}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
+        message = f"Hello Admin,\n\nYou have been assigned as the Admin for {org.name}.\n\nWebsite URL: {portal_url}\nLogin ID: {email}\nPassword: {password if not user.is_superuser else '[Your existing password]'}\n\nPlease log in and change your password.\n\nBest regards,\n{brand} Administration"
         
         import threading
         threading.Thread(target=send_mail_sync, args=(subject, message, [email])).start()
@@ -78,8 +85,8 @@ def provision_organization_admin(org):
         except Exception as e:
             print(f"Failed to create employee profile: {e}")
             
-        subject = f"Welcome to VibeCopilot HRMS - Admin Credentials"
-        message = f"Hello Admin,\n\nAn account has been created for you as the Admin for {org.name}.\n\nWebsite URL: https://hrms.vibesandbox.live\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
+        subject = f"Welcome to {brand} - Admin Credentials"
+        message = f"Hello Admin,\n\nAn account has been created for you as the Admin for {org.name}.\n\nWebsite URL: {portal_url}\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\n{brand} Administration"
         
         import threading
         threading.Thread(target=send_mail_sync, args=(subject, message, [email])).start()

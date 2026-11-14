@@ -75,11 +75,19 @@ def trigger_birthday_emails():
             
             if not photo_url:
                 try:
-                    with open(r"c:\Users\MC VIP\OneDrive\Desktop\HRMS\frontend\cake.jpg", "rb") as img_file:
-                        cake_img = MIMEImage(img_file.read())
-                        cake_img.add_header('Content-ID', '<fallback_cake>')
-                        cake_img.add_header('Content-Disposition', 'inline', filename='cake.jpg')
-                        msg.attach(cake_img)
+                    import os
+                    candidate_paths = [
+                        os.path.join(settings.BASE_DIR, 'static', 'cake.jpg'),
+                        os.path.join(settings.BASE_DIR, '..', 'HRMS-frontend', 'cake.jpg'),
+                        os.path.join(settings.BASE_DIR, 'media', 'cake.jpg'),
+                    ]
+                    cake_path = next((p for p in candidate_paths if os.path.exists(p)), None)
+                    if cake_path:
+                        with open(cake_path, "rb") as img_file:
+                            cake_img = MIMEImage(img_file.read())
+                            cake_img.add_header('Content-ID', '<fallback_cake>')
+                            cake_img.add_header('Content-Disposition', 'inline', filename='cake.jpg')
+                            msg.attach(cake_img)
                 except Exception as e:
                     logger.warning(f"Could not attach cake image: {e}")
 

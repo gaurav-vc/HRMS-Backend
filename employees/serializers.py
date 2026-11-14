@@ -68,6 +68,14 @@ class EmployeeSerializer(serializers.ModelSerializer):
                 return True
             if getattr(obj.dynamic_role, 'can_manage_users', False):
                 return True
+        request = self.context.get('request')
+        if request:
+            if not hasattr(request, '_cached_wfh_emp_ids'):
+                from organisation.models import AttendancePolicy
+                request._cached_wfh_emp_ids = set(
+                    AttendancePolicy.objects.filter(wfh_employees__isnull=False).values_list('wfh_employees__id', flat=True)
+                )
+            return obj.id in request._cached_wfh_emp_ids
         from organisation.models import AttendancePolicy
         return AttendancePolicy.objects.filter(wfh_employees=obj).exists()
 

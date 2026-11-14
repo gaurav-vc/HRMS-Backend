@@ -134,7 +134,7 @@ def evaluate_component(rule, context):
         
         # Apply Proration if flagged
         if getattr(rule, 'prorate', False) and 'present_days' in context and 'total_days' in context:
-            proration_ratio = Decimal(str(context['present_days'])) / Decimal(str(context['total_days']))
+            proration_ratio = min(Decimal('1.0'), Decimal(str(context['present_days'])) / Decimal(str(context['total_days'])))
             result = Decimal(str(result)) * proration_ratio
         
         # Ensure it's a Decimal

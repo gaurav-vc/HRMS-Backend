@@ -57,7 +57,8 @@ class LeaveRequest(models.Model):
     )
 
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='leave_requests')
-    organization = models.ForeignKey(Entity, on_delete=models.SET_NULL, null=True, blank=True)
+    entity = models.ForeignKey(Entity, on_delete=models.SET_NULL, null=True, blank=True, related_name='leave_requests')
+    organization = models.ForeignKey('admin_org.Organization', on_delete=models.SET_NULL, null=True, blank=True, related_name='leave_requests')
     site = models.ForeignKey(Site, on_delete=models.SET_NULL, null=True, blank=True)
     leave_type = models.ForeignKey(LeaveType, on_delete=models.PROTECT)
     
@@ -83,6 +84,16 @@ class LeaveRequest(models.Model):
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        if self.employee:
+            if not self.entity_id and self.employee.entity_id:
+                self.entity = self.employee.entity
+            if not self.organization_id and self.employee.organization_id:
+                self.organization = self.employee.organization
+            elif not self.organization_id and self.entity and self.entity.organization_id:
+                self.organization = self.entity.organization
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.employee} - {self.leave_type} ({self.start_date} to {self.end_date})"

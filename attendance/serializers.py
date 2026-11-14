@@ -47,9 +47,26 @@ class DailyAttendanceSerializer(serializers.ModelSerializer):
 
     def _get_shift(self, obj):
         if not hasattr(obj, '_cached_shift'):
-            from attendance.models import ShiftAssignment
-            assignment = ShiftAssignment.objects.filter(employee=obj.employee, date=obj.attendance_date).first()
-            obj._cached_shift = assignment.shift if assignment else None
+            request = self.context.get('request')
+            if request:
+                if not hasattr(request, '_shift_map'):
+                    from attendance.models import ShiftAssignment
+                    assignments = ShiftAssignment.objects.filter(
+                        date=obj.attendance_date
+                    ).select_related('shift')
+                    request._shift_map = {
+                        (a.employee_id, a.date): a.shift for a in assignments
+                    }
+                obj._cached_shift = request._shift_map.get((obj.employee_id, obj.attendance_date))
+                if obj._cached_shift is None:
+                    if not hasattr(request, '_default_shift'):
+                        from attendance.models import ShiftDefinition
+                        request._default_shift = ShiftDefinition.objects.filter(is_active=True).first()
+                    obj._cached_shift = request._default_shift
+            else:
+                from attendance.models import ShiftAssignment, ShiftDefinition
+                assignment = ShiftAssignment.objects.filter(employee_id=obj.employee_id, date=obj.attendance_date).select_related('shift').first()
+                obj._cached_shift = assignment.shift if assignment else ShiftDefinition.objects.filter(is_active=True).first()
         return obj._cached_shift
 
     def get_shift_name(self, obj):

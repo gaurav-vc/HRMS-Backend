@@ -7,7 +7,8 @@ from django.dispatch import receiver
 class DailyAttendance(models.Model):
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='attendances')
     site = models.ForeignKey(Site, on_delete=models.SET_NULL, null=True, blank=True)
-    organization = models.ForeignKey(Entity, on_delete=models.SET_NULL, null=True, blank=True)
+    entity = models.ForeignKey(Entity, on_delete=models.SET_NULL, null=True, blank=True, related_name='attendances')
+    organization = models.ForeignKey('admin_org.Organization', on_delete=models.SET_NULL, null=True, blank=True, related_name='attendances')
     
     attendance_date = models.DateField()
     first_check_in = models.DateTimeField(null=True, blank=True)
@@ -27,6 +28,14 @@ class DailyAttendance(models.Model):
         unique_together = ('employee', 'attendance_date')
 
     def save(self, *args, **kwargs):
+        if self.employee:
+            if not self.entity_id and self.employee.entity_id:
+                self.entity = self.employee.entity
+            if not self.organization_id and self.employee.organization_id:
+                self.organization = self.employee.organization
+            elif not self.organization_id and self.entity and self.entity.organization_id:
+                self.organization = self.entity.organization
+
         if self.first_check_in and self.last_check_out:
             # Calculate total duration in hours
             diff = self.last_check_out - self.first_check_in

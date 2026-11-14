@@ -110,7 +110,8 @@ class Designation(models.Model):
 class AttendancePolicy(models.Model):
     employee = models.OneToOneField('employees.Employee', on_delete=models.CASCADE, related_name='attendance_policy', null=True, blank=True)
     site = models.OneToOneField(Site, on_delete=models.CASCADE, related_name='attendance_policy', null=True, blank=True)
-    organization = models.OneToOneField(Entity, on_delete=models.CASCADE, related_name='default_attendance_policy', null=True, blank=True)
+    entity = models.OneToOneField(Entity, on_delete=models.CASCADE, related_name='default_attendance_policy', null=True, blank=True)
+    organization = models.ForeignKey('admin_org.Organization', on_delete=models.CASCADE, related_name='attendance_policies', null=True, blank=True)
     
     # Policy rules
     max_late_minutes = models.IntegerField(default=15)

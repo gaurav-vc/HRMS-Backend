@@ -1,7 +1,10 @@
+import logging
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
+
+logger = logging.getLogger(__name__)
 from .models import Entity, Branch, Site, Department, Designation, Role, AttendancePolicy, PunctualitySlab
 from .serializers import (
     EntitySerializer, BranchSerializer, SiteSerializer,
@@ -384,16 +387,18 @@ def provision_contact_person(site, origin=None, is_update=False):
         print(f"Failed to create/update employee profile: {e}")
 
     if not is_update and password and password != "[Your existing password]":
-        login_url = f"{origin}/" if origin else "https://hrms.vibecopilot.ai/"
+        login_url = f"{origin}/" if origin else getattr(settings, 'HRMS_PORTAL_URL', 'http://127.0.0.1:8000')
+        brand = getattr(site.organization, 'branding_text', None) or (site.organization.name if site.organization else getattr(settings, 'APP_NAME', 'HRMS Administration'))
         subject = f"You have been assigned to Site: {site.name}"
-        message = f"Hello {site.contact_name or 'User'},\n\nYou have been assigned as the Site Admin for {site.name}.\n\nWebsite URL: {login_url}\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\nVibeCopilot Team"
+        message = f"Hello {site.contact_name or 'User'},\n\nYou have been assigned as the Site Admin for {site.name}.\n\nWebsite URL: {login_url}\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password.\n\nBest regards,\n{brand}"
         
         import threading
         def send_async():
             try:
-                send_mail(subject, message, getattr(settings, 'EMAIL_HOST_USER', 'noreply@vibecopilot.ai'), [email], fail_silently=False)
+                from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', None) or getattr(settings, 'EMAIL_HOST_USER', None) or 'noreply@hrms.local'
+                send_mail(subject, message, from_email, [email], fail_silently=False)
             except Exception as e:
-                print(f"SITE EMAIL FAILED. Google SMTP Error: {str(e)}")
+                logger.warning(f"Could not deliver site assignment email to {email}: {str(e)}")
         threading.Thread(target=send_async).start()
 
 

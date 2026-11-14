@@ -49,10 +49,11 @@ def send_leave_email_async(emp_email, emp_name, status, start_date, end_date, to
         text_content = strip_tags(html_content)
         
         try:
+            from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', None) or getattr(settings, 'EMAIL_HOST_USER', None) or 'HRMS Administration <noreply@hrms.local>'
             msg = EmailMultiAlternatives(
                 subject=subject,
                 body=text_content,
-                from_email='HRMS Admin <hr@example.com>',
+                from_email=from_email,
                 to=[emp_email]
             )
             msg.attach_alternative(html_content, "text/html")
@@ -237,7 +238,7 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     def get_queryset(self):
         qs = LeaveRequest.objects.all().order_by('-created_at')
         
-        mode = self.request.query_params.get('mode')
+        mode = getattr(self.request, 'query_params', getattr(self.request, 'GET', {})).get('mode')
         user = self.request.user
         employee = getattr(user, 'employee_profile', None)
 
@@ -263,15 +264,45 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             if all_tenant_site_ids:
                 inbox_qs = inbox_qs.filter(Q(employee__site_id__in=all_tenant_site_ids) | Q(employee__enrolled_sites__id__in=all_tenant_site_ids))
             
-            return inbox_qs.filter(q).exclude(employee=employee).distinct()
+            return inbox_qs.filter(q).exclude(employee=employee).distinct().select_related(
+                'employee',
+                'employee__designation',
+                'employee__department',
+                'employee__entity',
+                'employee__site',
+                'leave_type',
+                'site',
+                'entity',
+                'organization',
+            )
         elif mode == 'my_leaves':
             # Show only their own leaves
             if employee:
-                return qs.filter(employee=employee)
+                return qs.filter(employee=employee).select_related(
+                    'employee',
+                    'employee__designation',
+                    'employee__department',
+                    'employee__entity',
+                    'employee__site',
+                    'leave_type',
+                    'site',
+                    'entity',
+                    'organization',
+                )
             else:
                 return qs.none()
             
-        return qs
+        return qs.select_related(
+            'employee',
+            'employee__designation',
+            'employee__department',
+            'employee__entity',
+            'employee__site',
+            'leave_type',
+            'site',
+            'entity',
+            'organization',
+        )
 
     def perform_create(self, serializer):
         from django.db import transaction
@@ -349,10 +380,12 @@ class LeaveRequestViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             if total_days > config.max_consecutive_leaves and start_date.month != config.exception_month:
                 salary_deduction_days = total_days - Decimal(config.max_consecutive_leaves)
 
-            organization = getattr(employee, 'entity', None)
+            entity = getattr(employee, 'entity', None)
+            organization = getattr(employee, 'organization', None)
             site = getattr(employee, 'site', None)
             serializer.save(
                 employee=employee,
+                entity=entity,
                 organization=organization,
                 site=site,
                 total_days=total_days,

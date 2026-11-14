@@ -71,7 +71,8 @@ class DashboardStatsAPIView(APIView):
         today = timezone.localdate()
         can_view_confidential = False
         emp = getattr(user, 'employee_profile', None)
-        if emp and emp.dynamic_role and emp.dynamic_role.permissions and emp.dynamic_role.permissions.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1']:
+        from authentication.permissions import coerce_permission_bool
+        if emp and emp.dynamic_role and emp.dynamic_role.permissions and coerce_permission_bool(emp.dynamic_role.permissions.get('can_view_confidential_payroll')):
             can_view_confidential = True
         
         from authentication.permissions import isolate_queryset

@@ -125,7 +125,7 @@ class ComplianceReportViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         return response
 
 from rest_framework.decorators import action
-from .service import PayrollService
+from .service import PayrollService, PayrollPrerequisiteError
 from authentication.permissions import DataIsolationMixin
 
 def resolve_employee_salary_structure(emp, default_struct=None):
@@ -176,13 +176,14 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             emp = Employee.objects.filter(email__iexact=user.email).first()
 
         can_run = False
-        if user.is_superuser:
+        from authentication.permissions import coerce_permission_bool
+        if user.is_superuser or (emp and emp.role in ['admin', 'org_admin', 'super_admin']) or getattr(user, 'role', '') in ['admin', 'org_admin', 'super_admin']:
             can_run = True
         elif emp and emp.dynamic_role and emp.dynamic_role.permissions:
             perms = emp.dynamic_role.permissions
-            if (perms.get('can_run_payroll') in [True, 'true', 'True', 1, '1'] or
-                perms.get('can_process_payroll') in [True, 'true', 'True', 1, '1'] or
-                perms.get('can_approve_payroll') in [True, 'true', 'True', 1, '1']):
+            if (coerce_permission_bool(perms.get('can_run_payroll')) or
+                coerce_permission_bool(perms.get('can_process_payroll')) or
+                coerce_permission_bool(perms.get('can_approve_payroll'))):
                 can_run = True
 
         if not can_run:
@@ -237,6 +238,17 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             run = PayrollService.execute_run(run.id, overrides=overrides, include_variable_bonus=include_variable_bonus, include_leaves_encashment=include_leaves_encashment)
             
             return Response({'status': 'success', 'run_status': run.status, 'msg': 'Engine started in background'})
+        except PayrollPrerequisiteError as pe:
+            logger.warning(f"Payroll prerequisite check failed for run {pk}: {str(pe)}")
+            try:
+                PayrollRun.objects.filter(pk=pk, status='Processing').update(status='Draft')
+            except Exception:
+                pass
+            return Response({
+                'status': 'error',
+                'detail': f"Payroll calculation failed: {str(pe)}",
+                'missing_employees': pe.missing_employees
+            }, status=400)
         except Exception as e:
             logger.exception(f"Payroll execution failed for run {pk}: {str(e)}")
             try:
@@ -309,77 +321,82 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         if not user_can_approve(user, module='Run Payroll'):
             return Response({'error': 'Permission denied. You do not have permission to approve payroll.'}, status=403)
 
-        run = self.get_object()
-        if run.status != 'Maker-Submitted':
-            return Response({'error': 'Can only approve Maker-Submitted runs'}, status=400)
+        from django.db import transaction
+        with transaction.atomic():
+            run = PayrollRun.objects.select_for_update().filter(pk=pk).first()
+            if not run:
+                return Response({'error': 'Payroll run not found'}, status=404)
+            if run.status != 'Maker-Submitted':
+                return Response({'error': 'Can only approve Maker-Submitted runs'}, status=400)
+                
+            run.status = 'Disbursed'
+            run.checker = request.user
+            run.save(update_fields=['status', 'checker'])
             
-        run.status = 'Disbursed'
-        run.checker = request.user
-        run.save()
-        
-        # Mark approved reimbursements as Paid for employees who got a payslip in this run
-        from .models import Reimbursement
-        paid_employees = run.payslip_set.values_list('employee_id', flat=True)
-        Reimbursement.objects.filter(employee_id__in=paid_employees, status='Approved').update(status='Paid')
+            # Mark approved reimbursements as Paid for employees who got a payslip in this run
+            from .models import Reimbursement
+            paid_employees = list(run.payslip_set.values_list('employee_id', flat=True))
+            Reimbursement.objects.filter(employee_id__in=paid_employees, status='Approved').update(status='Paid')
 
-        # Credit Employee Wallets & Post Ledger Entries for Security Deposits
-        from decimal import Decimal
-        import decimal
-        from .models import PayslipLineItem, EmployeeWallet, WalletLedgerEntry
-        wallet_lines = PayslipLineItem.objects.filter(
-            payslip__run=run,
-            rule__name="Security Deposit (Wallet)"
-        ).select_related('payslip__employee')
+            # Credit Employee Wallets & Post Ledger Entries for Security Deposits
+            from decimal import Decimal
+            import decimal
+            from .models import PayslipLineItem, EmployeeWallet, WalletLedgerEntry
+            wallet_lines = PayslipLineItem.objects.filter(
+                payslip__run=run,
+                rule__name="Security Deposit (Wallet)"
+            ).select_related('payslip__employee')
 
-        for item in wallet_lines:
-            emp = item.payslip.employee
-            amt = Decimal(str(item.amount or '0.00')).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
-            if amt > Decimal('0.00'):
-                wallet, _ = EmployeeWallet.objects.get_or_create(employee=emp)
-                if not WalletLedgerEntry.objects.filter(wallet=wallet, payroll_run=run).exists():
-                    new_bal = (wallet.current_balance + amt).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
-                    wallet.current_balance = new_bal
-                    wallet.save(update_fields=['current_balance', 'updated_at'])
-                    WalletLedgerEntry.objects.create(
-                        wallet=wallet,
-                        payroll_run=run,
-                        period=run.period,
-                        transaction_type='SALARY_DEDUCTION',
-                        amount=amt,
-                        balance_after=new_bal,
-                        notes=f"Security deposit deduction from payroll {run.period}"
-                    )
+            for item in wallet_lines:
+                emp = item.payslip.employee
+                amt = Decimal(str(item.amount or '0.00')).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+                if amt > Decimal('0.00'):
+                    wallet, _ = EmployeeWallet.objects.select_for_update().get_or_create(employee=emp)
+                    if not WalletLedgerEntry.objects.filter(wallet=wallet, payroll_run=run).exists():
+                        new_bal = (wallet.current_balance + amt).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+                        wallet.current_balance = new_bal
+                        wallet.save(update_fields=['current_balance', 'updated_at'])
+                        WalletLedgerEntry.objects.create(
+                            wallet=wallet,
+                            payroll_run=run,
+                            period=run.period,
+                            transaction_type='SALARY_DEDUCTION',
+                            amount=amt,
+                            balance_after=new_bal,
+                            notes=f"Security deposit deduction from payroll {run.period}"
+                        )
 
-        # Inactivate and link Disciplinary Memos deducted in this payroll run
-        from .models import EmployeeDisciplinaryMemo
-        paid_slips = run.payslip_set.all().select_related('employee')
-        slip_by_emp = {s.employee_id: s for s in paid_slips}
-        pending_memos = EmployeeDisciplinaryMemo.objects.filter(
-            employee_id__in=paid_employees,
-            status='PENDING',
-            is_active=True
-        )
-        for memo in pending_memos:
-            matching_slip = slip_by_emp.get(memo.employee_id)
-            if matching_slip:
-                memo.status = 'DEDUCTED'
-                memo.is_active = False
-                memo.payroll_run = run
-                memo.payslip = matching_slip
-                memo.deducted_at = timezone.now()
-                memo.save(update_fields=['status', 'is_active', 'payroll_run', 'payslip', 'deducted_at', 'updated_at'])
-        
-        comment_text = request.data.get('comment', 'Approved')
-        from .models import PayrollRunComment
-        PayrollRunComment.objects.create(
-            run=run,
-            author=request.user,
-            comment=f"Approved: {comment_text}" if comment_text and comment_text != 'Approved' else "Approved"
-        )
+            # Inactivate and link Disciplinary Memos deducted in this payroll run
+            from .models import EmployeeDisciplinaryMemo
+            paid_slips = run.payslip_set.all().select_related('employee')
+            slip_by_emp = {s.employee_id: s for s in paid_slips}
+            pending_memos = EmployeeDisciplinaryMemo.objects.filter(
+                employee_id__in=paid_employees,
+                status='PENDING',
+                is_active=True
+            )
+            for memo in pending_memos:
+                matching_slip = slip_by_emp.get(memo.employee_id)
+                if matching_slip:
+                    memo.status = 'DEDUCTED'
+                    memo.is_active = False
+                    memo.payroll_run = run
+                    memo.payslip = matching_slip
+                    memo.deducted_at = timezone.now()
+                    memo.save(update_fields=['status', 'is_active', 'payroll_run', 'payslip', 'deducted_at', 'updated_at'])
+            
+            comment_text = request.data.get('comment', 'Approved')
+            from .models import PayrollRunComment
+            PayrollRunComment.objects.create(
+                run=run,
+                author=request.user,
+                comment=f"Approved: {comment_text}" if comment_text and comment_text != 'Approved' else "Approved"
+            )
         
         from employees.models import Notification
+        from authentication.permissions import coerce_permission_bool
         for emp in Employee.objects.filter(status='Active'):
-            if emp.dynamic_role and emp.dynamic_role.permissions and emp.dynamic_role.permissions.get('can_release_salary') in [True, 'true', 'True', 1, '1']:
+            if emp.dynamic_role and emp.dynamic_role.permissions and coerce_permission_bool(emp.dynamic_role.permissions.get('can_release_salary')):
                 Notification.objects.create(
                     recipient=emp,
                     title="Payroll Approved",
@@ -404,23 +421,27 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         if not user_can_approve(user, module='Run Payroll'):
             return Response({'error': 'Permission denied. You do not have permission to reject payroll.'}, status=403)
 
-        run = self.get_object()
-        if run.status != 'Maker-Submitted':
-            return Response({'error': 'Can only reject Maker-Submitted runs'}, status=400)
-            
         comment_text = request.data.get('comment')
         if not comment_text:
             return Response({'error': 'Comment is required'}, status=400)
-            
-        from .models import PayrollRunComment
-        PayrollRunComment.objects.create(
-            run=run,
-            author=request.user,
-            comment=comment_text
-        )
-            
-        run.status = 'Draft'
-        run.save()
+
+        from django.db import transaction
+        with transaction.atomic():
+            run = PayrollRun.objects.select_for_update().filter(pk=pk).first()
+            if not run:
+                return Response({'error': 'Payroll run not found'}, status=404)
+            if run.status != 'Maker-Submitted':
+                return Response({'error': 'Can only reject Maker-Submitted runs'}, status=400)
+                
+            from .models import PayrollRunComment
+            PayrollRunComment.objects.create(
+                run=run,
+                author=request.user,
+                comment=comment_text
+            )
+                
+            run.status = 'Draft'
+            run.save(update_fields=['status'])
         
         if run.maker and hasattr(run.maker, 'employee_profile'):
             from employees.models import Notification
@@ -464,7 +485,8 @@ class SalarySlipAPIView(APIView):
                 if emp_profile:
                     if emp_profile.dynamic_role and emp_profile.dynamic_role.permissions:
                         perms = emp_profile.dynamic_role.permissions
-                        can_view_confidential = perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1'] or perms.get('can_view_confidential') in [True, 'true', 'True', 1, '1']
+                        from authentication.permissions import coerce_permission_bool
+                        can_view_confidential = coerce_permission_bool(perms.get('can_view_confidential_payroll')) or coerce_permission_bool(perms.get('can_view_confidential'))
                     elif emp_profile.role in ['admin', 'org_admin'] or getattr(emp_profile, 'is_admin', False):
                         can_view_confidential = True
             
@@ -978,9 +1000,14 @@ class PayslipEmailView(APIView):
                 pdf_bytes = buffer.getvalue()
                 buffer.close()
             
+            org_brand = None
+            if hasattr(slip.employee, 'organization') and slip.employee.organization:
+                org_brand = getattr(slip.employee.organization, 'branding_text', None) or slip.employee.organization.name
+            brand_name = org_brand or getattr(settings, 'APP_NAME', 'HRMS Management')
+
             email = EmailMessage(
                 f"Your Payslip for {slip.period}",
-                f"Hello {slip.employee.first_name},\n\nPlease find attached your payslip for the period {slip.period}.\n\nRegards,\nHRMS PeoplePulse",
+                f"Hello {slip.employee.first_name},\n\nPlease find attached your payslip for the period {slip.period}.\n\nRegards,\n{brand_name}",
                 settings.EMAIL_HOST_USER,
                 [slip.employee.email]
             )
@@ -1010,7 +1037,7 @@ class PayrollPreviewAPIView(APIView):
             user = request.user
             can_view_confidential = False
             if user and user.is_authenticated:
-                if user.is_superuser:
+                if user.is_superuser or getattr(user, 'role', '') in ['admin', 'org_admin', 'super_admin']:
                     can_view_confidential = True
                 else:
                     emp = getattr(user, 'employee_profile', None)
@@ -1019,7 +1046,8 @@ class PayrollPreviewAPIView(APIView):
                             can_view_confidential = True
                         elif emp.dynamic_role and emp.dynamic_role.permissions:
                             perms = emp.dynamic_role.permissions
-                            can_view_confidential = perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1'] or perms.get('can_view_confidential') in [True, 'true', 'True', 1, '1']
+                            from authentication.permissions import coerce_permission_bool
+                            can_view_confidential = coerce_permission_bool(perms.get('can_view_confidential_payroll')) or coerce_permission_bool(perms.get('can_view_confidential'))
                         elif emp.role in ['admin', 'org_admin'] or getattr(emp, 'is_admin', False):
                             can_view_confidential = True
             
@@ -1031,7 +1059,7 @@ class PayrollPreviewAPIView(APIView):
             from decimal import Decimal
 
             if entity_param and entity_param != '__all__':
-                entity_ids = entity_param.split(',')
+                entity_ids = [int(x.strip()) for x in entity_param.split(',') if x.strip().isdigit()]
                 entities = Entity.objects.filter(id__in=entity_ids)
             else:
                 entities = Entity.objects.all()
@@ -1576,7 +1604,6 @@ class EmployeeWalletViewSet(DataIsolationMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], url_path='adjust-balance')
     def adjust_balance(self, request, pk=None):
-        wallet = self.get_object()
         amount_str = request.data.get('amount')
         txn_type = request.data.get('transaction_type', 'MANUAL_ADJUSTMENT')
         notes = request.data.get('notes', 'Manual adjustment')
@@ -1584,19 +1611,24 @@ class EmployeeWalletViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             return Response({'error': 'amount is required'}, status=400)
         from decimal import Decimal
         import decimal
-        adj_amount = Decimal(str(amount_str)).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
-        new_balance = (wallet.current_balance + adj_amount).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
-        wallet.current_balance = max(Decimal('0.00'), new_balance)
-        wallet.save(update_fields=['current_balance', 'updated_at'])
+        from django.db import transaction
+        with transaction.atomic():
+            wallet = EmployeeWallet.objects.select_for_update().filter(pk=pk).first()
+            if not wallet:
+                return Response({'error': 'Wallet not found'}, status=404)
+            adj_amount = Decimal(str(amount_str)).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+            new_balance = (wallet.current_balance + adj_amount).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+            wallet.current_balance = max(Decimal('0.00'), new_balance)
+            wallet.save(update_fields=['current_balance', 'updated_at'])
 
-        WalletLedgerEntry.objects.create(
-            wallet=wallet,
-            period=timezone.now().strftime('%Y-%m'),
-            transaction_type=txn_type,
-            amount=adj_amount,
-            balance_after=wallet.current_balance,
-            notes=notes
-        )
+            WalletLedgerEntry.objects.create(
+                wallet=wallet,
+                period=timezone.now().strftime('%Y-%m'),
+                transaction_type=txn_type,
+                amount=adj_amount,
+                balance_after=wallet.current_balance,
+                notes=notes
+            )
         return Response(EmployeeWalletSerializer(wallet).data)
 
 

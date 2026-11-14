@@ -10,6 +10,12 @@ from .models import (
 )
 from .engine import build_dag_and_sort, evaluate_component, calculate_tds
 
+class PayrollPrerequisiteError(ValueError):
+    """Raised when active employees within a payroll run entity lack required salary structures or CTC."""
+    def __init__(self, message, missing_employees=None):
+        super().__init__(message)
+        self.missing_employees = missing_employees or []
+
 class LockService:
     @staticmethod
     def get_employee_entity(employee):
@@ -174,7 +180,10 @@ class PayrollService:
             'lop_map': lop_map,
             'ytd_map': ytd_map,
             'reimb_map': reimb_map,
-            'month': month
+            'month': month,
+            'year': year,
+            'start_date': start_date,
+            'end_date': end_date,
         }
 
     @staticmethod
@@ -183,6 +192,26 @@ class PayrollService:
         
         total_days = precomputed_data.get('total_days', 30)
         free_paid_days = precomputed_data.get('free_paid_days', 8)
+        start_date = precomputed_data.get('start_date')
+        end_date = precomputed_data.get('end_date')
+
+        # 1. Period Eligibility (respecting employee Date of Joining and Exit Relieving Date)
+        period_eligible_days = float(total_days)
+        if start_date and end_date:
+            emp_doj = getattr(employee, 'doj', None)
+            if emp_doj:
+                if emp_doj > end_date:
+                    period_eligible_days = 0.0
+                elif emp_doj > start_date:
+                    period_eligible_days = float((end_date - emp_doj).days + 1)
+            
+            exit_proc = getattr(employee, 'exit_process', None)
+            if exit_proc and getattr(exit_proc, 'relieving_date', None):
+                relieving = exit_proc.relieving_date
+                if relieving < start_date:
+                    period_eligible_days = 0.0
+                elif relieving < end_date:
+                    period_eligible_days = min(period_eligible_days, float((relieving - start_date).days + 1))
         
         emp_att = precomputed_data.get('att_map', {}).get(employee.id, {})
         present_count = emp_att.get('present_count', 0)
@@ -222,15 +251,27 @@ class PayrollService:
             elif 'presentDays' in emp_override: present_count = float(emp_override['presentDays'] or 0)
         
         worked_days = float(present_count) + (float(half_day_count) * 0.5)
-        
-        if worked_days == 0 and paid_leave_days == 0 and not emp_override:
+        total_att_records = float(present_count) + float(late_count) + float(half_day_count) + float(absent_count)
+
+        # 2. Determine payable days cleanly
+        if period_eligible_days <= 0.0:
             calculated_paid_days = 0.0
+        elif total_att_records > 0:
+            # Daily punch logs exist for this employee
+            if worked_days == 0 and paid_leave_days == 0 and absent_count >= period_eligible_days:
+                calculated_paid_days = 0.0
+            else:
+                calculated_paid_days = max(
+                    0.0,
+                    period_eligible_days - float(absent_count) - (float(half_day_count) * 0.5) - float(lop_days) - float(late_penalty_days)
+                )
         else:
-            calculated_paid_days = float(total_days) - float(absent_count) - (float(half_day_count) * 0.5) - float(lop_days) - float(late_penalty_days)
+            # Exception-based attendance: active contracts receive standard monthly pay minus approved LOP
+            calculated_paid_days = max(0.0, period_eligible_days - float(lop_days))
             
         # Determine payable days with 100% mathematical precision
-        calculated_override_payable = max(0.0, float(total_days) - float(lop_days) - (float(half_day_count) * 0.5) - float(late_penalty_days))
-        calculated_override_payable = min(calculated_override_payable, float(total_days))
+        calculated_override_payable = max(0.0, period_eligible_days - float(lop_days) - (float(half_day_count) * 0.5) - float(late_penalty_days))
+        calculated_override_payable = min(calculated_override_payable, period_eligible_days)
 
         if emp_override:
             user_days_paid = None
@@ -703,6 +744,17 @@ class PayrollService:
                             if default_struct:
                                 emp.salary_structure = default_struct
                                 emp._cached_dag = dag_cache.get(default_struct.id, [])
+
+                        # Dynamic validation: if employee lacks valid CTC or salary structure, record in PayrollException and skip
+                        if not emp.salary_structure or not emp.salary_structure.components.exists() or not emp.ctc or emp.ctc <= 0:
+                            if not is_simulation:
+                                exceptions.append(PayrollException(
+                                    run=run,
+                                    employee=emp,
+                                    error_trace=f"Skipped in payroll run: Employee {emp.code} has missing Salary Structure or CTC (Current CTC: {emp.ctc or 0}).",
+                                    resolved=False
+                                ))
+                            continue
                             
                         emp_override = None
                         if overrides:
@@ -746,39 +798,49 @@ class PayrollService:
                         if not is_simulation:
                             exceptions.append(PayrollException(run=run, employee=emp, error_trace=str(e), resolved=False))
                 
-                # BATCH INSERTS
-                if is_simulation:
-                    created_slips = SimulatedPayslip.objects.bulk_create(slips_to_create, batch_size=5000)
-                    line_objects = []
-                    for slip, lines in zip(created_slips, slip_lines_data):
-                        line_objects.extend([SimulatedLineItem(payslip=slip, rule=item['rule'], amount=item['amount']) for item in lines])
-                    SimulatedLineItem.objects.bulk_create(line_objects, batch_size=5000)
-                else:
-                    created_slips = Payslip.objects.bulk_create(slips_to_create, batch_size=5000)
-                    line_objects = []
-                    alloc_objects = []
-                    for slip, lines, allocs in zip(created_slips, slip_lines_data, allocations_data):
-                        line_objects.extend([PayslipLineItem(payslip=slip, rule=item['rule'], amount=item['amount']) for item in lines])
-                        alloc_objects.extend([PayslipAllocationSnapshot(payslip=slip, cost_center=a.cost_center, percentage=a.percentage) for a in allocs])
-                    PayslipLineItem.objects.bulk_create(line_objects, batch_size=5000)
-                    PayslipAllocationSnapshot.objects.bulk_create(alloc_objects, batch_size=5000)
-                    if exceptions:
-                        PayrollException.objects.bulk_create(exceptions, batch_size=5000)
-                
-                if not is_simulation:
-                    # Resolve fixed exceptions
-                    successful_emp_ids = [s.employee_id for s in slips_to_create]
-                    PayrollException.objects.filter(run=run, employee_id__in=successful_emp_ids).update(resolved=True)
-                            
-                has_exceptions = PayrollException.objects.filter(run=run, resolved=False).exists()
-                if has_exceptions:
-                    run.status = 'Maker-Submitted' # Still submit so approvers can reject/fix
-                else:
+                # BATCH INSERTS (Transaction-protected)
+                from django.db import transaction
+                with transaction.atomic():
+                    if is_simulation:
+                        created_slips = SimulatedPayslip.objects.bulk_create(slips_to_create, batch_size=5000)
+                        line_objects = []
+                        for slip, lines in zip(created_slips, slip_lines_data):
+                            line_objects.extend([SimulatedLineItem(payslip=slip, rule=item['rule'], amount=item['amount']) for item in lines])
+                        SimulatedLineItem.objects.bulk_create(line_objects, batch_size=5000)
+                    else:
+                        created_slips = Payslip.objects.bulk_create(slips_to_create, batch_size=5000)
+                        line_objects = []
+                        alloc_objects = []
+                        for slip, lines, allocs in zip(created_slips, slip_lines_data, allocations_data):
+                            line_objects.extend([PayslipLineItem(payslip=slip, rule=item['rule'], amount=item['amount']) for item in lines])
+                            alloc_objects.extend([PayslipAllocationSnapshot(payslip=slip, cost_center=a.cost_center, percentage=a.percentage) for a in allocs])
+                        PayslipLineItem.objects.bulk_create(line_objects, batch_size=5000)
+                        PayslipAllocationSnapshot.objects.bulk_create(alloc_objects, batch_size=5000)
+                        if exceptions:
+                            PayrollException.objects.bulk_create(exceptions, batch_size=5000)
+                    
+                    if not is_simulation:
+                        # Resolve fixed exceptions
+                        successful_emp_ids = [s.employee_id for s in slips_to_create]
+                        PayrollException.objects.filter(run=run, employee_id__in=successful_emp_ids).update(resolved=True)
+                                
+                    has_exceptions = PayrollException.objects.filter(run=run, resolved=False).exists()
                     run.status = 'Maker-Submitted'
+                    run.save(update_fields=['status'])
                     # Notify Approvers
                     from employees.models import Notification
-                    for approver in Employee.objects.filter(status='Active'):
-                        if approver.dynamic_role and approver.dynamic_role.permissions and approver.dynamic_role.permissions.get('can_approve_payroll') in [True, 'true', 'True', 1, '1']:
+
+                    from authentication.permissions import coerce_permission_bool
+                    for approver in Employee.objects.filter(status="Active"):
+                        if (
+                            approver.dynamic_role
+                            and approver.dynamic_role.permissions
+                            and coerce_permission_bool(
+                                approver.dynamic_role.permissions.get(
+                                    "can_approve_payroll"
+                                )
+                            )
+                        ):
                             Notification.objects.create(
                                 recipient=approver,
                                 title="Payroll Ready for Review",
@@ -787,7 +849,8 @@ class PayrollService:
                             )
                 run.save()
             finally:
-                connection.close()
+                if is_simulation:
+                    connection.close()
                 
         if is_simulation:
             thread = threading.Thread(target=worker)
@@ -809,17 +872,37 @@ class PayrollService:
         active_emps = Employee.objects.filter(
             Q(entity=run.entity) | Q(branch__entity=run.entity) | Q(site__branch__entity=run.entity),
             status='Active'
-        ).select_related('salary_structure').prefetch_related('salary_structure__components')
+        ).select_related('salary_structure', 'department', 'designation').prefetch_related('salary_structure__components')
         
         missing_records = []
+        missing_employees = []
         for emp in active_emps:
+            missing_fields = []
             if not emp.salary_structure or emp.salary_structure.components.count() == 0:
                 missing_records.append(f"{emp.code} (Missing Salary Structure)")
-            elif not emp.ctc or emp.ctc <= 0:
+                missing_fields.append("Salary Structure")
+            if not emp.ctc or emp.ctc <= 0:
                 missing_records.append(f"{emp.code} (Missing CTC)")
+                missing_fields.append("CTC")
                 
-        if missing_records:
-            raise ValueError(f"Cannot execute payroll. {len(missing_records)} active employee(s) have missing configuration: {', '.join(missing_records[:5])}")
+            if missing_fields:
+                missing_employees.append({
+                    'id': emp.id,
+                    'code': emp.code or f"EMP{emp.id}",
+                    'name': f"{emp.first_name} {emp.last_name}".strip() or "Unnamed",
+                    'department': emp.department.name if getattr(emp, 'department', None) else 'N/A',
+                    'designation': emp.designation.title if getattr(emp, 'designation', None) else 'N/A',
+                    'entity': run.entity.name if run.entity else 'N/A',
+                    'entity_id': run.entity.id if run.entity else None,
+                    'missing': missing_fields,
+                    'missing_salary_structure': "Salary Structure" in missing_fields,
+                    'missing_ctc': "CTC" in missing_fields,
+                })
+                
+        valid_emps_count = sum(1 for e in active_emps if (e.salary_structure and e.salary_structure.components.exists() and e.ctc and e.ctc > 0))
+        if valid_emps_count == 0:
+            msg = f"Cannot execute payroll. None of the {len(active_emps)} active employees have a configured CTC and Salary Structure."
+            raise PayrollPrerequisiteError(msg, missing_employees=missing_employees)
 
         run.status = 'Processing'
         run.save()

@@ -265,7 +265,8 @@ class WalletPolicy(models.Model):
         ('FIXED', 'Fixed Monthly Amount (₹)'),
     )
     site = models.OneToOneField('organisation.Site', on_delete=models.CASCADE, related_name='wallet_policy', null=True, blank=True)
-    organization = models.OneToOneField('organisation.Entity', on_delete=models.CASCADE, related_name='default_wallet_policy', null=True, blank=True)
+    entity = models.OneToOneField('organisation.Entity', on_delete=models.CASCADE, related_name='default_wallet_policy', null=True, blank=True)
+    organization = models.ForeignKey('admin_org.Organization', on_delete=models.CASCADE, related_name='wallet_policies', null=True, blank=True)
     is_enabled = models.BooleanField(default=False)
     deduction_basis = models.CharField(max_length=10, choices=BASIS_CHOICES, default='GROSS')
     deduction_rate = models.DecimalField(max_digits=7, decimal_places=2, default=10.00, help_text="e.g. 10.00 for 10%")
@@ -324,7 +325,8 @@ class WalletLedgerEntry(models.Model):
 # ==========================================
 
 class DisciplinaryInfractionCategory(models.Model):
-    organization = models.ForeignKey(Entity, on_delete=models.SET_NULL, null=True, blank=True, related_name='disciplinary_categories')
+    entity = models.ForeignKey(Entity, on_delete=models.SET_NULL, null=True, blank=True, related_name='disciplinary_categories')
+    organization = models.ForeignKey('admin_org.Organization', on_delete=models.SET_NULL, null=True, blank=True, related_name='disciplinary_categories')
     name = models.CharField(max_length=150)
     code = models.CharField(max_length=50, blank=True)
     description = models.TextField(blank=True, null=True)

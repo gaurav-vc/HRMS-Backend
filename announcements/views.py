@@ -243,7 +243,7 @@ class AnnouncementViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 if not recipients:
                     return
 
-                login_url = getattr(settings, 'HRMS_PORTAL_URL', "https://hrms.vibecopilot.ai/")
+                login_url = getattr(settings, 'HRMS_PORTAL_URL', "http://127.0.0.1:8000")
                 subject = f"[{announcement.priority.upper()}] Announcement: {announcement.title}"
                 has_attachment = bool(announcement.attachment)
                 org_label = announcement.entity.name if announcement.entity else "Organization Team"
@@ -265,10 +265,11 @@ Portal URL: {login_url}
 Best regards,
 {org_label}
 """
+                sender = getattr(settings, 'DEFAULT_FROM_EMAIL', None) or getattr(settings, 'EMAIL_HOST_USER', None) or 'noreply@hrms.local'
                 send_mail(
                     subject,
                     body,
-                    getattr(settings, 'DEFAULT_FROM_EMAIL', 'noreply@vibecopilot.ai'),
+                    sender,
                     list(recipients),
                     fail_silently=True
                 )

@@ -20,6 +20,19 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     serializer_class = EmployeeSerializer
     permission_classes = [IsAuthenticated]
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        return qs.select_related(
+            'department',
+            'designation',
+            'dynamic_role',
+            'site',
+            'entity',
+            'organization',
+            'salary_structure',
+            'manager',
+        ).prefetch_related('enrolled_sites')
+
     @action(detail=False, methods=['POST'], parser_classes=[CamelCaseMultiPartParser, CamelCaseFormParser])
     def bulk_import(self, request):
         file_obj = request.FILES.get('file')
@@ -366,8 +379,9 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             print(f"Failed to create Org Engine node for employee: {e}")
 
         # 7. CTC Notification Workflow
+        from authentication.permissions import coerce_permission_bool
         creator_profile = getattr(req_user, 'employee_profile', None)
-        creator_has_ctc = req_user.is_superuser or (creator_profile and creator_profile.dynamic_role and creator_profile.dynamic_role.permissions and creator_profile.dynamic_role.permissions.get('can_add_ctc') in [True, 'true', 'True', 1, '1'])
+        creator_has_ctc = req_user.is_superuser or (creator_profile and creator_profile.dynamic_role and creator_profile.dynamic_role.permissions and coerce_permission_bool(creator_profile.dynamic_role.permissions.get('can_add_ctc')))
         
         if (not employee.ctc or employee.ctc == 0) and not creator_has_ctc:
             from .models import Notification
@@ -384,7 +398,7 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             
             # Find roles with can_add_ctc
             from organisation.models import Role
-            ctc_roles = [r for r in Role.objects.all() if r.permissions and r.permissions.get('can_add_ctc') in [True, 'true', 'True', 1, '1']]
+            ctc_roles = [r for r in Role.objects.all() if r.permissions and coerce_permission_bool(r.permissions.get('can_add_ctc'))]
             ctc_employees = Employee.objects.filter(dynamic_role__in=ctc_roles)
             for ctc_emp in ctc_employees:
                 Notification.objects.create(
@@ -509,11 +523,13 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 emp.user = user
                 emp.save(update_fields=['user'])
                 
-                login_url = "https://hrms.vibecopilot.ai/"
-                subject = "Welcome to HRMS - Your Login Credentials"
-                message = f"Hello {emp.first_name},\n\nWelcome to the HRMS portal! Your account has been successfully created.\n\nWebsite: {login_url}\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password immediately.\n\nRegards,\nHRMS Admin"
+                login_url = getattr(settings, 'HRMS_PORTAL_URL', 'http://127.0.0.1:8000')
+                brand = getattr(emp.organization, 'branding_text', None) or (emp.organization.name if emp.organization else getattr(settings, 'APP_NAME', 'HRMS Management'))
+                subject = f"Welcome to {brand} - Your Login Credentials"
+                message = f"Hello {emp.first_name},\n\nWelcome to {brand}! Your account has been successfully created.\n\nWebsite: {login_url}\nLogin ID: {email}\nPassword: {password}\n\nPlease log in and change your password immediately.\n\nRegards,\n{brand} Administration"
                 try:
-                    threading.Thread(target=send_mail, args=(subject, message, settings.DEFAULT_FROM_EMAIL, [email]), kwargs={'fail_silently': True}).start()
+                    sender = getattr(settings, 'DEFAULT_FROM_EMAIL', None) or getattr(settings, 'EMAIL_HOST_USER', None) or 'noreply@hrms.local'
+                    threading.Thread(target=send_mail, args=(subject, message, sender, [email]), kwargs={'fail_silently': True}).start()
                 except:
                     pass
                     
@@ -614,11 +630,12 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                     print(f"NotificationService failed for {emp.id}: {e}")
 
                 if not dispatched and emp.email:
-                    login_url = getattr(settings, 'HRMS_PORTAL_URL', "https://hrms.vibecopilot.ai/")
-                    subject = "Welcome to HRMS - Your Login Credentials"
+                    login_url = getattr(settings, 'HRMS_PORTAL_URL', 'http://127.0.0.1:8000')
+                    brand = getattr(emp.organization, 'branding_text', None) or (emp.organization.name if emp.organization else getattr(settings, 'APP_NAME', 'HRMS Management'))
+                    subject = f"Welcome to {brand} - Your Login Credentials"
                     message = f"""Hello {emp.first_name},
 
-Welcome to the HRMS portal! Your account is ready.
+Welcome to {brand}! Your account is ready.
 
 Website: {login_url}
 Login ID: {emp.email}
@@ -627,7 +644,7 @@ Password: {new_password}
 Please log in and change your password immediately.
 
 Regards,
-HRMS Admin
+{brand} Administration
 """
                     try:
                         threading.Thread(target=send_mail, args=(
@@ -711,7 +728,8 @@ HRMS Admin
 
         if not user:
             if not target_email:
-                target_email = target_employee.code + "@peoplepulse.internal"
+                domain = getattr(settings, 'INTERNAL_EMAIL_DOMAIN', 'hrms.local')
+                target_email = f"{target_employee.code.lower()}@{domain}"
             user = User.objects.filter(username=target_email).first()
             if not user and target_employee.code:
                 user = User.objects.filter(username=target_employee.code).first()
@@ -1082,8 +1100,8 @@ class OfferLetterViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         # Dynamic HR Details
         hr_name = "HR Department"
         hr_designation = "Human Resources"
-        hr_email = getattr(settings, 'DEFAULT_FROM_EMAIL', 'hr@example.com')
-        hr_contact = "+91 9876543210"
+        hr_email = getattr(settings, 'DEFAULT_FROM_EMAIL', None) or getattr(settings, 'EMAIL_HOST_USER', None) or ""
+        hr_contact = getattr(settings, 'COMPANY_CONTACT_PHONE', "N/A")
 
         if request_user and request_user.is_authenticated:
             hr_name = f"{request_user.first_name} {request_user.last_name}".strip() or request_user.username
@@ -1343,7 +1361,7 @@ class OfferLetterViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 msg = EmailMessage(
                     subject=subject,
                     body=email_body,
-                    from_email=getattr(settings, 'EMAIL_HOST_USER', getattr(settings, 'DEFAULT_FROM_EMAIL', 'hr@example.com')),
+                    from_email=getattr(settings, 'DEFAULT_FROM_EMAIL', None) or getattr(settings, 'EMAIL_HOST_USER', None) or 'noreply@hrms.local',
                     to=[instance.employee.email],
                 )
                 msg.content_subtype = "html"
@@ -1402,6 +1420,12 @@ class OfferLetterViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         template_id = request.data.get('template_id')
         html_content = request.data.get('html_content')
         
+        if not employee_id or not template_id or not html_content:
+            return Response({"error": "employee_id, template_id, and html_content are required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not isinstance(html_content, str):
+            return Response({"error": "html_content must be a string"}, status=status.HTTP_400_BAD_REQUEST)
+
         import re
         
         # Clean up doctype to avoid nested wrapping issues
@@ -1440,9 +1464,6 @@ class OfferLetterViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             </html>
             """
         
-        if not employee_id or not template_id or not html_content:
-            return Response({"error": "employee_id, template_id, and html_content are required"}, status=400)
-            
         try:
             from authentication.permissions import isolate_queryset
             employee = isolate_queryset(Employee.objects.all(), request.user).get(id=employee_id)
@@ -1505,10 +1526,11 @@ class OfferLetterViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 </html>
                 """
             
+            sender = getattr(settings, 'DEFAULT_FROM_EMAIL', None) or getattr(settings, 'EMAIL_HOST_USER', None) or 'noreply@hrms.local'
             msg = EmailMessage(
                 subject=subject,
                 body=email_body,
-                from_email=getattr(settings, 'EMAIL_HOST_USER', getattr(settings, 'DEFAULT_FROM_EMAIL', 'hr@example.com')),
+                from_email=sender,
                 to=[employee.email],
             )
             msg.content_subtype = "html"
@@ -1604,11 +1626,15 @@ class OfferLetterViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             from django.conf import settings
             subject = f"Offer Accepted - {instance.employee.first_name} {instance.employee.last_name}"
             message = f"Offer letter {instance.offer_number} has been accepted by {instance.employee.first_name} {instance.employee.last_name}."
+            sender = getattr(settings, 'DEFAULT_FROM_EMAIL', None) or getattr(settings, 'EMAIL_HOST_USER', None) or 'noreply@hrms.local'
+            recipients = [instance.employee.email]
+            if sender and sender != 'noreply@hrms.local':
+                recipients.append(sender)
             send_mail(
                 subject,
                 message,
-                getattr(settings, 'EMAIL_HOST_USER', getattr(settings, 'DEFAULT_FROM_EMAIL', 'hr@example.com')),
-                [instance.employee.email, getattr(settings, 'EMAIL_HOST_USER', getattr(settings, 'DEFAULT_FROM_EMAIL', 'hr@example.com'))],
+                sender,
+                recipients,
                 fail_silently=True,
             )
 

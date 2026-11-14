@@ -24,7 +24,7 @@ class NotificationService:
         phone = (employee.phone or '').strip()
         code = employee.code
         login_id = email or phone or code
-        login_url = getattr(settings, 'HRMS_PORTAL_URL', 'https://hrms.vibecopilot.ai/')
+        login_url = getattr(settings, 'HRMS_PORTAL_URL', 'http://127.0.0.1:8000')
 
         send_email_active = False
         send_sms_active = False
@@ -75,10 +75,11 @@ HR Operations Team
 """
         def _send():
             try:
+                from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', None) or getattr(settings, 'EMAIL_HOST_USER', None) or 'HRMS Admin <noreply@hrms.local>'
                 send_mail(
                     subject,
                     message,
-                    getattr(settings, 'DEFAULT_FROM_EMAIL', 'HRMS Admin <noreply@vibecopilot.ai>'),
+                    from_email,
                     [email],
                     fail_silently=True
                 )
@@ -110,13 +111,11 @@ HR Operations Team
                     except Exception as e:
                         logger.error(f"[TWILIO SMS FAILED] {e}")
             
-            # Default / Pending Credentials Mock Dispatcher:
-            # Safely logs the SMS dispatch to console/logs so credentials can be inspected and verified!
-            print("\n" + "="*60)
-            print("📱 [HRMS SMS GATEWAY DISPATCH]")
-            print(f"To: {phone}")
-            print(f"Message: {sms_text}")
-            print("="*60 + "\n")
-            logger.info(f"[SMS CONSOLE DISPATCH] Credentials logged for {phone}")
+            # In non-production environments without an SMS gateway, log dispatch with credentials redacted
+            import re
+            masked_text = re.sub(r'(Password:\s*)\S+', r'\1[REDACTED]', sms_text, flags=re.IGNORECASE)
+            masked_text = re.sub(r'(PIN:\s*)\S+', r'\1[REDACTED]', masked_text, flags=re.IGNORECASE)
+            masked_phone = phone[:3] + '****' + phone[-3:] if len(phone) > 6 else '****'
+            logger.info(f"[SMS DISPATCH SIMULATED] To: {masked_phone} | Content: {masked_text}")
 
         threading.Thread(target=_send, daemon=True).start()

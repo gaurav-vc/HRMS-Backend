@@ -60,9 +60,10 @@ class PayrollRunSerializer(serializers.ModelSerializer):
         from organisation.models import Site
         if Site.objects.filter(contact_email=user.email).exists():
             return True
+        from authentication.permissions import coerce_permission_bool
         if emp and emp.dynamic_role and emp.dynamic_role.permissions:
             perms = emp.dynamic_role.permissions
-            if perms.get('can_view_confidential_payroll') in [True, 'true', 'True', 1, '1'] or perms.get('can_view_confidential') in [True, 'true', 'True', 1, '1']:
+            if coerce_permission_bool(perms.get('can_view_confidential_payroll')) or coerce_permission_bool(perms.get('can_view_confidential')):
                 return True
         return False
         
