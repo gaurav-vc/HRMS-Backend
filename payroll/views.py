@@ -853,24 +853,10 @@ class SalarySlipAPIView(APIView):
                             if basic_amt == 0.0 and getattr(emp, 'ctc', None):
                                 basic_amt = (float(emp.ctc) / 12.0) * 0.5
 
-                            ot_mult = 1.0
-                            from attendance.models import ShiftAssignment, ShiftDefinition
-                            emp_shift = ShiftAssignment.objects.filter(employee=emp, date__gte=calc_start, date__lte=calc_end).select_related('shift').first()
-                            if not emp_shift:
-                                emp_shift = ShiftAssignment.objects.filter(employee=emp).order_by('-date').select_related('shift').first()
-                            if emp_shift and getattr(emp_shift.shift, 'ot_multiplier', None):
-                                ot_mult = float(emp_shift.shift.ot_multiplier)
-                            else:
-                                try:
-                                    from ot_engine.models import OTPolicy
-                                    active_policy = OTPolicy.objects.order_by('-effective_from').first()
-                                    if active_policy and getattr(active_policy, 'multiplier', None):
-                                        ot_mult = float(active_policy.multiplier)
-                                except Exception:
-                                    pass
-
-                            policy = getattr(emp, 'attendance_policy', None) or getattr(emp.site, 'attendance_policy', None) or None
-                            day_hours = float(policy.full_day_hours) if policy and getattr(policy, 'full_day_hours', None) else 8.0
+                            # Dynamically resolve OT Multiplier and Base Hours from assigned Shift Definition
+                            shift_cfg = PayrollService.resolve_employee_shift_config(emp, {'start_date': calc_start, 'end_date': calc_end})
+                            ot_mult = float(shift_cfg['ot_multiplier'])
+                            day_hours = float(shift_cfg['base_hours'])
 
                             hourly_rate = (basic_amt / float(calc_days or 30)) / day_hours
                             new_ot_amt = round(hourly_rate * ot_mult * total_ot_hours, 2)
@@ -1328,6 +1314,7 @@ class PayrollPreviewAPIView(APIView):
                             'ot': sfloat(slip.ot_hours or 0),
                             'overtimeHours': sfloat(slip.ot_hours or 0),
                             'overtimePay': 0 if hide_money else sfloat(ot_pay),
+                            'otMultiplier': float(getattr(slip, 'attendance_snapshot', {}).get('ot_multiplier', 2.0) if getattr(slip, 'attendance_snapshot', None) else 2.0),
                             'halfDays': sfloat(slip.half_days or 0),
                             'latePenalties': sfloat(slip.late_penalty_days or 0),
                             'daysPaid': sfloat(slip.days_paid or 0),
@@ -1487,6 +1474,7 @@ class PayrollPreviewAPIView(APIView):
                             'ot': sfloat(context.get('ot_hours', context.get('overtime_hours', 0))),
                             'overtimeHours': sfloat(context.get('ot_hours', context.get('overtime_hours', 0))),
                             'overtimePay': 0 if hide_money else sfloat(ot_pay),
+                            'otMultiplier': float(context.get('ot_multiplier', 2.0)),
                             'halfDays': sfloat(context.get('half_day_count', 0)),
                             'latePenalties': sfloat(context.get('late_penalty_days', 0)),
                             'daysPaid': sfloat(context.get('paid_days', 0)),

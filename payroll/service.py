@@ -187,6 +187,61 @@ class PayrollService:
         }
 
     @staticmethod
+    def resolve_employee_shift_config(employee, precomputed_data=None):
+        """
+        Dynamically resolves shift definition configuration for an employee:
+        - ot_multiplier: Any user-configured decimal number on ShiftDefinition (e.g. 1.0, 1.25, 1.5, 2.0, 2.5, etc.)
+        - ot_calculation_base_hours: Standard shift duration for hourly rate (e.g. 8.0, 9.0, etc.)
+        - is_ot_enabled: Master toggle to enable/disable OT
+        - min_hours_for_ot: Minimum threshold hours
+        """
+        from attendance.models import ShiftAssignment, ShiftDefinition
+        emp_shift = None
+        shift_def = None
+        start_d = precomputed_data.get('start_date') if precomputed_data else None
+        end_d = precomputed_data.get('end_date') if precomputed_data else None
+
+        try:
+            if start_d and end_d:
+                emp_shift = ShiftAssignment.objects.filter(
+                    employee=employee, date__gte=start_d, date__lte=end_d
+                ).select_related('shift').first()
+            if not emp_shift:
+                emp_shift = ShiftAssignment.objects.filter(
+                    employee=employee
+                ).order_by('-date').select_related('shift').first()
+
+            if emp_shift and emp_shift.shift:
+                shift_def = emp_shift.shift
+            elif getattr(employee, 'site', None):
+                shift_def = ShiftDefinition.objects.filter(site=employee.site, is_active=True).first()
+            if not shift_def:
+                shift_def = ShiftDefinition.objects.filter(is_active=True).first()
+        except Exception:
+            pass
+
+        if shift_def:
+            multiplier = Decimal(str(shift_def.ot_multiplier if shift_def.ot_multiplier is not None else 1.0))
+            base_hours = Decimal(str(shift_def.ot_calculation_base_hours or 8.0))
+            is_enabled = bool(shift_def.is_ot_enabled)
+            min_ot = Decimal(str(shift_def.min_hours_for_ot or 0.0))
+            return {
+                'shift': shift_def,
+                'ot_multiplier': multiplier,
+                'base_hours': base_hours,
+                'is_ot_enabled': is_enabled,
+                'min_hours_for_ot': min_ot,
+            }
+
+        return {
+            'shift': None,
+            'ot_multiplier': Decimal('1.00'),
+            'base_hours': Decimal('8.00'),
+            'is_ot_enabled': True,
+            'min_hours_for_ot': Decimal('0.00'),
+        }
+
+    @staticmethod
     def _get_context_for_employee(employee, precomputed_data, emp_override=None):
         settings = PayrollSettings.objects.first() or PayrollSettings()
         
@@ -316,6 +371,13 @@ class PayrollService:
         if not reimbursement_amount:
             reimbursement_amount = Decimal('0.00')
         
+        # Dynamically resolve all Shift Definition parameters (multiplier, base hours, min threshold, master toggle)
+        shift_cfg = PayrollService.resolve_employee_shift_config(employee, precomputed_data)
+        ot_mult = shift_cfg['ot_multiplier']
+        shift_base_h = shift_cfg['base_hours']
+        if not shift_cfg['is_ot_enabled']:
+            overtime_hours = Decimal('0.00')
+
         return {
             'ctc': Decimal(employee.ctc or 0),
             'monthly_ctc': Decimal(employee.ctc or 0) / Decimal(12),
@@ -324,6 +386,8 @@ class PayrollService:
             'total_days': Decimal(str(total_days)),
             'overtime_hours': Decimal(str(overtime_hours)),
             'ot_hours': Decimal(str(overtime_hours)),
+            'ot_multiplier': ot_mult,
+            'shift_base_hours': shift_base_h,
             'absent_days': Decimal(str(absent_count)),
             'lop_days': Decimal(str(lop_days)),
             'half_day_count': Decimal(str(half_day_count)),
@@ -354,14 +418,12 @@ class PayrollService:
         context['hra'] = Decimal('0.00')
         context['non_balancing_gross'] = Decimal('0.00')
         
-        # Inject Enterprise OT Engine Parameters
+        # Ensure OT parameters are resolved dynamically from Shift Definition
         context['ot_hours'] = context.get('overtime_hours', Decimal('0.00')) 
-        try:
-            from ot_engine.models import OTPolicy
-            active_ot_policy = OTPolicy.objects.order_by('-effective_from').first()
-            context['ot_multiplier'] = active_ot_policy.multiplier if active_ot_policy else Decimal('1.50')
-        except Exception:
-            context['ot_multiplier'] = Decimal('1.50') 
+        if 'ot_multiplier' not in context or context['ot_multiplier'] is None:
+            shift_cfg = PayrollService.resolve_employee_shift_config(employee, precomputed_data)
+            context['ot_multiplier'] = shift_cfg['ot_multiplier']
+            context['shift_base_hours'] = shift_cfg['base_hours'] 
         
         for rule in rules_dag:
             # PF Applicability Filter
@@ -517,9 +579,10 @@ class PayrollService:
                     # Standard labor fallback: 50% of monthly CTC as basic wage if separate basic component not defined
                     basic_amt = (emp_ctc / Decimal('12.0')) * Decimal('0.50') if emp_ctc > 0 else Decimal('0.00')
                 
-                # Standard hourly rate calculation: (basic_wage / total_days / 8.0)
-                hourly_rate = basic_amt / total_days / Decimal('8.00')
-                multiplier = context.get('ot_multiplier', Decimal('1.50'))
+                # Dynamic hourly rate calculation based on Shift Definition base hours and dynamic multiplier
+                base_h = Decimal(str(context.get('shift_base_hours', 8.0)))
+                hourly_rate = basic_amt / total_days / base_h
+                multiplier = Decimal(str(context.get('ot_multiplier', 1.0)))
                 ot_pay = (hourly_rate * multiplier * ot_hours).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
                 
                 if ot_pay > 0:
@@ -528,7 +591,7 @@ class PayrollService:
                         name="Overtime Allowance",
                         defaults={
                             'type': 'Earning',
-                            'formula': 'ot_hours * (basic / total_days / 8) * 1.5',
+                            'formula': f'ot_hours * (basic / total_days / {base_h}) * {multiplier}',
                             'is_statutory': False,
                             'effective_from': timezone.now().date()
                         }

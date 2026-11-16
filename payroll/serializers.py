@@ -150,6 +150,7 @@ class PayrollRunSerializer(serializers.ModelSerializer):
                 'ot': float(slip.ot_hours or 0),
                 'overtimeHours': float(slip.ot_hours or 0),
                 'overtimePay': 0 if hide_money else float(ot_pay),
+                'otMultiplier': float(getattr(slip, 'attendance_snapshot', {}).get('ot_multiplier', 2.0) if getattr(slip, 'attendance_snapshot', None) else 2.0),
                 'daysPaid': float(slip.days_paid or 0),
                 'totalAmount': 0 if hide_money else float(slip.gross or 0),
                 'arrears': 0 if hide_money else float(arrears),
