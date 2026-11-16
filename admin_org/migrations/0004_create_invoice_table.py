@@ -9,8 +9,7 @@ class Migration(migrations.Migration):
 
     operations = [
         migrations.SeparateDatabaseAndState(
-            state_operations=[],
-            database_operations=[
+            state_operations=[
                 migrations.CreateModel(
                     name='Invoice',
                     fields=[
@@ -27,7 +26,8 @@ class Migration(migrations.Migration):
                         'db_table': 'organisation_invoice',
                     },
                 ),
-            ]
+            ],
+            database_operations=[]
         )
     ]
 

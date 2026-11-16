@@ -121,6 +121,7 @@ class PayrollRun(models.Model):
         ('Checker-Approved', 'Checker-Approved'),
         ('Frozen', 'Frozen'),
         ('Disbursed', 'Disbursed'),
+        ('Rejected', 'Rejected'),
     )
     RUN_TYPE = (('Live', 'Live'), ('Simulation', 'Simulation'))
     
@@ -149,6 +150,17 @@ class Payslip(models.Model):
     deductions = models.DecimalField(max_digits=12, decimal_places=2, default=0.0)
     net = models.DecimalField(max_digits=12, decimal_places=2, default=0.0)
 
+    # Attendance & Proration Snapshot fields
+    days_present = models.DecimalField(max_digits=6, decimal_places=2, default=0.0)
+    days_paid = models.DecimalField(max_digits=6, decimal_places=2, default=0.0)
+    total_days = models.DecimalField(max_digits=6, decimal_places=2, default=30.0)
+    lop_days = models.DecimalField(max_digits=6, decimal_places=2, default=0.0)
+    half_days = models.DecimalField(max_digits=6, decimal_places=2, default=0.0)
+    late_penalty_days = models.DecimalField(max_digits=6, decimal_places=2, default=0.0)
+    ot_hours = models.DecimalField(max_digits=6, decimal_places=2, default=0.0)
+    annual_leaves = models.DecimalField(max_digits=6, decimal_places=2, default=0.0)
+    attendance_snapshot = models.JSONField(default=dict, blank=True)
+
     class Meta:
         unique_together = ('employee', 'period', 'run')
 
@@ -169,6 +181,16 @@ class SimulatedPayslip(models.Model):
     gross = models.DecimalField(max_digits=12, decimal_places=2, default=0.0)
     deductions = models.DecimalField(max_digits=12, decimal_places=2, default=0.0)
     net = models.DecimalField(max_digits=12, decimal_places=2, default=0.0)
+
+    days_present = models.DecimalField(max_digits=6, decimal_places=2, default=0.0)
+    days_paid = models.DecimalField(max_digits=6, decimal_places=2, default=0.0)
+    total_days = models.DecimalField(max_digits=6, decimal_places=2, default=30.0)
+    lop_days = models.DecimalField(max_digits=6, decimal_places=2, default=0.0)
+    half_days = models.DecimalField(max_digits=6, decimal_places=2, default=0.0)
+    late_penalty_days = models.DecimalField(max_digits=6, decimal_places=2, default=0.0)
+    ot_hours = models.DecimalField(max_digits=6, decimal_places=2, default=0.0)
+    annual_leaves = models.DecimalField(max_digits=6, decimal_places=2, default=0.0)
+    attendance_snapshot = models.JSONField(default=dict, blank=True)
 
 class SimulatedLineItem(models.Model):
     payslip = models.ForeignKey(SimulatedPayslip, on_delete=models.CASCADE, related_name='lines')

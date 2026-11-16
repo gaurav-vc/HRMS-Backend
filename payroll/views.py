@@ -1,4 +1,4 @@
-from rest_framework import viewsets
+from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -167,6 +167,45 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 
         return super().create(request, *args, **kwargs)
 
+    def destroy(self, request, *args, **kwargs):
+        run = self.get_object()
+        user = request.user
+        
+        from authentication.permissions import check_user_permission, user_can_approve, check_module_permission
+        can_run = check_user_permission(user, 'can_run_payroll')
+        can_approve = user_can_approve(user, module='Run Payroll')
+        has_del = check_module_permission(user, 'Run Payroll', action='delete')
+        
+        if not (user.is_superuser or can_run or can_approve or has_del):
+            return Response({'error': 'Permission denied. You do not have permission to delete this payroll run.'}, status=403)
+            
+        if run.status == 'Disbursed':
+            return Response({'error': 'Cannot delete an already disbursed payroll run.'}, status=400)
+            
+        from django.db import transaction
+        with transaction.atomic():
+            # 1. Revert disciplinary memos attached to this run
+            from .models import EmployeeDisciplinaryMemo, WalletLedgerEntry, Payslip, SimulatedPayslip
+            EmployeeDisciplinaryMemo.objects.filter(payroll_run=run).update(
+                status='PENDING',
+                is_active=True,
+                payroll_run=None,
+                payslip=None,
+                deducted_at=None
+            )
+            # 2. Delete wallet transactions linked to this run
+            WalletLedgerEntry.objects.filter(payroll_run=run).delete()
+            # 3. Delete payslips and simulated payslips
+            Payslip.objects.filter(run=run).delete()
+            SimulatedPayslip.objects.filter(run=run).delete()
+            # 4. Clean up any related notifications pointing to this run
+            from employees.models import Notification
+            Notification.objects.filter(related_run_id=run.id).delete()
+            # 5. Delete the run
+            run.delete()
+            
+        return Response({'status': 'success', 'message': 'Payroll run deleted successfully'}, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=['post'])
     def execute(self, request, pk=None):
         user = request.user
@@ -177,14 +216,17 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
 
         can_run = False
         from authentication.permissions import coerce_permission_bool
-        if user.is_superuser or (emp and emp.role in ['admin', 'org_admin', 'super_admin']) or getattr(user, 'role', '') in ['admin', 'org_admin', 'super_admin']:
+        if user.is_superuser:
             can_run = True
         elif emp and emp.dynamic_role and emp.dynamic_role.permissions:
             perms = emp.dynamic_role.permissions
             if (coerce_permission_bool(perms.get('can_run_payroll')) or
                 coerce_permission_bool(perms.get('can_process_payroll')) or
-                coerce_permission_bool(perms.get('can_approve_payroll'))):
+                coerce_permission_bool(perms.get('can_approve_payroll')) or
+                coerce_permission_bool(perms.get('can_manage_payroll'))):
                 can_run = True
+        elif emp and getattr(emp, 'is_admin', False):
+            can_run = True
 
         if not can_run:
             return Response({'error': 'Permission denied. You do not have permission to run payroll.'}, status=403)
@@ -196,28 +238,38 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         logger = logging.getLogger('hrms.payroll')
 
         try:
-            with transaction.atomic():
-                run = PayrollRun.objects.select_for_update().filter(pk=pk).first()
-                if not run:
-                    return Response({'status': 'error', 'detail': 'Payroll run not found.'}, status=404)
+            import time
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    with transaction.atomic():
+                        run = PayrollRun.objects.filter(pk=pk).first()
+                        if not run:
+                            return Response({'status': 'error', 'detail': 'Payroll run not found.'}, status=404)
 
-                if run.status == 'Processing':
-                    return Response({'status': 'error', 'detail': 'Payroll run is currently being processed by another task. Please wait.'}, status=400)
+                        if run.status == 'Processing':
+                            return Response({'status': 'error', 'detail': 'Payroll run is currently being processed by another task. Please wait.'}, status=400)
 
-                overrides = request.data.get('overrides')
-                include_variable_bonus = request.data.get('include_variable_bonus', False)
-                include_leaves_encashment = request.data.get('include_leaves_encashment', False)
+                        overrides = request.data.get('overrides')
+                        include_variable_bonus = request.data.get('include_variable_bonus', False)
+                        include_leaves_encashment = request.data.get('include_leaves_encashment', False)
 
-                if run.status in ['Frozen', 'Disbursed']:
-                    if overrides:
-                        PayrollService.file_arrears(run.id, overrides)
-                    return Response({'status': 'success', 'run_status': run.status, 'msg': 'Arrears processed'})
+                        if run.status in ['Frozen', 'Disbursed']:
+                            if overrides:
+                                PayrollService.file_arrears(run.id, overrides)
+                            return Response({'status': 'success', 'run_status': run.status, 'msg': 'Arrears processed'})
 
-                # Mark as Processing inside the atomic lock to prevent duplicate race conditions
-                run.status = 'Processing'
-                if hasattr(request, 'user') and request.user.is_authenticated:
-                    run.maker = request.user
-                run.save(update_fields=['status', 'maker'] if run.maker else ['status'])
+                        # Mark as Processing inside the atomic lock to prevent duplicate race conditions
+                        run.status = 'Processing'
+                        if hasattr(request, 'user') and request.user.is_authenticated:
+                            run.maker = request.user
+                        run.save(update_fields=['status', 'maker'] if run.maker else ['status'])
+                    break
+                except Exception as lock_err:
+                    if 'database is locked' in str(lock_err).lower() and attempt < max_retries - 1:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    raise lock_err
 
             # Dynamic resolution of active salary structure for any unassigned employees
             from employees.models import Employee
@@ -256,6 +308,103 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             except Exception:
                 pass
             return Response({'status': 'error', 'detail': f"Payroll calculation failed: {str(e)}"}, status=400)
+
+    @action(detail=True, methods=['get'])
+    def details(self, request, pk=None):
+        user = request.user
+        can_view_confidential = False
+        if user.is_superuser:
+            can_view_confidential = True
+        else:
+            emp_profile = getattr(user, 'employee_profile', None)
+            if emp_profile and emp_profile.dynamic_role and emp_profile.dynamic_role.permissions:
+                perms = emp_profile.dynamic_role.permissions
+                from authentication.permissions import coerce_permission_bool
+                can_view_confidential = (
+                    coerce_permission_bool(perms.get('can_view_confidential_payroll')) or
+                    coerce_permission_bool(perms.get('can_view_confidential')) or
+                    coerce_permission_bool(perms.get('can_approve_payroll')) or
+                    coerce_permission_bool(perms.get('can_run_payroll'))
+                )
+            elif emp_profile and getattr(emp_profile, 'is_admin', False):
+                can_view_confidential = True
+
+        run = self.get_object()
+        slips = run.payslip_set.all().select_related(
+            'employee', 'employee__department', 'employee__designation',
+            'employee__site', 'employee__entity', 'employee__salary_structure'
+        ).prefetch_related('lines', 'lines__rule')
+
+        employee_details = []
+        for slip in slips:
+            emp = slip.employee
+            components = {line.rule.name.strip(): float(line.amount) for line in slip.lines.all()}
+            
+            pf_amount = sum(float(l.amount) for l in slip.lines.all() if l.rule and 'PF' in str(l.rule.name).upper())
+            pt_amount = sum(float(l.amount) for l in slip.lines.all() if l.rule and ('PT' in str(l.rule.name).upper() or 'PROFESSIONAL TAX' in str(l.rule.name).upper()))
+            reimbursement = sum(float(l.amount) for l in slip.lines.all() if l.rule and 'REIMBURSEMENT' in str(l.rule.name).upper())
+            incentive = sum(float(l.amount) for l in slip.lines.all() if l.rule and ('INCENTIVE' in str(l.rule.name).upper() or 'BONUS' in str(l.rule.name).upper()))
+            arrears = sum(float(l.amount) for l in slip.lines.all() if l.rule and 'ARREAR' in str(l.rule.name).upper())
+            ot_pay = sum(float(l.amount) for l in slip.lines.all() if l.rule and ('OVERTIME' in str(l.rule.name).upper() or 'OT' in str(l.rule.name).upper()))
+
+            safe_name = f"{emp.first_name} {emp.last_name}".strip()
+            safe_dept = emp.department.name if emp.department else 'N/A'
+            safe_site = emp.site.name if emp.site else ''
+            safe_entity = emp.entity.name if emp.entity else run.entity.name
+
+            employee_details.append({
+                'id': emp.id,
+                'name': safe_name,
+                'code': emp.code or f"EMP{emp.id}",
+                'email': emp.email,
+                'number': emp.phone or '',
+                'workFrom': safe_site,
+                'entity': safe_entity,
+                '_entity': safe_entity,
+                'department': safe_dept,
+                'bankName': emp.bank_name or '',
+                'acNo': emp.bank_account or '',
+                'ifscCode': emp.ifsc or '',
+                'currentSalary': float(emp.ctc or 0) if can_view_confidential else 0,
+                'totalDays': float(slip.total_days or 30),
+                'presentDays': float(slip.days_present or 0),
+                'leaves': float(slip.annual_leaves or 0),
+                'lopDays': float(slip.lop_days or 0),
+                'halfDays': float(slip.half_days or 0),
+                'latePenalties': float(slip.late_penalty_days or 0),
+                'ot': float(slip.ot_hours or 0),
+                'overtimeHours': float(slip.ot_hours or 0),
+                'overtimePay': ot_pay if can_view_confidential else 0,
+                'daysPaid': float(slip.days_paid or 0),
+                'totalAmount': float(slip.gross) if can_view_confidential else 0,
+                'arrears': arrears if can_view_confidential else 0,
+                'deduction': float(slip.deductions) if can_view_confidential else 0,
+                'pf': pf_amount if can_view_confidential else 0,
+                'pt': pt_amount if can_view_confidential else 0,
+                'reimbursement': reimbursement if can_view_confidential else 0,
+                'incentive': incentive if can_view_confidential else 0,
+                'payableSalary': float(slip.net) if can_view_confidential else 0,
+                'isConfidential': not can_view_confidential,
+                'components': components if can_view_confidential else {},
+            })
+
+        total_gross = sum(float(s.gross) for s in slips)
+        total_ded = sum(float(s.deductions) for s in slips)
+        total_net = sum(float(s.net) for s in slips)
+
+        return Response({
+            'id': run.id,
+            'period': run.period,
+            'entity': run.entity.name,
+            'entity_id': run.entity.id,
+            'status': run.status,
+            'employees': len(slips),
+            'gross': total_gross if can_view_confidential else 0,
+            'deductions': total_ded if can_view_confidential else 0,
+            'net': total_net if can_view_confidential else 0,
+            'employee_details': employee_details,
+            'employeeDetails': employee_details,
+        })
 
     @action(detail=False, methods=['post', 'get'])
     def validate_prerequisites(self, request):
@@ -440,14 +589,24 @@ class PayrollRunViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 comment=comment_text
             )
                 
-            run.status = 'Draft'
+            run.status = 'Rejected'
             run.save(update_fields=['status'])
         
+        # Notify maker and users who can run payroll
+        from employees.models import Notification, Employee
+        recipients = set()
         if run.maker and hasattr(run.maker, 'employee_profile'):
-            from employees.models import Notification
+            recipients.add(run.maker.employee_profile)
+            
+        from authentication.permissions import check_user_permission
+        for emp in Employee.objects.filter(status='Active').select_related('user'):
+            if emp.user and (emp.user.is_superuser or check_user_permission(emp.user, 'can_run_payroll')):
+                recipients.add(emp)
+
+        for recipient in recipients:
             Notification.objects.create(
-                recipient=run.maker.employee_profile,
-                title="Payroll Rejected",
+                recipient=recipient,
+                title="Payroll Run Rejected",
                 message=f"Payroll for {run.period} was rejected. Reason: {comment_text}",
                 related_run_id=run.id
             )
@@ -486,8 +645,13 @@ class SalarySlipAPIView(APIView):
                     if emp_profile.dynamic_role and emp_profile.dynamic_role.permissions:
                         perms = emp_profile.dynamic_role.permissions
                         from authentication.permissions import coerce_permission_bool
-                        can_view_confidential = coerce_permission_bool(perms.get('can_view_confidential_payroll')) or coerce_permission_bool(perms.get('can_view_confidential'))
-                    elif emp_profile.role in ['admin', 'org_admin'] or getattr(emp_profile, 'is_admin', False):
+                        can_view_confidential = (
+                            coerce_permission_bool(perms.get('can_view_confidential_payroll')) or
+                            coerce_permission_bool(perms.get('can_view_confidential')) or
+                            coerce_permission_bool(perms.get('can_approve_payroll')) or
+                            coerce_permission_bool(perms.get('can_run_payroll'))
+                        )
+                    elif getattr(emp_profile, 'is_admin', False):
                         can_view_confidential = True
             
             # Determine all periods where payroll has been run or payslips exist
@@ -579,11 +743,23 @@ class SalarySlipAPIView(APIView):
                         pass
                 
                 emp_doj = emp.doj if emp.doj else month_start
+                calc_start = max(month_start, emp_doj)
                 
-                if emp_doj > calc_end:
-                    days_paid, days_present, days_off, days_absent = 0, 0, 0, 0
+                if slip.id and not is_draft:
+                    days_present = float(slip.days_present or 0)
+                    days_paid = float(slip.days_paid or 0)
+                    calc_days = int(slip.total_days or calc_days)
+                    lop_days = float(slip.lop_days or 0)
+                    half_day_count = float(slip.half_days or 0)
+                    late_penalty_days = float(slip.late_penalty_days or 0)
+                    late_count = int(late_penalty_days * 3)
+                    total_ot_hours = float(slip.ot_hours or 0)
+                    paid_leave_days = float(slip.annual_leaves or 0)
+                    days_absent = max(0.0, float(calc_days) - days_paid)
+                    days_off = sum(1 for i in range(calc_days) if date.fromordinal(month_start.toordinal() + i).weekday() == 6)
+                elif emp_doj > calc_end:
+                    days_paid, days_present, days_off, days_absent, late_count = 0, 0, 0, 0, 0
                 else:
-                    calc_start = max(month_start, emp_doj)
                     calc_days = (calc_end - calc_start).days + 1
                     days_off = sum(1 for i in range(calc_days) if date.fromordinal(calc_start.toordinal() + i).weekday() == 6)
                     
@@ -652,67 +828,76 @@ class SalarySlipAPIView(APIView):
                 slip_ded = float(slip.deductions)
                 slip_net = float(slip.net)
                 
-                # Synchronize snapshot Overtime Allowance if OT was recalculated
-                ot_lines = slip.lines.filter(rule__name__icontains='overtime') if slip.id else None
-                if (ot_lines is not None and ot_lines.exists()) or 'Overtime Allowance' in components:
-                    old_ot_amt = sum(float(l.amount) for l in ot_lines) if (ot_lines is not None and ot_lines.exists()) else float(components.get('Overtime Allowance', 0))
-                    if total_ot_hours == 0:
-                        if ot_lines is not None:
-                            ot_lines.delete()
-                        components.pop('Overtime Allowance', None)
-                        components.pop('Overtime Pay', None)
-                        components.pop('Overtime', None)
-                        if old_ot_amt > 0:
-                            slip_gross = max(0.0, slip_gross - old_ot_amt)
-                            slip_net = max(0.0, slip_net - old_ot_amt)
-                            if slip.id:
-                                Payslip.objects.filter(id=slip.id).update(gross=slip_gross, net=slip_net)
-                    else:
-                        basic_amt = 0.0
-                        for c_name, c_val in components.items():
-                            if 'basic' in c_name.lower():
-                                basic_amt = float(c_val)
-                                break
-                        if basic_amt == 0.0 and getattr(emp, 'ctc', None):
-                            basic_amt = (float(emp.ctc) / 12.0) * 0.5
-
-                        # Dynamically resolve shift multiplier from assigned shift or active policy
-                        ot_mult = 1.0
-                        from attendance.models import ShiftAssignment, ShiftDefinition
-                        emp_shift = ShiftAssignment.objects.filter(employee=emp, date__gte=calc_start, date__lte=calc_end).select_related('shift').first()
-                        if not emp_shift:
-                            emp_shift = ShiftAssignment.objects.filter(employee=emp).order_by('-date').select_related('shift').first()
-                        if emp_shift and getattr(emp_shift.shift, 'ot_multiplier', None):
-                            ot_mult = float(emp_shift.shift.ot_multiplier)
-                        else:
-                            try:
-                                from ot_engine.models import OTPolicy
-                                active_policy = OTPolicy.objects.order_by('-effective_from').first()
-                                if active_policy and getattr(active_policy, 'multiplier', None):
-                                    ot_mult = float(active_policy.multiplier)
-                            except Exception:
-                                pass
-
-                        policy = getattr(emp, 'attendance_policy', None) or getattr(emp.site, 'attendance_policy', None) or None
-                        day_hours = float(policy.full_day_hours) if policy and getattr(policy, 'full_day_hours', None) else 8.0
-
-                        hourly_rate = (basic_amt / float(calc_days or 30)) / day_hours
-                        new_ot_amt = round(hourly_rate * ot_mult * total_ot_hours, 2)
-                        if abs(new_ot_amt - old_ot_amt) > 0.01:
+                # Synchronize snapshot Overtime Allowance if OT was recalculated (drafts only)
+                if is_draft:
+                    ot_lines = slip.lines.filter(rule__name__icontains='overtime') if slip.id else None
+                    if (ot_lines is not None and ot_lines.exists()) or 'Overtime Allowance' in components:
+                        old_ot_amt = sum(float(l.amount) for l in ot_lines) if (ot_lines is not None and ot_lines.exists()) else float(components.get('Overtime Allowance', 0))
+                        if total_ot_hours == 0:
                             if ot_lines is not None:
-                                ot_lines.update(amount=new_ot_amt)
-                            components['Overtime Allowance'] = new_ot_amt
-                            diff = new_ot_amt - old_ot_amt
-                            slip_gross = max(0.0, slip_gross + diff)
-                            slip_net = max(0.0, slip_net + diff)
-                            if slip.id:
-                                Payslip.objects.filter(id=slip.id).update(gross=slip_gross, net=slip_net)
+                                ot_lines.delete()
+                            components.pop('Overtime Allowance', None)
+                            components.pop('Overtime Pay', None)
+                            components.pop('Overtime', None)
+                            if old_ot_amt > 0:
+                                slip_gross = max(0.0, slip_gross - old_ot_amt)
+                                slip_net = max(0.0, slip_net - old_ot_amt)
+                                if slip.id:
+                                    Payslip.objects.filter(id=slip.id).update(gross=slip_gross, net=slip_net)
+                        else:
+                            basic_amt = 0.0
+                            for c_name, c_val in components.items():
+                                if 'basic' in c_name.lower():
+                                    basic_amt = float(c_val)
+                                    break
+                            if basic_amt == 0.0 and getattr(emp, 'ctc', None):
+                                basic_amt = (float(emp.ctc) / 12.0) * 0.5
+
+                            ot_mult = 1.0
+                            from attendance.models import ShiftAssignment, ShiftDefinition
+                            emp_shift = ShiftAssignment.objects.filter(employee=emp, date__gte=calc_start, date__lte=calc_end).select_related('shift').first()
+                            if not emp_shift:
+                                emp_shift = ShiftAssignment.objects.filter(employee=emp).order_by('-date').select_related('shift').first()
+                            if emp_shift and getattr(emp_shift.shift, 'ot_multiplier', None):
+                                ot_mult = float(emp_shift.shift.ot_multiplier)
+                            else:
+                                try:
+                                    from ot_engine.models import OTPolicy
+                                    active_policy = OTPolicy.objects.order_by('-effective_from').first()
+                                    if active_policy and getattr(active_policy, 'multiplier', None):
+                                        ot_mult = float(active_policy.multiplier)
+                                except Exception:
+                                    pass
+
+                            policy = getattr(emp, 'attendance_policy', None) or getattr(emp.site, 'attendance_policy', None) or None
+                            day_hours = float(policy.full_day_hours) if policy and getattr(policy, 'full_day_hours', None) else 8.0
+
+                            hourly_rate = (basic_amt / float(calc_days or 30)) / day_hours
+                            new_ot_amt = round(hourly_rate * ot_mult * total_ot_hours, 2)
+                            if abs(new_ot_amt - old_ot_amt) > 0.01:
+                                if ot_lines is not None:
+                                    ot_lines.update(amount=new_ot_amt)
+                                components['Overtime Allowance'] = new_ot_amt
+                                diff = new_ot_amt - old_ot_amt
+                                slip_gross = max(0.0, slip_gross + diff)
+                                slip_net = max(0.0, slip_net + diff)
+                                if slip.id:
+                                    Payslip.objects.filter(id=slip.id).update(gross=slip_gross, net=slip_net)
 
                 for k in list(components.keys()):
                     components[k] = float(components[k])
                 
-                # Retroactive Fix: If an employee was saved with full salary but actually had 0 paid days due to the old bug, zero it out dynamically here.
-                if days_paid == 0:
+                # Accurately compute total deductions from components
+                ded_keys = ['pf', 'pt', 'tds', 'provident', 'professional', 'income tax', 'loan', 'advance', 'penalty', 'memo', 'deduction', 'esi']
+                calculated_ded = sum(v for k, v in components.items() if any(d in k.lower() for d in ded_keys))
+                if calculated_ded > 0:
+                    slip_ded = calculated_ded
+                    slip_net = max(0.0, round(slip_gross - slip_ded, 2))
+                    if slip.id and not is_draft and abs(float(slip.deductions or 0) - slip_ded) > 0.01:
+                        Payslip.objects.filter(id=slip.id).update(deductions=slip_ded, net=slip_net)
+
+                # Retroactive Fix: If an employee was saved with full salary but actually had 0 paid days due to the old bug, zero it out dynamically here (only for unexecuted drafts).
+                if is_draft and days_paid == 0:
                     slip_gross = 0.0
                     slip_ded = 0.0
                     slip_net = 0.0
@@ -756,14 +941,16 @@ class SalarySlipAPIView(APIView):
                     except Exception:
                         pass
 
+                is_ded_key = lambda name: any(d in name.lower() for d in ['pf', 'pt', 'tds', 'provident', 'professional', 'tax', 'deduction', 'esi', 'loan', 'advance', 'memo', 'penalty'])
                 for k, v in components.items():
                     if k not in actual_components:
-                        if days_paid > 0 and days_paid < calc_days:
+                        if days_paid > 0 and days_paid != calc_days:
                             act_val = round((float(v) / float(days_paid)) * float(calc_days), 2)
                         else:
                             act_val = float(v)
                         actual_components[k] = act_val
-                        actual_gross += act_val
+                        if not is_ded_key(k):
+                            actual_gross += act_val
 
                 if actual_gross == 0:
                     actual_gross = float(emp.ctc or 0) / 12.0 if emp.ctc else slip_gross
@@ -1037,18 +1224,21 @@ class PayrollPreviewAPIView(APIView):
             user = request.user
             can_view_confidential = False
             if user and user.is_authenticated:
-                if user.is_superuser or getattr(user, 'role', '') in ['admin', 'org_admin', 'super_admin']:
+                if user.is_superuser:
                     can_view_confidential = True
                 else:
                     emp = getattr(user, 'employee_profile', None)
                     if emp:
-                        if emp.role == 'super_admin':
-                            can_view_confidential = True
-                        elif emp.dynamic_role and emp.dynamic_role.permissions:
+                        if emp.dynamic_role and emp.dynamic_role.permissions:
                             perms = emp.dynamic_role.permissions
                             from authentication.permissions import coerce_permission_bool
-                            can_view_confidential = coerce_permission_bool(perms.get('can_view_confidential_payroll')) or coerce_permission_bool(perms.get('can_view_confidential'))
-                        elif emp.role in ['admin', 'org_admin'] or getattr(emp, 'is_admin', False):
+                            can_view_confidential = (
+                                coerce_permission_bool(perms.get('can_view_confidential_payroll')) or
+                                coerce_permission_bool(perms.get('can_view_confidential')) or
+                                coerce_permission_bool(perms.get('can_approve_payroll')) or
+                                coerce_permission_bool(perms.get('can_run_payroll'))
+                            )
+                        elif getattr(emp, 'is_admin', False):
                             can_view_confidential = True
             
             from organisation.models import Entity
@@ -1065,8 +1255,115 @@ class PayrollPreviewAPIView(APIView):
                 entities = Entity.objects.all()
 
             results = []
+            reset_attendance = request.query_params.get('reset', 'false').lower() == 'true'
 
             for entity in entities:
+                # Check if an existing run with payslips exists for this period and entity (e.g. Rejected, Draft, etc.)
+                # If so, load the saved payslips so user-edited attendance, payable days, and amounts are preserved!
+                existing_run = PayrollRun.objects.filter(period=period, entity=entity).first()
+                if not reset_attendance and existing_run and existing_run.payslip_set.exists():
+                    slips = existing_run.payslip_set.all().select_related(
+                        'employee', 'employee__department', 'employee__designation',
+                        'employee__site', 'employee__entity', 'employee__salary_structure'
+                    ).prefetch_related('lines', 'lines__rule')
+                    
+                    emp_count = 0
+                    total_gross = Decimal('0.00')
+                    total_deductions = Decimal('0.00')
+                    total_net = Decimal('0.00')
+                    employee_details = []
+                    
+                    def sfloat(val):
+                        try:
+                            return float(val or 0)
+                        except:
+                            return 0.0
+
+                    hide_money = not can_view_confidential
+
+                    for slip in slips:
+                        emp = slip.employee
+                        pf_amount = sum(float(l.amount) for l in slip.lines.all() if l.rule and 'PF' in str(l.rule.name).upper())
+                        pt_amount = sum(float(l.amount) for l in slip.lines.all() if l.rule and ('PT' in str(l.rule.name).upper() or 'PROFESSIONAL TAX' in str(l.rule.name).upper()))
+                        reimbursement = sum(float(l.amount) for l in slip.lines.all() if l.rule and 'REIMBURSEMENT' in str(l.rule.name).upper())
+                        incentive = sum(float(l.amount) for l in slip.lines.all() if l.rule and ('INCENTIVE' in str(l.rule.name).upper() or 'BONUS' in str(l.rule.name).upper()))
+                        arrears = sum(float(l.amount) for l in slip.lines.all() if l.rule and 'ARREAR' in str(l.rule.name).upper())
+                        ot_pay = sum(float(l.amount) for l in slip.lines.all() if l.rule and ('OVERTIME' in str(l.rule.name).upper() or 'OT' in str(l.rule.name).upper()))
+
+                        safe_name = f"{getattr(emp, 'first_name', '')} {getattr(emp, 'last_name', '')}".strip()
+                        safe_dept = emp.department.name if getattr(emp, 'department', None) else ''
+                        safe_site = emp.site.name if getattr(emp, 'site', None) else ''
+                        if getattr(emp, 'entity', None): safe_entity = emp.entity.name
+                        elif getattr(emp, 'branch', None) and getattr(emp.branch, 'entity', None): safe_entity = emp.branch.entity.name
+                        elif getattr(emp, 'site', None) and getattr(emp.site, 'branch', None) and getattr(emp.site.branch, 'entity', None): safe_entity = emp.site.branch.entity.name
+                        else: safe_entity = entity.name
+                        safe_bank = getattr(emp, 'bank_name', '')
+                        safe_ac = getattr(emp, 'bank_account', '')
+                        safe_ifsc = getattr(emp, 'ifsc', '')
+
+                        total_gross += Decimal(str(slip.gross or 0))
+                        total_deductions += Decimal(str(slip.deductions or 0))
+                        total_net += Decimal(str(slip.net or 0))
+                        emp_count += 1
+
+                        employee_details.append({
+                            'id': emp.id,
+                            'name': safe_name,
+                            'code': emp.code or f"EMP{emp.id}",
+                            'email': getattr(emp, 'email', ''),
+                            'number': getattr(emp, 'phone', '') or '',
+                            'workFrom': safe_site,
+                            'entity': safe_entity,
+                            '_entity': safe_entity,
+                            'department': safe_dept,
+                            'bankName': safe_bank or '',
+                            'acNo': safe_ac or '',
+                            'ifscCode': safe_ifsc or '',
+                            'currentSalary': 0 if hide_money else sfloat(getattr(emp, 'ctc', 0)),
+                            'totalDays': sfloat(slip.total_days or 30),
+                            'presentDays': sfloat(slip.days_present or 0),
+                            'leaves': sfloat(slip.annual_leaves or 0),
+                            'absentDays': max(0.0, sfloat(slip.total_days or 30) - sfloat(slip.days_paid or 0)),
+                            'lopDays': sfloat(slip.lop_days or 0),
+                            'ot': sfloat(slip.ot_hours or 0),
+                            'overtimeHours': sfloat(slip.ot_hours or 0),
+                            'overtimePay': 0 if hide_money else sfloat(ot_pay),
+                            'halfDays': sfloat(slip.half_days or 0),
+                            'latePenalties': sfloat(slip.late_penalty_days or 0),
+                            'daysPaid': sfloat(slip.days_paid or 0),
+                            'totalAmount': 0 if hide_money else sfloat(slip.gross),
+                            'arrears': 0 if hide_money else sfloat(arrears),
+                            'deduction': 0 if hide_money else sfloat(slip.deductions),
+                            'pf': 0 if hide_money else sfloat(pf_amount),
+                            'pt': 0 if hide_money else sfloat(pt_amount),
+                            'reimbursement': 0 if hide_money else sfloat(reimbursement),
+                            'incentive': 0 if hide_money else sfloat(incentive),
+                            'payableSalary': 0 if hide_money else sfloat(slip.net),
+                            'isConfidential': hide_money,
+                            'salaryStructure': emp.salary_structure_id if getattr(emp, 'salary_structure_id', None) else None,
+                            'salary_structure': emp.salary_structure_id if getattr(emp, 'salary_structure_id', None) else None,
+                            'missingFields': [],
+                            'hasSalaryStructure': True,
+                            'hasCtc': True,
+                            'isValidForRun': True,
+                        })
+
+                    results.append({
+                        'entity': entity.name,
+                        'entity_id': entity.id,
+                        'employees': emp_count,
+                        'gross': float(total_gross) if can_view_confidential else 0,
+                        'deduction': float(total_deductions) if can_view_confidential else 0,
+                        'net': float(total_net) if can_view_confidential else 0,
+                        'isConfidential': not can_view_confidential,
+                        'errors': [],
+                        'employee_details': employee_details,
+                        'employeeDetails': employee_details,
+                        'missing_employees': [],
+                        'can_run': True
+                    })
+                    continue
+
                 # Create a mock run for precomputation
                 run = PayrollRun(period=period, entity=entity, status='Draft')
                 precomputed_data = PayrollService._precompute_payroll_data(run)
@@ -1289,11 +1586,16 @@ class Form16DocumentViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         user = self.request.user
         emp = getattr(user, 'employee_profile', None)
         
-        # Super admin and org admins can view all Form 16 documents
+        # Super admin and users with tax/payroll permissions can view all Form 16 documents
         if user.is_superuser:
             return qs
             
-        if emp and emp.role in ['org_admin', 'admin']:
+        if emp and emp.dynamic_role and emp.dynamic_role.permissions:
+            perms = emp.dynamic_role.permissions
+            from authentication.permissions import coerce_permission_bool
+            if coerce_permission_bool(perms.get('can_view_confidential_payroll')) or coerce_permission_bool(perms.get('can_run_payroll')):
+                return qs
+        elif emp and getattr(emp, 'is_admin', False):
             return qs
             
         # Regular employees can only see their own

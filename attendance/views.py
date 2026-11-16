@@ -1408,10 +1408,15 @@ class AttendanceViewSet(viewsets.ViewSet):
             
         summary = {
             "present_days": present_count,
+            "presentDays": present_count,
             "absent_days": absent_count,
+            "absentDays": absent_count,
             "half_days": half_day_count,
+            "halfDays": half_day_count,
             "late_marks": late_count,
+            "lateMarks": late_count,
             "total_overtime_hours": round(total_ot_hours, 2),
+            "totalOvertimeHours": round(total_ot_hours, 2),
         }
         
         return Response({

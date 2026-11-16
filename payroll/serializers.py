@@ -39,6 +39,7 @@ class PayrollRunSerializer(serializers.ModelSerializer):
     net = serializers.SerializerMethodField()
     comments = serializers.SerializerMethodField()
     exceptions = serializers.SerializerMethodField()
+    employee_details = serializers.SerializerMethodField()
 
     class Meta:
         model = PayrollRun
@@ -55,16 +56,19 @@ class PayrollRunSerializer(serializers.ModelSerializer):
         if user.is_superuser:
             return True
         emp = getattr(user, 'employee_profile', None)
-        if emp and emp.role in ['super_admin', 'org_admin', 'admin']:
-            return True
-        from organisation.models import Site
-        if Site.objects.filter(contact_email=user.email).exists():
-            return True
         from authentication.permissions import coerce_permission_bool
         if emp and emp.dynamic_role and emp.dynamic_role.permissions:
             perms = emp.dynamic_role.permissions
-            if coerce_permission_bool(perms.get('can_view_confidential_payroll')) or coerce_permission_bool(perms.get('can_view_confidential')):
+            if (coerce_permission_bool(perms.get('can_view_confidential_payroll')) or 
+                coerce_permission_bool(perms.get('can_view_confidential')) or
+                coerce_permission_bool(perms.get('can_approve_payroll')) or
+                coerce_permission_bool(perms.get('can_run_payroll'))):
                 return True
+        from organisation.models import Site
+        if Site.objects.filter(contact_email=user.email).exists():
+            return True
+        if emp and getattr(emp, 'is_admin', False):
+            return True
         return False
         
     def get_gross(self, obj):
@@ -100,6 +104,64 @@ class PayrollRunSerializer(serializers.ModelSerializer):
         if hasattr(obj, 'payrollexception_set'):
             return [e.error_trace for e in obj.payrollexception_set.all()]
         return []
+
+    def get_employee_details(self, obj):
+        if not hasattr(obj, 'payslip_set'):
+            return []
+        slips = obj.payslip_set.select_related(
+            'employee', 'employee__department', 'employee__designation', 'employee__site', 'employee__entity'
+        ).prefetch_related('lines', 'lines__rule').all()
+        if not slips.exists():
+            return []
+        
+        can_view_conf = self._can_view_confidential()
+        details = []
+        for slip in slips:
+            emp = slip.employee
+            components = {}
+            for line in slip.lines.all():
+                components[line.rule.name.strip()] = float(line.amount)
+            
+            pf_amount = sum(v for k, v in components.items() if 'pf' in k.lower() or 'provident' in k.lower())
+            pt_amount = sum(v for k, v in components.items() if 'pt' in k.lower() or 'professional' in k.lower())
+            reimbursement = sum(v for k, v in components.items() if 'reimbursement' in k.lower())
+            incentive = sum(v for k, v in components.items() if 'incentive' in k.lower() or 'bonus' in k.lower())
+            arrears = sum(v for k, v in components.items() if 'arrear' in k.lower())
+            ot_pay = sum(v for k, v in components.items() if 'overtime' in k.lower() or 'ot' in k.lower())
+
+            hide_money = not can_view_conf
+            details.append({
+                'id': emp.id,
+                'name': f"{emp.first_name} {emp.last_name}".strip(),
+                'code': emp.code or f"EMP{emp.id}",
+                'email': emp.email or '',
+                'entity': obj.entity.name if obj.entity else '',
+                'department': emp.department.name if emp.department else 'General',
+                'bankName': emp.bank_name or '',
+                'acNo': emp.bank_account or '',
+                'ifscCode': emp.ifsc or '',
+                'currentSalary': 0 if hide_money else float(emp.ctc or 0),
+                'totalDays': float(slip.total_days or 30),
+                'presentDays': float(slip.days_present or 0),
+                'leaves': float(slip.annual_leaves or 0),
+                'lopDays': float(slip.lop_days or 0),
+                'halfDays': float(slip.half_days or 0),
+                'latePenalties': float(slip.late_penalty_days or 0),
+                'ot': float(slip.ot_hours or 0),
+                'overtimeHours': float(slip.ot_hours or 0),
+                'overtimePay': 0 if hide_money else float(ot_pay),
+                'daysPaid': float(slip.days_paid or 0),
+                'totalAmount': 0 if hide_money else float(slip.gross or 0),
+                'arrears': 0 if hide_money else float(arrears),
+                'deduction': 0 if hide_money else float(slip.deductions or 0),
+                'pf': 0 if hide_money else float(pf_amount),
+                'pt': 0 if hide_money else float(pt_amount),
+                'reimbursement': 0 if hide_money else float(reimbursement),
+                'incentive': 0 if hide_money else float(incentive),
+                'payableSalary': 0 if hide_money else float(slip.net or 0),
+                'isConfidential': hide_money,
+            })
+        return details
 
 class LoanSerializer(serializers.ModelSerializer):
     class Meta:

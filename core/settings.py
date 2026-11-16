@@ -94,8 +94,23 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'db.sqlite3',
+        'OPTIONS': {
+            'timeout': 60,
+        },
     }
 }
+
+# Automatically configure SQLite for high concurrency (WAL mode + 60s busy timeout)
+from django.db.backends.signals import connection_created
+from django.dispatch import receiver
+
+@receiver(connection_created)
+def configure_sqlite_connection(sender, connection, **kwargs):
+    if connection.vendor == 'sqlite':
+        cursor = connection.cursor()
+        cursor.execute('PRAGMA journal_mode = WAL;')
+        cursor.execute('PRAGMA busy_timeout = 60000;')
+        cursor.execute('PRAGMA synchronous = NORMAL;')
 
 
 # Password validation

@@ -98,9 +98,21 @@ class EmployeeExitSerializer(serializers.ModelSerializer):
 
 from .models import Notification
 class NotificationSerializer(serializers.ModelSerializer):
+    related_run_period = serializers.SerializerMethodField()
+
     class Meta:
         model = Notification
         fields = '__all__'
+
+    def get_related_run_period(self, obj):
+        if obj.related_run_id:
+            try:
+                from payroll.models import PayrollRun
+                run = PayrollRun.objects.filter(id=obj.related_run_id).values_list('period', flat=True).first()
+                return run or ''
+            except Exception:
+                return ''
+        return ''
 
 from .models import OfferLetter, OfferTemplate
 

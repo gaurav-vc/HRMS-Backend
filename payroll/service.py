@@ -253,7 +253,7 @@ class PayrollService:
         worked_days = float(present_count) + (float(half_day_count) * 0.5)
         total_att_records = float(present_count) + float(late_count) + float(half_day_count) + float(absent_count)
 
-        # 2. Determine payable days cleanly
+        # Determine payable days cleanly
         if period_eligible_days <= 0.0:
             calculated_paid_days = 0.0
         elif total_att_records > 0:
@@ -269,11 +269,19 @@ class PayrollService:
             # Exception-based attendance: active contracts receive standard monthly pay minus approved LOP
             calculated_paid_days = max(0.0, period_eligible_days - float(lop_days))
             
-        # Determine payable days with 100% mathematical precision
+        # Determine payable days with mathematical precision
         calculated_override_payable = max(0.0, period_eligible_days - float(lop_days) - (float(half_day_count) * 0.5) - float(late_penalty_days))
-        calculated_override_payable = min(calculated_override_payable, period_eligible_days)
 
         if emp_override:
+            for key in ['totalDays', 'total_days']:
+                if key in emp_override and emp_override[key] is not None and str(emp_override[key]).strip() != '':
+                    try:
+                        total_days = float(emp_override[key])
+                        period_eligible_days = float(total_days)
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
             user_days_paid = None
             for key in ['daysPaid', 'days_paid', 'payable_days', 'payableDays']:
                 if key in emp_override and emp_override[key] is not None and str(emp_override[key]).strip() != '':
@@ -283,22 +291,24 @@ class PayrollService:
                     except (ValueError, TypeError):
                         pass
 
-            has_explicit_deduction_override = any(
-                k in emp_override and emp_override[k] is not None and str(emp_override[k]).strip() != ''
-                for k in ['lop_days', 'lopDays', 'lop', 'half_days', 'halfDays', 'late_penalties', 'latePenalties']
-            )
+            user_present_days = None
+            for key in ['presentDays', 'present_days', 'actual_present_days']:
+                if key in emp_override and emp_override[key] is not None and str(emp_override[key]).strip() != '':
+                    try:
+                        user_present_days = float(emp_override[key])
+                        break
+                    except (ValueError, TypeError):
+                        pass
 
-            if has_explicit_deduction_override:
-                if user_days_paid is not None and user_days_paid < calculated_override_payable:
-                    present_days = user_days_paid
-                else:
-                    present_days = calculated_override_payable
-            elif user_days_paid is not None:
-                present_days = max(0.0, min(user_days_paid, float(total_days)))
-            elif 'present_days' in emp_override or 'presentDays' in emp_override:
-                present_days = max(0.0, min(float(emp_override.get('present_days') or emp_override.get('presentDays') or 0), float(total_days)))
+            if user_days_paid is not None:
+                present_days = max(0.0, user_days_paid)
+            elif user_present_days is not None:
+                present_days = max(0.0, user_present_days + float(paid_leave_days))
             else:
-                present_days = max(0.0, min(calculated_paid_days, float(total_days)))
+                present_days = max(0.0, calculated_paid_days)
+
+            if user_present_days is not None:
+                worked_days = user_present_days
         else:
             present_days = max(0.0, min(calculated_paid_days, float(total_days)))
         
@@ -698,9 +708,9 @@ class PayrollService:
                     SimulatedPayslip.objects.filter(run=run).delete()
                     employees = Employee.objects.filter(Q(entity=run.entity) | Q(branch__entity=run.entity) | Q(site__branch__entity=run.entity), status='Active')
                 else:
-                    employees = Employee.objects.filter(Q(entity=run.entity) | Q(branch__entity=run.entity) | Q(site__branch__entity=run.entity), status='Active').exclude(
-                        payslip__run=run
-                    )
+                    # Cleanly re-generate payslips for this run so attendance and parameter changes take immediate effect
+                    Payslip.objects.filter(run=run).delete()
+                    employees = Employee.objects.filter(Q(entity=run.entity) | Q(branch__entity=run.entity) | Q(site__branch__entity=run.entity), status='Active')
                     
                 # PREFETCH to kill N+1 queries
                 employees = employees.select_related('salary_structure').prefetch_related(
@@ -758,37 +768,69 @@ class PayrollService:
                             
                         emp_override = None
                         if overrides:
-                            emp_override = next((o for o in overrides if o.get('id') == emp.id), None)
+                            emp_override = next((o for o in overrides if str(o.get('id', '')) == str(emp.id)), None)
                             
                         gross, ded, net, line_items = PayrollService.process_employee_in_memory(
                             emp, run, precomputed_data, is_simulation, include_variable_bonus, emp_override=emp_override, include_leaves_encashment=include_leaves_encashment
                         )
                         
+                        context = PayrollService._get_context_for_employee(emp, precomputed_data, emp_override=emp_override)
+                        
                         if emp_override:
-                            from decimal import Decimal
-                            # Allow hard overrides of financial amounts if they were edited directly
-                            # The engine already recalculated based on attendance, but if user explicitly edited gross/net, honor it
-                            if 'totalAmount' in emp_override: gross = Decimal(str(emp_override['totalAmount']))
-                            if 'deduction' in emp_override: ded = Decimal(str(emp_override['deduction']))
-                            if 'payableSalary' in emp_override: net = Decimal(str(emp_override['payableSalary']))
+                            # Apply any specific manual component adjustments if passed
                             for item in line_items:
                                 rule_name = getattr(item['rule'], 'name', '').upper()
-                                if 'PF' in rule_name and 'pf' in emp_override:
+                                if 'PF' in rule_name and 'pf' in emp_override and emp_override.get('hasManualPf'):
                                     item['amount'] = Decimal(str(emp_override['pf']))
-                                elif ('PT' in rule_name or 'PROFESSIONAL TAX' in rule_name) and 'pt' in emp_override:
+                                elif ('PT' in rule_name or 'PROFESSIONAL TAX' in rule_name) and 'pt' in emp_override and emp_override.get('hasManualPt'):
                                     item['amount'] = Decimal(str(emp_override['pt']))
-                                elif 'REIMBURSEMENT' in rule_name and 'reimbursement' in emp_override:
+                                elif 'REIMBURSEMENT' in rule_name and 'reimbursement' in emp_override and emp_override['reimbursement'] is not None:
                                     item['amount'] = Decimal(str(emp_override['reimbursement']))
-                                elif ('INCENTIVE' in rule_name or 'BONUS' in rule_name) and 'incentive' in emp_override:
+                                elif ('INCENTIVE' in rule_name or 'BONUS' in rule_name) and 'incentive' in emp_override and emp_override['incentive'] is not None:
                                     item['amount'] = Decimal(str(emp_override['incentive']))
                                 elif ('OVERTIME' in rule_name or 'OT' in rule_name) and ('overtimePay' in emp_override or 'otAmount' in emp_override):
-                                    ot_override_amt = emp_override.get('overtimePay') or emp_override.get('otAmount')
-                                    item['amount'] = Decimal(str(ot_override_amt))
+                                    ot_override_amt = emp_override.get('overtimePay') if emp_override.get('overtimePay') is not None else emp_override.get('otAmount')
+                                    if ot_override_amt is not None:
+                                        item['amount'] = Decimal(str(ot_override_amt))
+
+                            # Re-verify and maintain 100% strict mathematical invariant:
+                            gross = sum((item['amount'] for item in line_items if item['rule'].type == 'Earning'), Decimal('0.00')).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+                            ded = sum((item['amount'] for item in line_items if item['rule'].type == 'Deduction'), Decimal('0.00')).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+                            net = (gross - ded).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
                         
+                        serializable_snapshot = {}
+                        for k, v in context.items():
+                            if isinstance(v, Decimal):
+                                serializable_snapshot[k] = float(v)
+                            elif isinstance(v, (int, float, str, bool)):
+                                serializable_snapshot[k] = v
+
                         if is_simulation:
-                            slip = SimulatedPayslip(employee=emp, run=run, period=run.period, gross=gross, deductions=ded, net=net)
+                            slip = SimulatedPayslip(
+                                employee=emp, run=run, period=run.period, gross=gross, deductions=ded, net=net,
+                                days_present=Decimal(str(context.get('actual_present_days', context.get('present_days', 0)))),
+                                days_paid=Decimal(str(context.get('paid_days', context.get('present_days', 0)))),
+                                total_days=Decimal(str(context.get('total_days', 30))),
+                                lop_days=Decimal(str(context.get('lop_days', 0))),
+                                half_days=Decimal(str(context.get('half_day_count', 0))),
+                                late_penalty_days=Decimal(str(context.get('late_penalty_days', 0))),
+                                ot_hours=Decimal(str(context.get('ot_hours', context.get('overtime_hours', 0)))),
+                                annual_leaves=Decimal(str(context.get('annual_leaves', context.get('paid_leave_days', 0)))),
+                                attendance_snapshot=serializable_snapshot,
+                            )
                         else:
-                            slip = Payslip(employee=emp, run=run, period=run.period, gross=gross, deductions=ded, net=net)
+                            slip = Payslip(
+                                employee=emp, run=run, period=run.period, gross=gross, deductions=ded, net=net,
+                                days_present=Decimal(str(context.get('actual_present_days', context.get('present_days', 0)))),
+                                days_paid=Decimal(str(context.get('paid_days', context.get('present_days', 0)))),
+                                total_days=Decimal(str(context.get('total_days', 30))),
+                                lop_days=Decimal(str(context.get('lop_days', 0))),
+                                half_days=Decimal(str(context.get('half_day_count', 0))),
+                                late_penalty_days=Decimal(str(context.get('late_penalty_days', 0))),
+                                ot_hours=Decimal(str(context.get('ot_hours', context.get('overtime_hours', 0)))),
+                                annual_leaves=Decimal(str(context.get('annual_leaves', context.get('paid_leave_days', 0)))),
+                                attendance_snapshot=serializable_snapshot,
+                            )
                             
                         slips_to_create.append(slip)
                         slip_lines_data.append(line_items)
