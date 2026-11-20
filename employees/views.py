@@ -710,6 +710,14 @@ Regards,
             send_email = send_email_val.lower() in ('true', '1')
         else:
             send_email = bool(send_email_val)
+
+        send_sms_val = request.data.get('send_sms')
+        if send_sms_val is None:
+            send_sms_val = request.data.get('sendSms', True)
+        if isinstance(send_sms_val, str):
+            send_sms = send_sms_val.lower() in ('true', '1')
+        else:
+            send_sms = bool(send_sms_val)
         
         import secrets
         import string
@@ -804,15 +812,47 @@ HR Operations
                 email_sent = True
             except Exception as e:
                 print(f"Failed to start password email thread: {e}")
+
+        sms_sent = False
+        target_phone = target_employee.phone or ''
+        if send_sms and target_phone:
+            import threading
+            from core.jio_sms import JioSMSService
+            origin = request.headers.get('Origin') or request.build_absolute_uri('/')
+            login_url = origin.rstrip('/') + '/auth'
+            login_id = target_email or target_employee.code or target_phone
+            def _send_sms():
+                try:
+                    JioSMSService.send_credentials_sms(
+                        phone=target_phone,
+                        first_name=target_employee.first_name,
+                        login_id=login_id,
+                        password=new_password,
+                        login_url=login_url
+                    )
+                except Exception as err:
+                    print(f"[Password Reset SMS Error] {err}")
+            threading.Thread(target=_send_sms, daemon=True).start()
+            sms_sent = True
                 
+        status_msg_parts = []
+        if email_sent:
+            status_msg_parts.append(f"email to {target_email}")
+        if sms_sent:
+            status_msg_parts.append(f"SMS to {target_phone}")
+        status_msg = f"Credentials sent via {', '.join(status_msg_parts)}." if status_msg_parts else "Password updated successfully."
+
         return Response({
             "success": True,
             "email_sent": email_sent,
             "emailSent": email_sent,
+            "sms_sent": sms_sent,
+            "smsSent": sms_sent,
             "recipient": target_email,
+            "recipient_phone": target_phone,
             "generated_password": new_password if password_mode != 'custom' else None,
             "generatedPassword": new_password if password_mode != 'custom' else None,
-            "message": f"Credentials updated successfully and sent to {target_email}." if email_sent else "Password updated successfully."
+            "message": status_msg
         })
 
 from .models import EmployeeDocument, EmployeeTransfer, EmployeeExit

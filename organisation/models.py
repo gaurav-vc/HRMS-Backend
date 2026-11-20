@@ -59,6 +59,13 @@ class Site(models.Model):
     qr_enabled = models.BooleanField(default=True)
     face_enabled = models.BooleanField(default=True)
     is_saturday_working = models.BooleanField(default=False)
+    is_sunday_working = models.BooleanField(default=False, help_text="Allow shift assignment and attendance on Sundays for this site")
+    split_shift_incomplete_policy = models.CharField(
+        max_length=20,
+        default='Half Day',
+        choices=[('Half Day', 'Half Day'), ('Absent', 'Full Day Deduction (Absent)')],
+        help_text="Attendance status when employee completes 1st part of split shift but misses 2nd part"
+    )
     is_sub_site = models.BooleanField(default=False)
     parent_site = models.ForeignKey('self', on_delete=models.CASCADE, related_name='sub_sites', null=True, blank=True, help_text="The main client site this sub-site belongs to")
     
@@ -123,6 +130,13 @@ class AttendancePolicy(models.Model):
     face_match_threshold = models.DecimalField(max_digits=5, decimal_places=2, default=95.00, help_text="Strict accuracy percentage required for face verification")
     require_qr = models.BooleanField(default=True)
     require_gps = models.BooleanField(default=True)
+    is_sunday_working = models.BooleanField(default=False, help_text="Allow shift assignment and attendance on Sundays")
+    split_shift_incomplete_policy = models.CharField(
+        max_length=20,
+        default='Half Day',
+        choices=[('Half Day', 'Half Day'), ('Absent', 'Full Day Deduction (Absent)')],
+        help_text="Attendance status when employee completes 1st part of split shift but misses 2nd part"
+    )
     wfh_employees = models.ManyToManyField('employees.Employee', related_name='wfh_policies', blank=True, help_text="Employees granted Work From Home privileges to bypass geofence.")
 
     def __str__(self):

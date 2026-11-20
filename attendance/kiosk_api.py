@@ -133,7 +133,7 @@ class KioskPunchAPIView(APIView):
                 }, status=status.HTTP_400_BAD_REQUEST)
 
             live_encoding = encoding_res.get('encoding')
-            threshold = max(float(site.kiosk_similarity_threshold or 0.50), 0.50)
+            threshold = float(site.kiosk_similarity_threshold or 0.45)
 
             # 4. Site-Scoped 1:N Face Search
             # Candidate pool: employees assigned to this site, enrolled in site, parent site, sub-sites, or site organization
@@ -325,40 +325,92 @@ class KioskPunchAPIView(APIView):
             }
         )
 
-        if punch_type == 'IN':
-            if not daily_att.first_check_in:
-                daily_att.first_check_in = now
-                from attendance.models import ShiftAssignment
-                import datetime
-                shift_assignment = ShiftAssignment.objects.filter(employee=matched_employee, date=today).first()
-                if shift_assignment and shift_assignment.shift:
-                    shift = shift_assignment.shift
-                    cutoff_dt = datetime.datetime.combine(today, shift.start_time) + datetime.timedelta(minutes=shift.grace_minutes)
-                    if timezone.is_naive(cutoff_dt):
-                        cutoff_dt = timezone.make_aware(cutoff_dt)
-                    if now > cutoff_dt:
-                        daily_att.attendance_status = 'Late'
-                    else:
-                        daily_att.attendance_status = 'Present'
-                else:
-                    shift_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
-                    if now > shift_start:
-                        daily_att.attendance_status = 'Late'
-                    else:
-                        daily_att.attendance_status = 'Present'
-        else:
-            daily_att.last_check_out = now
+        # Check shift assignment for split shift detection
+        from attendance.models import ShiftAssignment
+        import datetime
+        shift_assignment = ShiftAssignment.objects.filter(employee=matched_employee, date=today).first()
+        shift = shift_assignment.shift if (shift_assignment and shift_assignment.shift) else None
+        is_split = bool(shift and getattr(shift, 'is_split_shift', False)) or getattr(daily_att, 'is_split_shift', False)
 
-        if daily_att.first_check_in and daily_att.last_check_out:
-            duration = (daily_att.last_check_out - daily_att.first_check_in).total_seconds() / 3600.0
-            daily_att.total_work_hours = round(max(0.0, duration), 2)
-            if daily_att.total_work_hours >= 8.0:
-                if daily_att.attendance_status not in ['Late']:
+        if is_split:
+            daily_att.is_split_shift = True
+            # Split shift 4-punch tracking
+            if punch_type == 'IN':
+                if not daily_att.part1_in:
+                    daily_att.part1_in = now
+                    daily_att.first_check_in = now
+                elif daily_att.part1_out and not daily_att.part2_in:
+                    daily_att.part2_in = now
+            else: # OUT
+                if daily_att.part1_in and not daily_att.part1_out:
+                    daily_att.part1_out = now
+                elif daily_att.part2_in and not daily_att.part2_out:
+                    daily_att.part2_out = now
+                    daily_att.last_check_out = now
+
+            # Work hours
+            h1 = 0.0
+            h2 = 0.0
+            if daily_att.part1_in and daily_att.part1_out:
+                h1 = max(0.0, (daily_att.part1_out - daily_att.part1_in).total_seconds() / 3600.0)
+            if daily_att.part2_in and daily_att.part2_out:
+                h2 = max(0.0, (daily_att.part2_out - daily_att.part2_in).total_seconds() / 3600.0)
+
+            total_hours = round(h1 + h2, 2)
+            daily_att.total_work_hours = total_hours
+            daily_att.overtime_hours = daily_att.compute_overtime(total_hours)
+
+            # If 1st shift completed and 2nd shift skipped -> apply site/policy rule
+            if daily_att.part1_in and daily_att.part1_out and not daily_att.part2_in:
+                policy = 'Half Day'
+                if hasattr(site, 'attendance_policy') and site.attendance_policy and site.attendance_policy.split_shift_incomplete_policy:
+                    policy = site.attendance_policy.split_shift_incomplete_policy
+                elif getattr(site, 'split_shift_incomplete_policy', None):
+                    policy = site.split_shift_incomplete_policy
+                daily_att.attendance_status = 'Absent' if policy == 'Absent' else 'Half Day'
+            elif daily_att.part1_in and daily_att.part1_out and daily_att.part2_in and daily_att.part2_out:
+                if total_hours >= 8.0:
                     daily_att.attendance_status = 'Present'
-            elif daily_att.total_work_hours >= 4.0:
-                daily_att.attendance_status = 'Half Day'
+                elif total_hours >= 4.0:
+                    daily_att.attendance_status = 'Half Day'
+                else:
+                    daily_att.attendance_status = 'Absent'
             else:
-                daily_att.attendance_status = 'Absent'
+                if not daily_att.attendance_status:
+                    daily_att.attendance_status = 'Present'
+        else:
+            # Regular shift
+            if punch_type == 'IN':
+                if not daily_att.first_check_in:
+                    daily_att.first_check_in = now
+                    if shift:
+                        cutoff_dt = datetime.datetime.combine(today, shift.start_time) + datetime.timedelta(minutes=shift.grace_minutes)
+                        if timezone.is_naive(cutoff_dt):
+                            cutoff_dt = timezone.make_aware(cutoff_dt)
+                        if now > cutoff_dt:
+                            daily_att.attendance_status = 'Late'
+                        else:
+                            daily_att.attendance_status = 'Present'
+                    else:
+                        shift_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                        if now > shift_start:
+                            daily_att.attendance_status = 'Late'
+                        else:
+                            daily_att.attendance_status = 'Present'
+            else:
+                daily_att.last_check_out = now
+
+            if daily_att.first_check_in and daily_att.last_check_out:
+                duration = (daily_att.last_check_out - daily_att.first_check_in).total_seconds() / 3600.0
+                daily_att.total_work_hours = round(max(0.0, duration), 2)
+                daily_att.overtime_hours = daily_att.compute_overtime(daily_att.total_work_hours)
+                if daily_att.total_work_hours >= 8.0:
+                    if daily_att.attendance_status not in ['Late']:
+                        daily_att.attendance_status = 'Present'
+                elif daily_att.total_work_hours >= 4.0:
+                    daily_att.attendance_status = 'Half Day'
+                else:
+                    daily_att.attendance_status = 'Absent'
 
         daily_att.save()
 

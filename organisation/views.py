@@ -91,6 +91,19 @@ class AttendancePolicyViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 raw_wfh = request.data.get('wfhEmployees')
             if raw_wfh is not None:
                 policy.wfh_employees.set(raw_wfh)
+            if policy.site:
+                if hasattr(policy, 'is_sunday_working'):
+                    policy.site.is_sunday_working = policy.is_sunday_working
+                if hasattr(policy, 'split_shift_incomplete_policy') and policy.split_shift_incomplete_policy:
+                    policy.site.split_shift_incomplete_policy = policy.split_shift_incomplete_policy
+                policy.site.save(update_fields=['is_sunday_working', 'split_shift_incomplete_policy'])
+            elif not policy.employee and not policy.organization and not policy.site:
+                if hasattr(policy, 'is_sunday_working'):
+                    Site.objects.all().update(is_sunday_working=policy.is_sunday_working)
+                    AttendancePolicy.objects.filter(site__isnull=False).update(is_sunday_working=policy.is_sunday_working)
+                if hasattr(policy, 'split_shift_incomplete_policy') and policy.split_shift_incomplete_policy:
+                    Site.objects.all().update(split_shift_incomplete_policy=policy.split_shift_incomplete_policy)
+                    AttendancePolicy.objects.filter(site__isnull=False).update(split_shift_incomplete_policy=policy.split_shift_incomplete_policy)
             return Response(self.get_serializer(policy).data, status=status.HTTP_200_OK)
 
         serializer = self.get_serializer(data=request.data)
@@ -101,6 +114,19 @@ class AttendancePolicyViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             raw_wfh = request.data.get('wfhEmployees')
         if raw_wfh is not None:
             policy.wfh_employees.set(raw_wfh)
+        if policy.site:
+            if hasattr(policy, 'is_sunday_working'):
+                policy.site.is_sunday_working = policy.is_sunday_working
+            if hasattr(policy, 'split_shift_incomplete_policy') and policy.split_shift_incomplete_policy:
+                policy.site.split_shift_incomplete_policy = policy.split_shift_incomplete_policy
+            policy.site.save(update_fields=['is_sunday_working', 'split_shift_incomplete_policy'])
+        elif not policy.employee and not policy.organization and not policy.site:
+            if hasattr(policy, 'is_sunday_working'):
+                Site.objects.all().update(is_sunday_working=policy.is_sunday_working)
+                AttendancePolicy.objects.filter(site__isnull=False).update(is_sunday_working=policy.is_sunday_working)
+            if hasattr(policy, 'split_shift_incomplete_policy') and policy.split_shift_incomplete_policy:
+                Site.objects.all().update(split_shift_incomplete_policy=policy.split_shift_incomplete_policy)
+                AttendancePolicy.objects.filter(site__isnull=False).update(split_shift_incomplete_policy=policy.split_shift_incomplete_policy)
         return Response(self.get_serializer(policy).data, status=status.HTTP_201_CREATED)
 
     def update(self, request, *args, **kwargs):
@@ -132,6 +158,19 @@ class AttendancePolicyViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             raw_wfh = request.data.get('wfhEmployees')
         if raw_wfh is not None:
             policy.wfh_employees.set(raw_wfh)
+        if policy.site:
+            if hasattr(policy, 'is_sunday_working'):
+                policy.site.is_sunday_working = policy.is_sunday_working
+            if hasattr(policy, 'split_shift_incomplete_policy') and policy.split_shift_incomplete_policy:
+                policy.site.split_shift_incomplete_policy = policy.split_shift_incomplete_policy
+            policy.site.save(update_fields=['is_sunday_working', 'split_shift_incomplete_policy'])
+        elif not policy.employee and not policy.organization and not policy.site:
+            if hasattr(policy, 'is_sunday_working'):
+                Site.objects.all().update(is_sunday_working=policy.is_sunday_working)
+                AttendancePolicy.objects.filter(site__isnull=False).update(is_sunday_working=policy.is_sunday_working)
+            if hasattr(policy, 'split_shift_incomplete_policy') and policy.split_shift_incomplete_policy:
+                Site.objects.all().update(split_shift_incomplete_policy=policy.split_shift_incomplete_policy)
+                AttendancePolicy.objects.filter(site__isnull=False).update(split_shift_incomplete_policy=policy.split_shift_incomplete_policy)
         return Response(self.get_serializer(policy).data, status=status.HTTP_200_OK)
 
     def get_object(self):

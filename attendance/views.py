@@ -889,71 +889,111 @@ class AttendanceViewSet(viewsets.ViewSet):
                         }
                     )
                     
-                    if punch_type == 'IN':
-                        if not daily_att.first_check_in:
-                            daily_att.first_check_in = now
-                            from .models import ShiftAssignment
-                            import datetime
-                            shift_assignment = ShiftAssignment.objects.filter(employee=employee, date=today).first()
-                            
-                            shift_start_dt = None
-                            if shift_assignment and shift_assignment.shift:
-                                shift = shift_assignment.shift
-                                shift_start_dt = datetime.datetime.combine(today, shift.start_time)
-                                if timezone.is_naive(shift_start_dt):
-                                    shift_start_dt = timezone.make_aware(shift_start_dt)
-                            else:
-                                shift_start_dt = now.replace(hour=9, minute=30, second=0, microsecond=0)
-                                if timezone.is_naive(shift_start_dt):
-                                    shift_start_dt = timezone.make_aware(shift_start_dt)
+                    from .models import ShiftAssignment
+                    import datetime
+                    shift_assignment = ShiftAssignment.objects.filter(employee=employee, date=today).first()
+                    shift = shift_assignment.shift if (shift_assignment and shift_assignment.shift) else None
+                    is_split = bool(shift and getattr(shift, 'is_split_shift', False)) or getattr(daily_att, 'is_split_shift', False)
 
-                            # Evaluate punctuality slabs dynamically
-                            punct_res = evaluate_punctuality_slabs(employee, now, shift_start_dt)
-                            if punct_res["matched"]:
-                                daily_att.attendance_status = punct_res["status"]
-                                daily_att.late_deduction_amount = punct_res["penalty_amount"]
-                                daily_att.punctuality_penalty_details = punct_res["details"]
-                                
-                                from organisation.models import PunctualityPenaltyLog
-                                PunctualityPenaltyLog.objects.create(
-                                    daily_attendance=daily_att,
-                                    slab=punct_res["slab"],
-                                    penalty_amount=punct_res["penalty_amount"],
-                                    penalty_type=punct_res["penalty_type"],
-                                    punch_time=now,
-                                    shift_start=shift_start_dt,
-                                    minutes_late=int(max(0, punct_res["minutes_offset"]))
-                                )
-                            else:
-                                # Standard fallback if no custom slab policy applies
-                                if shift_assignment and shift_assignment.shift:
-                                    shift = shift_assignment.shift
-                                    cutoff_dt = shift_start_dt + datetime.timedelta(minutes=shift.grace_minutes)
-                                    if now > cutoff_dt:
-                                        daily_att.attendance_status = 'Late'
-                                    else:
-                                        daily_att.attendance_status = 'Present'
-                                else:
-                                    if now > shift_start_dt:
-                                        daily_att.attendance_status = 'Late'
-                                    else:
-                                        daily_att.attendance_status = 'Present'
-                    else:
-                        daily_att.last_check_out = now
-                        
-                    if daily_att.first_check_in and daily_att.last_check_out:
-                        duration = daily_att.last_check_out - daily_att.first_check_in
-                        hours = duration.total_seconds() / 3600
-                        daily_att.total_work_hours = round(hours, 2)
-                        daily_att.overtime_hours = daily_att.compute_overtime(hours)
-                        if hours >= 8:
-                            if daily_att.attendance_status not in ['Late']:
-                                daily_att.attendance_status = 'Present'
-                        elif hours >= 4:
-                            daily_att.attendance_status = 'Half Day'
+                    if is_split:
+                        daily_att.is_split_shift = True
+                        if punch_type == 'IN':
+                            if not daily_att.part1_in:
+                                daily_att.part1_in = now
+                                daily_att.first_check_in = now
+                            elif daily_att.part1_out and not daily_att.part2_in:
+                                daily_att.part2_in = now
                         else:
-                            daily_att.attendance_status = 'Absent'
+                            if daily_att.part1_in and not daily_att.part1_out:
+                                daily_att.part1_out = now
+                            elif daily_att.part2_in and not daily_att.part2_out:
+                                daily_att.part2_out = now
+                                daily_att.last_check_out = now
+
+                        h1 = 0.0
+                        h2 = 0.0
+                        if daily_att.part1_in and daily_att.part1_out:
+                            h1 = max(0.0, (daily_att.part1_out - daily_att.part1_in).total_seconds() / 3600.0)
+                        if daily_att.part2_in and daily_att.part2_out:
+                            h2 = max(0.0, (daily_att.part2_out - daily_att.part2_in).total_seconds() / 3600.0)
+
+                        total_hours = round(h1 + h2, 2)
+                        daily_att.total_work_hours = total_hours
+                        daily_att.overtime_hours = daily_att.compute_overtime(total_hours)
+
+                        if daily_att.part1_in and daily_att.part1_out and not daily_att.part2_in:
+                            policy = get_split_shift_incomplete_policy(employee, matched_site)
+                            daily_att.attendance_status = 'Absent' if policy == 'Absent' else 'Half Day'
+                        elif daily_att.part1_in and daily_att.part1_out and daily_att.part2_in and daily_att.part2_out:
+                            if total_hours >= 8.0:
+                                daily_att.attendance_status = 'Present'
+                            elif total_hours >= 4.0:
+                                daily_att.attendance_status = 'Half Day'
+                            else:
+                                daily_att.attendance_status = 'Absent'
+                        else:
+                            if not daily_att.attendance_status:
+                                daily_att.attendance_status = 'Present'
+                    else:
+                        if punch_type == 'IN':
+                            if not daily_att.first_check_in:
+                                daily_att.first_check_in = now
+                                shift_start_dt = None
+                                if shift:
+                                    shift_start_dt = datetime.datetime.combine(today, shift.start_time)
+                                    if timezone.is_naive(shift_start_dt):
+                                        shift_start_dt = timezone.make_aware(shift_start_dt)
+                                else:
+                                    shift_start_dt = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                                    if timezone.is_naive(shift_start_dt):
+                                        shift_start_dt = timezone.make_aware(shift_start_dt)
+
+                                # Evaluate punctuality slabs dynamically
+                                punct_res = evaluate_punctuality_slabs(employee, now, shift_start_dt)
+                                if punct_res["matched"]:
+                                    daily_att.attendance_status = punct_res["status"]
+                                    daily_att.late_deduction_amount = punct_res["penalty_amount"]
+                                    daily_att.punctuality_penalty_details = punct_res["details"]
+                                    
+                                    from organisation.models import PunctualityPenaltyLog
+                                    PunctualityPenaltyLog.objects.create(
+                                        daily_attendance=daily_att,
+                                        slab=punct_res["slab"],
+                                        penalty_amount=punct_res["penalty_amount"],
+                                        penalty_type=punct_res["penalty_type"],
+                                        punch_time=now,
+                                        shift_start=shift_start_dt,
+                                        minutes_late=int(max(0, punct_res["minutes_offset"]))
+                                    )
+                                else:
+                                    # Standard fallback if no custom slab policy applies
+                                    if shift:
+                                        cutoff_dt = shift_start_dt + datetime.timedelta(minutes=shift.grace_minutes)
+                                        if now > cutoff_dt:
+                                            daily_att.attendance_status = 'Late'
+                                        else:
+                                            daily_att.attendance_status = 'Present'
+                                    else:
+                                        if now > shift_start_dt:
+                                            daily_att.attendance_status = 'Late'
+                                        else:
+                                            daily_att.attendance_status = 'Present'
+                        else:
+                            daily_att.last_check_out = now
                             
+                        if daily_att.first_check_in and daily_att.last_check_out:
+                            duration = daily_att.last_check_out - daily_att.first_check_in
+                            hours = duration.total_seconds() / 3600
+                            daily_att.total_work_hours = round(hours, 2)
+                            daily_att.overtime_hours = daily_att.compute_overtime(hours)
+                            if hours >= 8:
+                                if daily_att.attendance_status not in ['Late']:
+                                    daily_att.attendance_status = 'Present'
+                            elif hours >= 4:
+                                daily_att.attendance_status = 'Half Day'
+                            else:
+                                daily_att.attendance_status = 'Absent'
+                                
                     daily_att.save()
                 else:
                     daily_att, _ = DailyAttendance.objects.select_for_update().get_or_create(
@@ -1831,10 +1871,95 @@ def is_saturday_working_for_employee(employee):
     except Exception:
         return False
 
+def is_sunday_working_for_employee(employee):
+    from organisation.models import AttendancePolicy
+    # 1. Check AttendancePolicy for this employee directly
+    try:
+        emp_policy = AttendancePolicy.objects.filter(employee=employee).first()
+        if emp_policy is not None and emp_policy.is_sunday_working:
+            return True
+    except Exception:
+        pass
+
+    # 2. Check site AttendancePolicy or site model toggle
+    site = getattr(employee, 'site', None)
+    if site:
+        try:
+            site_policy = AttendancePolicy.objects.filter(site=site).first()
+            if site_policy is not None and site_policy.is_sunday_working:
+                return True
+        except Exception:
+            pass
+        if getattr(site, 'is_sunday_working', False):
+            return True
+
+    # 3. Check enrolled_sites if employee has multi-site assignments
+    if hasattr(employee, 'enrolled_sites'):
+        for es in employee.enrolled_sites.all():
+            try:
+                es_policy = AttendancePolicy.objects.filter(site=es).first()
+                if es_policy is not None and es_policy.is_sunday_working:
+                    return True
+            except Exception:
+                pass
+            if getattr(es, 'is_sunday_working', False):
+                return True
+
+    # 4. Check entity AttendancePolicy
+    entity = getattr(employee, 'entity', None)
+    if entity:
+        try:
+            ent_policy = AttendancePolicy.objects.filter(entity=entity).first()
+            if ent_policy is not None and ent_policy.is_sunday_working:
+                return True
+        except Exception:
+            pass
+
+    # 5. Check global AttendancePolicy
+    try:
+        global_policy = AttendancePolicy.objects.filter(site__isnull=True, employee__isnull=True, entity__isnull=True).first()
+        if global_policy is not None and global_policy.is_sunday_working:
+            return True
+    except Exception:
+        pass
+
+    # 6. Fallback to leaves.LeavePolicyConfiguration
+    try:
+        from leaves.models import LeavePolicyConfiguration
+        config = LeavePolicyConfiguration.get_settings()
+        if getattr(config, 'is_sunday_working', False):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+def get_split_shift_incomplete_policy(employee, site=None):
+    if employee and hasattr(employee, 'attendance_policy') and employee.attendance_policy:
+        return employee.attendance_policy.split_shift_incomplete_policy
+    target_site = site or getattr(employee, 'site', None)
+    if target_site:
+        if hasattr(target_site, 'attendance_policy') and target_site.attendance_policy:
+            return target_site.attendance_policy.split_shift_incomplete_policy
+        if getattr(target_site, 'split_shift_incomplete_policy', None):
+            return target_site.split_shift_incomplete_policy
+    if employee and hasattr(employee, 'entity') and employee.entity:
+        if hasattr(employee.entity, 'default_attendance_policy') and employee.entity.default_attendance_policy:
+            return employee.entity.default_attendance_policy.split_shift_incomplete_policy
+    try:
+        from organisation.models import AttendancePolicy
+        global_policy = AttendancePolicy.objects.filter(site__isnull=True, employee__isnull=True, entity__isnull=True).first()
+        if global_policy and global_policy.split_shift_incomplete_policy:
+            return global_policy.split_shift_incomplete_policy
+    except Exception:
+        pass
+    return 'Half Day'
+
 def is_working_day(employee, date):
-    # Sunday is always off
+    # Sunday is off unless Sunday working toggle is enabled for employee's site
     if date.weekday() == 6:
-        return False
+        if not is_sunday_working_for_employee(employee):
+            return False
     # Saturday is off unless Saturday working toggle is enabled
     if date.weekday() == 5:
         if not is_saturday_working_for_employee(employee):
@@ -1875,7 +2000,9 @@ class RosterViewSet(viewsets.ViewSet):
                 "employee": {
                     "id": emp.id,
                     "name": f"{emp.first_name} {emp.last_name}",
-                    "title": emp.designation.title if emp.designation else "Employee"
+                    "title": emp.designation.title if emp.designation else "Employee",
+                    "site_id": emp.site_id,
+                    "is_sunday_working": is_sunday_working_for_employee(emp),
                 },
                 "shifts": assignments_map.get(emp.id, {})
             })
@@ -1904,7 +2031,7 @@ class RosterViewSet(viewsets.ViewSet):
             # Strict boundary: Do not allow manual assignment on non-working days
             if not is_working_day(emp, date_obj):
                 day_name = date_obj.strftime("%A")
-                reason = "Sunday weekly off" if date_obj.weekday() == 6 else ("Saturday off (toggle disabled)" if date_obj.weekday() == 5 else "Holiday calendar off")
+                reason = "Sunday weekly off (Sunday working is disabled for this site)" if date_obj.weekday() == 6 else ("Saturday off (toggle disabled)" if date_obj.weekday() == 5 else "Holiday calendar off")
                 return Response({"error": f"Cannot assign shift on {day_name} ({date}): {reason}."}, status=400)
                 
             valid_date_str = date_obj.strftime("%Y-%m-%d")

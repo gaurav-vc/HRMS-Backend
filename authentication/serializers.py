@@ -6,7 +6,28 @@ from .models import LoginAuditLog
 from django.utils import timezone
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Allow username to be supplied via username, email, phone, or identifier
+        self.fields[self.username_field].required = False
+        self.fields['email'] = serializers.CharField(required=False, write_only=True)
+        self.fields['phone'] = serializers.CharField(required=False, write_only=True)
+        self.fields['identifier'] = serializers.CharField(required=False, write_only=True)
+
     def validate(self, attrs):
+        # Resolve username from username, email, phone, or identifier
+        identifier = (
+            attrs.get('username') or 
+            attrs.get('email') or 
+            attrs.get('phone') or 
+            attrs.get('identifier') or 
+            ''
+        ).strip()
+
+        if not identifier:
+            raise serializers.ValidationError({"username": "Username, email, or phone number is required."})
+
+        attrs['username'] = identifier
         data = super().validate(attrs)
         
         # Automated LWD Deactivation Logic

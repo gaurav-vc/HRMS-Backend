@@ -33,7 +33,7 @@ def get_face_models():
             model=det_path,
             config='',
             input_size=(320, 320),
-            score_threshold=0.5,
+            score_threshold=0.35,
             nms_threshold=0.3,
             top_k=5000
         )
@@ -99,12 +99,12 @@ def get_face_encoding(image_bytes):
         return {"success": False, "error": str(e)}
 
 
-def compare_faces(known_encoding_list, face_encoding_list, tolerance=0.50):
+def compare_faces(known_encoding_list, face_encoding_list, tolerance=0.45):
     """
-    Compares face embedding vectors using Cosine distance.
-    SFace embeddings yield high cosine similarity (> 0.60 to 0.95) for matches.
+    Compares face embedding vectors using Cosine similarity.
+    SFace embeddings yield cosine similarity (0.0 to 1.0).
     Distance = 1.0 - CosineSimilarity.
-    A tolerance of 0.50 (similarity >= 0.50) provides robust, fast matching.
+    tolerance is treated as the minimum required similarity threshold (e.g. 0.40 to 0.70).
     """
     try:
         if not known_encoding_list or not face_encoding_list:
@@ -115,9 +115,8 @@ def compare_faces(known_encoding_list, face_encoding_list, tolerance=0.50):
         if norm_live == 0:
             return {"success": False, "error": "Invalid live encoding vector"}
 
-        # Handle nested list of known embeddings (e.g. multi-angle or multiple snapshots)
+        sim_list = []
         if isinstance(known_encoding_list[0], (list, np.ndarray)):
-            distances = []
             for known in known_encoding_list:
                 k_arr = np.array(known, dtype=np.float32).flatten()
                 if len(k_arr) != len(live_arr):
@@ -125,29 +124,30 @@ def compare_faces(known_encoding_list, face_encoding_list, tolerance=0.50):
                 norm_k = np.linalg.norm(k_arr)
                 if norm_k > 0:
                     sim = float(np.dot(k_arr, live_arr) / (norm_k * norm_live))
-                    distances.append(max(0.0, 1.0 - sim))
-            
-            if not distances:
-                return {"success": False, "error": "Encoding vector dimension mismatch"}
-            best_dist = min(distances)
+                    sim_list.append(sim)
         else:
             k_arr = np.array(known_encoding_list, dtype=np.float32).flatten()
-            if len(k_arr) != len(live_arr):
-                return {"success": False, "error": "Encoding vector dimension mismatch"}
-            norm_k = np.linalg.norm(k_arr)
-            if norm_k > 0:
-                sim = float(np.dot(k_arr, live_arr) / (norm_k * norm_live))
-                best_dist = max(0.0, 1.0 - sim)
-            else:
-                best_dist = 1.0
+            if len(k_arr) == len(live_arr):
+                norm_k = np.linalg.norm(k_arr)
+                if norm_k > 0:
+                    sim = float(np.dot(k_arr, live_arr) / (norm_k * norm_live))
+                    sim_list.append(sim)
 
-        is_match = best_dist <= tolerance
+        if not sim_list:
+            return {"success": False, "error": "Encoding vector dimension mismatch"}
+
+        best_sim = max(sim_list)
+        best_dist = max(0.0, 1.0 - best_sim)
+
+        # Minimum required similarity threshold (e.g. 0.45 means >= 45% match)
+        min_sim = float(tolerance) if tolerance <= 0.85 else (1.0 - float(tolerance))
+        is_match = best_sim >= min_sim
 
         return {
             "success": True,
             "match": bool(is_match),
             "distance": float(best_dist),
-            "similarity": float(1.0 - best_dist)
+            "similarity": float(best_sim)
         }
     except Exception as e:
         return {"success": False, "error": str(e)}

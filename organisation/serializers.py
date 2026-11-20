@@ -93,6 +93,10 @@ class AttendancePolicySerializer(serializers.ModelSerializer):
         data = data.copy() if hasattr(data, 'copy') else dict(data)
         if 'wfhEmployees' in data and 'wfh_employees' not in data:
             data['wfh_employees'] = data.get('wfhEmployees')
+        if 'isSundayWorking' in data and 'is_sunday_working' not in data:
+            data['is_sunday_working'] = data.get('isSundayWorking')
+        if 'splitShiftIncompletePolicy' in data and 'split_shift_incomplete_policy' not in data:
+            data['split_shift_incomplete_policy'] = data.get('splitShiftIncompletePolicy')
         return super().to_internal_value(data)
 
     def to_representation(self, instance):
@@ -100,4 +104,6 @@ class AttendancePolicySerializer(serializers.ModelSerializer):
         wfh_ids = list(instance.wfh_employees.values_list('id', flat=True))
         ret['wfh_employees'] = wfh_ids
         ret['wfhEmployees'] = wfh_ids
+        ret['isSundayWorking'] = bool(instance.is_sunday_working)
+        ret['splitShiftIncompletePolicy'] = instance.split_shift_incomplete_policy
         return ret

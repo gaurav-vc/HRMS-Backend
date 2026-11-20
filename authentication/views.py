@@ -90,41 +90,103 @@ class LogoutView(APIView):
         except Exception as e:
             return Response(status=status.HTTP_400_BAD_REQUEST)
 
+def resolve_user_from_identifier(identifier: str):
+    """
+    Resolves Django User by Email, Username, Employee Code, or Phone Number.
+    Supports flexible login and forgot-password mechanisms.
+    """
+    if not identifier:
+        return None
+    identifier = identifier.strip()
+    
+    # 1. Direct email match
+    user = User.objects.filter(email__iexact=identifier).first()
+    if user:
+        return user
+        
+    # 2. Direct username match
+    user = User.objects.filter(username__iexact=identifier).first()
+    if user:
+        return user
+
+    # 3. Phone number match against Employee profile
+    import re
+    digits = re.sub(r'\D', '', identifier)
+    if digits:
+        from employees.models import Employee
+        last10 = digits[-10:] if len(digits) >= 10 else digits
+        emp = Employee.objects.filter(phone__endswith=last10).first()
+        if emp and emp.user:
+            return emp.user
+
+    # 4. Employee Code match
+    from employees.models import Employee
+    emp = Employee.objects.filter(code__iexact=identifier).first()
+    if emp and emp.user:
+        return emp.user
+
+    return None
+
+
 class PasswordResetRequestView(APIView):
     permission_classes = [AllowAny]
     def post(self, request):
-        email = request.data.get('email')
-        if not email:
-            return Response({"error": "Email is required"}, status=status.HTTP_400_BAD_REQUEST)
+        identifier = (request.data.get('identifier') or request.data.get('phone') or request.data.get('email') or '').strip()
+        if not identifier:
+            return Response({"error": "Email or registered phone number is required"}, status=status.HTTP_400_BAD_REQUEST)
             
-        user = User.objects.filter(email=email).first()
+        user = resolve_user_from_identifier(identifier)
+        channel = "email"
+        masked = ""
+        
         if user:
             otp = PasswordResetOTP.generate_otp(user)
+            emp = getattr(user, 'employee_profile', None)
+            phone = emp.phone if emp else None
             
-            try:
-                send_mail(
-                    "Password Reset OTP",
-                    f"Your OTP for password reset is: {otp}\n\nThis OTP is valid for 10 minutes.",
-                    settings.DEFAULT_FROM_EMAIL,
-                    [user.email],
-                    fail_silently=True,
-                )
-            except Exception:
-                pass
-                
-        # Always return success to prevent email enumeration
-        return Response({"message": "If the email exists, an OTP has been sent."}, status=status.HTTP_200_OK)
+            # If user entered a phone number or employee has phone, dispatch via SMS
+            import re
+            is_phone_input = bool(re.search(r'\d{6,}', identifier)) and '@' not in identifier
+            
+            if (is_phone_input or not user.email) and phone:
+                channel = "sms"
+                masked = phone[:3] + '****' + phone[-3:] if len(phone) > 6 else phone
+                from core.jio_sms import JioSMSService
+                JioSMSService.send_otp_sms(phone, otp)
+            else:
+                if user.email:
+                    masked = user.email[:2] + '***@' + user.email.split('@')[-1]
+                    try:
+                        send_mail(
+                            "Password Reset OTP",
+                            f"Your OTP for password reset is: {otp}\n\nThis OTP is valid for 10 minutes.",
+                            settings.DEFAULT_FROM_EMAIL,
+                            [user.email],
+                            fail_silently=True,
+                        )
+                    except Exception:
+                        pass
+                if phone:
+                    from core.jio_sms import JioSMSService
+                    JioSMSService.send_otp_sms(phone, otp)
+                    channel = "both"
+                    
+        return Response({
+            "message": "If the account exists, an OTP has been sent.",
+            "channel": channel,
+            "masked_destination": masked
+        }, status=status.HTTP_200_OK)
 
 class PasswordResetVerifyOTPView(APIView):
     permission_classes = [AllowAny]
     def post(self, request):
-        email = request.data.get('email')
+        identifier = (request.data.get('identifier') or request.data.get('phone') or request.data.get('email') or '').strip()
         otp_code = request.data.get('otp')
         
-        if not email or not otp_code:
-            return Response({"error": "Email and OTP are required"}, status=status.HTTP_400_BAD_REQUEST)
+        if not identifier or not otp_code:
+            return Response({"error": "Email/Phone and OTP are required"}, status=status.HTTP_400_BAD_REQUEST)
             
-        user = User.objects.filter(email=email).first()
+        user = resolve_user_from_identifier(identifier)
         if not user:
             return Response({"error": "Invalid OTP"}, status=status.HTTP_400_BAD_REQUEST)
             
@@ -138,14 +200,14 @@ class PasswordResetVerifyOTPView(APIView):
 class PasswordResetConfirmView(APIView):
     permission_classes = [AllowAny]
     def post(self, request):
-        email = request.data.get('email')
+        identifier = (request.data.get('identifier') or request.data.get('phone') or request.data.get('email') or '').strip()
         otp_code = request.data.get('otp')
         new_password = request.data.get('password')
         
-        if not email or not otp_code or not new_password:
+        if not identifier or not otp_code or not new_password:
             return Response({"error": "Missing parameters"}, status=status.HTTP_400_BAD_REQUEST)
             
-        user = User.objects.filter(email=email).first()
+        user = resolve_user_from_identifier(identifier)
         if not user:
             return Response({"error": "Invalid OTP"}, status=status.HTTP_400_BAD_REQUEST)
             
