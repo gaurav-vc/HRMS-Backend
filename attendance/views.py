@@ -1532,6 +1532,36 @@ class RegularizationViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     rbac_module = 'Regularization'
     queryset = RegularizationRequest.objects.all().order_by('-created_at', '-id')
     serializer_class = RegularizationRequestSerializer
+
+    def get_queryset(self):
+        from django.db.models import Q
+        qs = super().get_queryset().select_related(
+            'employee', 'approved_by', 'employee__designation', 'employee__entity'
+        )
+
+        employee_id = self.request.query_params.get('employee')
+        if employee_id:
+            qs = qs.filter(employee_id=employee_id)
+
+        status_param = self.request.query_params.get('status')
+        if status_param:
+            qs = qs.filter(status=status_param)
+
+        time_query = self.request.query_params.get('time')
+        if time_query:
+            qs = qs.filter(
+                Q(requested_check_in__time__icontains=time_query) |
+                Q(requested_check_out__time__icontains=time_query)
+            )
+
+        start_date = self.request.query_params.get('start_date')
+        end_date = self.request.query_params.get('end_date')
+        if start_date:
+            qs = qs.filter(attendance_date__gte=start_date)
+        if end_date:
+            qs = qs.filter(attendance_date__lte=end_date)
+
+        return qs
     
     def perform_create(self, serializer):
         try:
@@ -1548,10 +1578,155 @@ class RegularizationViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 status_code = 400
                 default_detail = trace
             raise CustomAPIException(trace)
+
+    @action(detail=False, methods=['POST'])
+    def bulk_apply(self, request):
+        """
+        Atomically applies regularization requests across one or multiple employees and a date range [start_date, end_date].
+        """
+        raw_emp_ids = request.data.get('employee_ids') or request.data.get('employeeIds') or []
+        if isinstance(raw_emp_ids, str):
+            raw_emp_ids = [e.strip() for e in raw_emp_ids.split(',') if e.strip()]
+        if not raw_emp_ids and request.data.get('employee'):
+            raw_emp_ids = [request.data.get('employee')]
+
+        employees = []
+        if raw_emp_ids:
+            from employees.models import Employee
+            employees = list(Employee.objects.filter(id__in=raw_emp_ids))
+        elif hasattr(request.user, 'employee_profile') and request.user.employee_profile:
+            employees = [request.user.employee_profile]
+
+        if not employees:
+            return Response({"error": "At least one employee is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        start_date_str = request.data.get('start_date') or request.data.get('startDate')
+        end_date_str = request.data.get('end_date') or request.data.get('endDate') or start_date_str
+        if not start_date_str:
+            return Response({"error": "Start date is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+            end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return Response({"error": "Dates must be in YYYY-MM-DD format."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if start_date > end_date:
+            return Response({"error": "Start date cannot be after end date."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if (end_date - start_date).days > 62:
+            return Response({"error": "Date range cannot exceed 62 days."}, status=status.HTTP_400_BAD_REQUEST)
+
+        import datetime as dt_module
+
+        requested_in_time_str = request.data.get('requested_in') or request.data.get('requestedIn') or '09:30'
+        requested_out_time_str = request.data.get('requested_out') or request.data.get('requestedOut') or '18:30'
+        reason = request.data.get('reason', '').strip()
+        if not reason:
+            return Response({"error": "Reason is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        def parse_time_str(t_str, default_hour, default_minute):
+            if not t_str:
+                return dt_module.time(default_hour, default_minute)
+            for fmt in ('%H:%M:%S', '%H:%M', '%I:%M %p', '%I:%M%p'):
+                try:
+                    return datetime.strptime(str(t_str).strip(), fmt).time()
+                except ValueError:
+                    continue
+            return dt_module.time(default_hour, default_minute)
+
+        time_in = parse_time_str(requested_in_time_str, 9, 30)
+        time_out = parse_time_str(requested_out_time_str, 18, 30)
+
+        skip_sundays = request.data.get('skip_sundays', True)
+        if 'skipSundays' in request.data:
+            skip_sundays = request.data.get('skipSundays')
+        
+        # Base Entitlements / Leave Policy Saturday setting
+        from leaves.models import LeavePolicyConfiguration
+        try:
+            leave_conf = LeavePolicyConfiguration.get_settings()
+            policy_is_saturday_working = bool(getattr(leave_conf, 'is_saturday_working', False))
+        except Exception:
+            policy_is_saturday_working = False
+
+        include_saturday_param = request.data.get('include_saturday')
+        if include_saturday_param is None:
+            include_saturday_param = request.data.get('includeSaturday')
+
+        from django.db import transaction
+        created_records = []
+        skipped_dates = []
+
+        with transaction.atomic():
+            for emp in employees:
+                site_is_saturday_working = False
+                if emp.site and getattr(emp.site, 'is_saturday_working', False):
+                    site_is_saturday_working = True
+                effective_saturday_working = site_is_saturday_working or policy_is_saturday_working
+
+                if include_saturday_param is not None:
+                    include_saturday = bool(include_saturday_param)
+                else:
+                    include_saturday = effective_saturday_working
+
+                curr = start_date
+                while curr <= end_date:
+                    # 6 = Sunday: By default Sunday is skipped
+                    if skip_sundays and curr.weekday() == 6:
+                        skipped_dates.append(curr.strftime('%Y-%m-%d'))
+                        curr += timedelta(days=1)
+                        continue
+
+                    # 5 = Saturday: Dynamically check if Saturday is working
+                    if curr.weekday() == 5 and not include_saturday:
+                        skipped_dates.append(curr.strftime('%Y-%m-%d'))
+                        curr += timedelta(days=1)
+                        continue
+
+                    dt_in = dt_module.datetime.combine(curr, time_in)
+                    dt_out = dt_module.datetime.combine(curr, time_out)
+                    if timezone.is_naive(dt_in):
+                        dt_in = timezone.make_aware(dt_in)
+                    if timezone.is_naive(dt_out):
+                        dt_out = timezone.make_aware(dt_out)
+
+                    reg_obj, created = RegularizationRequest.objects.get_or_create(
+                        employee=emp,
+                        attendance_date=curr,
+                        defaults={
+                            'requested_check_in': dt_in,
+                            'requested_check_out': dt_out,
+                            'reason': reason,
+                            'status': 'Pending',
+                        }
+                    )
+                    if not created and reg_obj.status == 'Pending':
+                        reg_obj.requested_check_in = dt_in
+                        reg_obj.requested_check_out = dt_out
+                        reg_obj.reason = reason
+                        reg_obj.save(update_fields=['requested_check_in', 'requested_check_out', 'reason', 'updated_at'])
+
+                    created_records.append(reg_obj)
+                    curr += timedelta(days=1)
+
+        serializer = self.get_serializer(created_records, many=True)
+        return Response({
+            "message": f"Successfully processed regularization for {len(employees)} employee(s) across {len(created_records)} record(s).",
+            "count": len(created_records),
+            "employees_count": len(employees),
+            "skipped_weekends": len(skipped_dates),
+            "data": serializer.data
+        }, status=status.HTTP_201_CREATED)
         
     def perform_update(self, serializer):
         from django.db import transaction
         with transaction.atomic():
+            if serializer.validated_data.get('status') in ['Approved', 'Rejected']:
+                approver = getattr(self.request.user, 'employee_profile', None)
+                serializer.validated_data['approved_by'] = approver
+                serializer.validated_data['approved_at'] = timezone.now()
+
             instance = serializer.save()
             # If approved, update the DailyAttendance
             if instance.status == 'Approved':
@@ -1567,16 +1742,29 @@ class RegularizationViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                 daily_att.first_check_in = instance.requested_check_in
                 daily_att.last_check_out = instance.requested_check_out
                 
-                # Recalculate rules on regularization
-                shift_start = instance.requested_check_in.replace(hour=9, minute=30, second=0, microsecond=0)
-                if instance.requested_check_in > shift_start:
-                    daily_att.attendance_status = 'Late'
+                # Recalculate rules on regularization dynamically
+                from .models import ShiftAssignment
+                import datetime as dt_module
+                shift_assignment = ShiftAssignment.objects.filter(employee=instance.employee, date=instance.attendance_date).first()
+                if shift_assignment and shift_assignment.shift:
+                    shift = shift_assignment.shift
+                    cutoff_dt = dt_module.datetime.combine(instance.attendance_date, shift.start_time) + dt_module.timedelta(minutes=shift.grace_minutes)
+                    if timezone.is_naive(cutoff_dt):
+                        cutoff_dt = timezone.make_aware(cutoff_dt)
+                    if instance.requested_check_in > cutoff_dt:
+                        daily_att.attendance_status = 'Late'
+                    else:
+                        daily_att.attendance_status = 'Present'
                 else:
-                    daily_att.attendance_status = 'Present'
+                    shift_start = instance.requested_check_in.replace(hour=9, minute=30, second=0, microsecond=0)
+                    if instance.requested_check_in > shift_start:
+                        daily_att.attendance_status = 'Late'
+                    else:
+                        daily_att.attendance_status = 'Present'
                 
                 duration = daily_att.last_check_out - daily_att.first_check_in
                 hours = duration.total_seconds() / 3600
-                daily_att.total_work_hours = round(hours, 2)
+                daily_att.total_work_hours = round(max(0.0, hours), 2)
                 daily_att.overtime_hours = daily_att.compute_overtime(hours)
                 if hours >= 8:
                     if daily_att.attendance_status not in ['Late']:
@@ -1751,18 +1939,31 @@ class RosterViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['post'])
     def bulk_assign(self, request):
+        from django.db.models import Q
         department_ids = request.data.get('department_ids', [])
+        designation_ids = request.data.get('designation_ids', [])
+        role_ids = request.data.get('role_ids', [])
+        employee_ids = request.data.get('employee_ids', [])
         
-        # Fallback for legacy requests passing single department_id
-        if not department_ids and 'department_id' in request.data:
+        # Fallback for legacy requests passing single values
+        if not department_ids and request.data.get('department_id'):
             department_ids = [request.data.get('department_id')]
+        if not designation_ids and request.data.get('designation_id'):
+            designation_ids = [request.data.get('designation_id')]
+        if not role_ids and request.data.get('role_id'):
+            role_ids = [request.data.get('role_id')]
+        if not employee_ids and request.data.get('employee_id'):
+            employee_ids = [request.data.get('employee_id')]
             
         shift_id = request.data.get('shift_id')
         start_date = request.data.get('start_date')
         end_date = request.data.get('end_date')
 
-        if not department_ids or not shift_id or not start_date or not end_date:
-            return Response({"error": "department_ids, shift_id, start_date, and end_date are required"}, status=400)
+        if not (department_ids or designation_ids or role_ids or employee_ids):
+            return Response({"error": "Please select at least one department, designation, role, or employee"}, status=400)
+
+        if not shift_id or not start_date or not end_date:
+            return Response({"error": "shift_id, start_date, and end_date are required"}, status=400)
 
         try:
             shift = ShiftDefinition.objects.get(id=shift_id)
@@ -1778,7 +1979,24 @@ class RosterViewSet(viewsets.ViewSet):
         if start_dt > end_dt:
             return Response({"error": "start_date cannot be after end_date"}, status=400)
 
-        employees = Employee.objects.filter(department_id__in=department_ids, status='Active')
+        criteria_q = Q()
+        if department_ids:
+            criteria_q |= Q(department_id__in=department_ids)
+        if designation_ids:
+            criteria_q |= Q(designation_id__in=designation_ids)
+        if role_ids:
+            criteria_q |= Q(dynamic_role_id__in=role_ids)
+        if employee_ids:
+            criteria_q |= Q(id__in=employee_ids)
+
+        employees = Employee.objects.filter(criteria_q, status='Active')
+        if request.user and request.user.is_authenticated:
+            from authentication.permissions import isolate_queryset
+            employees = isolate_queryset(employees, request.user)
+        employees = employees.distinct()
+
+        if not employees.exists():
+            return Response({"error": "No active employees found matching the selected criteria."}, status=400)
         
         delta = end_dt - start_dt
         dates = [start_dt + timedelta(days=i) for i in range(delta.days + 1)]

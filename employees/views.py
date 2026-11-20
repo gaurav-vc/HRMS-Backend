@@ -502,7 +502,6 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         # Draft to Active Transition
         if old_status == 'Draft' and new_status == 'Active' and not emp.user:
             email = emp.email
-            from django.contrib.auth.models import User
             if email and not User.objects.filter(username=email).exists():
                 import secrets
                 import string
@@ -720,7 +719,6 @@ Regards,
             alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
             new_password = ''.join(secrets.choice(alphabet) for _ in range(12))
             
-        from django.contrib.auth.models import User
         user = target_employee.user
         target_email = target_employee.email or (user.email if user else None)
         if not target_email and user and '@' in user.username:

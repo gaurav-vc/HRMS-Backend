@@ -17,6 +17,9 @@ from attendance.utils import get_face_encoding, compare_faces
 
 logger = logging.getLogger('hrms.kiosk')
 
+# Fast in-memory photo encoding cache: (emp_id, photo_name) -> list of 128 floats
+_PHOTO_ENCODING_CACHE = {}
+
 
 class KioskConfigAPIView(APIView):
     """
@@ -83,12 +86,13 @@ class KioskPunchAPIView(APIView):
     def post(self, request):
         token = request.data.get('token')
         frame_data = request.data.get('frame') # Base64 data URL or raw base64 string
-        requested_type = request.data.get('punch_type', 'AUTO') # AUTO, IN, OUT
+        requested_type = request.data.get('punch_type', 'AUTO') # IDENTIFY, PROMPT, AUTO, IN, OUT
+        employee_id = request.data.get('employee_id')
 
         if not token:
             return Response({"error": "Kiosk terminal token is required."}, status=status.HTTP_400_BAD_REQUEST)
-        if not frame_data:
-            return Response({"error": "Camera frame is required."}, status=status.HTTP_400_BAD_REQUEST)
+        if not employee_id and not frame_data:
+            return Response({"error": "Camera frame or employee_id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
         # 1. Validate Site & Kiosk Status
         site = Site.objects.filter(kiosk_token=token).first()
@@ -99,65 +103,140 @@ class KioskPunchAPIView(APIView):
                 "error": f"Kiosk attendance is currently disabled for {site.name}. Please contact Site Admin."
             }, status=status.HTTP_403_FORBIDDEN)
 
-        # 2. Decode Frame
-        try:
-            if ',' in frame_data:
-                frame_data = frame_data.split(',', 1)[1]
-            image_bytes = base64.b64decode(frame_data)
-        except Exception as e:
-            return Response({"error": f"Invalid base64 image data: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
-
-        # 3. Extract Face Encoding
-        encoding_res = get_face_encoding(image_bytes)
-        if not encoding_res.get('success'):
-            return Response({
-                "error": encoding_res.get('error', 'Face detection failed. Please align your face inside the guide.')
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        live_encoding = encoding_res.get('encoding')
-        threshold = site.kiosk_similarity_threshold or 0.45
-
-        # 4. Strict Site-Scoped 1:N Face Search
-        site_employees = Employee.objects.filter(
-            Q(site=site) | Q(enrolled_sites=site),
-            status='Active'
-        ).select_related('face_profile', 'department')
-
         matched_employee = None
         best_distance = float('inf')
+        encoding_res = {}
 
-        for emp in site_employees:
-            known_encodings = []
-            
-            # Check enrolled FaceProfile vectors
-            if hasattr(emp, 'face_profile') and emp.face_profile and emp.face_profile.encrypted_face_encodings:
-                try:
-                    payload = CryptoService.decrypt_json(
-                        emp.face_profile.encrypted_face_encodings,
-                        emp.face_profile.encrypted_dek
-                    )
-                    known_encodings = payload.get('encodings', [])
-                except Exception:
-                    pass
+        if employee_id:
+            # Confirmed punch for an already identified employee
+            matched_employee = Employee.objects.filter(
+                id=employee_id,
+                status='Active'
+            ).select_related('face_profile', 'department', 'designation').first()
+            if not matched_employee:
+                return Response({"error": "Employee not found or inactive."}, status=status.HTTP_404_NOT_FOUND)
+            best_distance = 0.05
+        else:
+            # 2. Decode Frame
+            try:
+                if ',' in frame_data:
+                    frame_data = frame_data.split(',', 1)[1]
+                image_bytes = base64.b64decode(frame_data)
+            except Exception as e:
+                return Response({"error": f"Invalid base64 image data: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Fallback to computing on-the-fly from employee.photo if no pre-saved vectors
-            if not known_encodings and emp.photo and emp.photo.name:
-                try:
-                    with emp.photo.open('rb') as f:
-                        photo_bytes = f.read()
-                    p_res = get_face_encoding(photo_bytes)
-                    if p_res.get('success'):
-                        known_encodings = [p_res.get('encoding')]
-                except Exception:
-                    pass
+            # 3. Extract Face Encoding
+            encoding_res = get_face_encoding(image_bytes)
+            if not encoding_res.get('success'):
+                return Response({
+                    "error": encoding_res.get('error', 'Face detection failed. Please align your face inside the guide.')
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            if known_encodings:
-                comp = compare_faces(known_encodings, live_encoding, tolerance=threshold)
-                if comp.get('success'):
-                    distance = comp.get('distance', 1.0)
-                    if comp.get('match') and distance < best_distance:
-                        best_distance = distance
-                        matched_employee = emp
+            live_encoding = encoding_res.get('encoding')
+            threshold = max(float(site.kiosk_similarity_threshold or 0.50), 0.50)
+
+            # 4. Site-Scoped 1:N Face Search
+            # Candidate pool: employees assigned to this site, enrolled in site, parent site, sub-sites, or site organization
+            candidate_q = Q(site=site) | Q(enrolled_sites=site)
+            if site.parent_site:
+                candidate_q |= Q(site=site.parent_site) | Q(enrolled_sites=site.parent_site)
+            candidate_q |= Q(site__parent_site=site)
+            if site.organization:
+                candidate_q |= Q(organization=site.organization)
+
+            site_employees = Employee.objects.filter(
+                candidate_q,
+                status='Active'
+            ).select_related('face_profile', 'department', 'designation').distinct()
+
+            matching_candidates = []
+
+            for emp in site_employees:
+                known_encodings = []
+
+                # Check enrolled FaceProfile vectors
+                if hasattr(emp, 'face_profile') and emp.face_profile and emp.face_profile.encrypted_face_encodings:
+                    try:
+                        payload = CryptoService.decrypt_json(
+                            emp.face_profile.encrypted_face_encodings,
+                            emp.face_profile.encrypted_dek
+                        )
+                        encs = payload.get('encodings', [])
+                        if encs and len(encs[0]) == 128:
+                            known_encodings = encs
+                    except Exception:
+                        pass
+
+                # Fallback to computing on-the-fly from employee.photo with memory cache
+                if not known_encodings and emp.photo and emp.photo.name:
+                    cache_key = (emp.id, emp.photo.name)
+                    cached = _PHOTO_ENCODING_CACHE.get(cache_key)
+                    if cached:
+                        known_encodings = cached
+                    else:
+                        try:
+                            with emp.photo.open('rb') as f:
+                                photo_bytes = f.read()
+                            p_res = get_face_encoding(photo_bytes)
+                            if p_res.get('success'):
+                                known_encodings = [p_res.get('encoding')]
+                                _PHOTO_ENCODING_CACHE[cache_key] = known_encodings
+                        except Exception:
+                            pass
+
+                if known_encodings:
+                    comp = compare_faces(known_encodings, live_encoding, tolerance=threshold)
+                    if comp.get('success') and comp.get('match'):
+                        distance = comp.get('distance', 1.0)
+                        matching_candidates.append({
+                            'employee': emp,
+                            'distance': distance,
+                            'similarity': comp.get('similarity', 1.0 - distance),
+                            'photo_name': emp.photo.name if emp.photo else None,
+                            'encodings': known_encodings
+                        })
+                        if distance < best_distance:
+                            best_distance = distance
+                            matched_employee = emp
+
+            # Check if 2 or more employees match and share the same common profile photo / face
+            if len(matching_candidates) >= 2:
+                matching_candidates.sort(key=lambda x: x['distance'])
+                c1 = matching_candidates[0]
+                c2 = matching_candidates[1]
+                e1 = c1['employee']
+                e2 = c2['employee']
+
+                same_photo_file = bool(c1['photo_name'] and c1['photo_name'] == c2['photo_name'])
+                comp_between = compare_faces(c1['encodings'], c2['encodings'], tolerance=0.50)
+                same_face = bool(comp_between.get('match'))
+
+                if same_photo_file or same_face:
+                    alert_msg = f"2 employees have the same photo: {e1.first_name} {e1.last_name} ({e1.code}) and {e2.first_name} {e2.last_name} ({e2.code})."
+                    logger.warning(f"Kiosk Duplicate Photo Conflict: {alert_msg}")
+                    return Response({
+                        "status": "DUPLICATE_PHOTO_ALERT",
+                        "error": alert_msg,
+                        "message": alert_msg,
+                        "conflict_employees": [
+                            {
+                                "id": e1.id,
+                                "code": e1.code,
+                                "name": f"{e1.first_name} {e1.last_name}".strip(),
+                                "photo_url": request.build_absolute_uri(e1.photo.url) if e1.photo else None,
+                                "department": e1.department.name if e1.department else "",
+                            },
+                            {
+                                "id": e2.id,
+                                "code": e2.code,
+                                "name": f"{e2.first_name} {e2.last_name}".strip(),
+                                "photo_url": request.build_absolute_uri(e2.photo.url) if e2.photo else None,
+                                "department": e2.department.name if e2.department else "",
+                            }
+                        ],
+                        "facial_area": encoding_res.get('facial_area'),
+                        "frame_dims": encoding_res.get('frame_dims')
+                    }, status=status.HTTP_200_OK)
 
         if not matched_employee:
             return Response({
@@ -168,9 +247,47 @@ class KioskPunchAPIView(APIView):
         today = now.date()
         cooldown_sec = site.kiosk_cooldown_seconds or 30
 
-        # 5. Debounce / Anti-Spam Check
-        last_punch = PunchLog.objects.filter(employee=matched_employee).order_by('-punch_time').first()
-        if last_punch:
+        # Query today's punch activity for smart status resolution
+        today_punches = PunchLog.objects.filter(
+            employee=matched_employee,
+            punch_time__date=today
+        ).order_by('punch_time')
+        last_punch = today_punches.last()
+
+        # Step 4b. When in IDENTIFY / PROMPT mode: Return identified employee info and ask for Punch IN or Punch OUT
+        if requested_type in ['IDENTIFY', 'PROMPT']:
+            recommended_type = 'OUT' if (last_punch and last_punch.punch_type == 'IN') else 'IN'
+            photo_url = None
+            if matched_employee.photo:
+                photo_url = request.build_absolute_uri(matched_employee.photo.url)
+            dept_name = matched_employee.department.name if matched_employee.department else 'General'
+            desig_title = matched_employee.designation.title if matched_employee.designation else ''
+
+            return Response({
+                "status": "IDENTIFIED",
+                "employee": {
+                    "id": matched_employee.id,
+                    "code": matched_employee.code,
+                    "employee_id": matched_employee.code,
+                    "first_name": matched_employee.first_name,
+                    "last_name": matched_employee.last_name,
+                    "name": f"{matched_employee.first_name} {matched_employee.last_name}".strip(),
+                    "department": dept_name,
+                    "designation": desig_title,
+                    "photo_url": photo_url
+                },
+                "recommended_type": recommended_type,
+                "last_punch": {
+                    "punch_type": last_punch.punch_type,
+                    "punch_time": last_punch.punch_time.strftime("%I:%M %p")
+                } if last_punch else None,
+                "facial_area": encoding_res.get('facial_area'),
+                "frame_dims": encoding_res.get('frame_dims'),
+                "similarity_score": round(float(1.0 - best_distance), 2) if best_distance != float('inf') else 1.0,
+            }, status=status.HTTP_200_OK)
+
+        # 5. Debounce / Anti-Spam Check (only for auto scans when employee_id was not explicitly confirmed)
+        if not employee_id and last_punch:
             elapsed = (now - last_punch.punch_time).total_seconds()
             if elapsed < cooldown_sec:
                 remaining = int(cooldown_sec - elapsed)
@@ -178,6 +295,8 @@ class KioskPunchAPIView(APIView):
                     "status": "COOLDOWN",
                     "message": f"Already punched {last_punch.punch_type} at {last_punch.punch_time.strftime('%I:%M %p')}.",
                     "remaining_seconds": remaining,
+                    "facial_area": encoding_res.get('facial_area'),
+                    "frame_dims": encoding_res.get('frame_dims'),
                     "employee": {
                         "name": f"{matched_employee.first_name} {matched_employee.last_name}",
                         "code": matched_employee.code,
@@ -185,11 +304,6 @@ class KioskPunchAPIView(APIView):
                 }, status=status.HTTP_200_OK)
 
         # 6. Smart IN / OUT Resolution
-        today_punches = PunchLog.objects.filter(
-            employee=matched_employee,
-            punch_time__date=today
-        ).order_by('punch_time')
-
         if requested_type in ['IN', 'OUT']:
             punch_type = requested_type
         else: # AUTO
@@ -200,12 +314,14 @@ class KioskPunchAPIView(APIView):
                 punch_type = 'OUT' if last_type == 'IN' else 'IN'
 
         # 7. Record Daily Attendance & Punch Log
+        org = matched_employee.organization or (site.organization if site else None)
         daily_att, _ = DailyAttendance.objects.get_or_create(
             employee=matched_employee,
             attendance_date=today,
             defaults={
                 'site': site,
-                'organization': matched_employee.entity
+                'entity': matched_employee.entity,
+                'organization': org
             }
         )
 
@@ -269,6 +385,8 @@ class KioskPunchAPIView(APIView):
             "punch_time": now.strftime("%I:%M %p"),
             "attendance_date": today.strftime("%d %b %Y"),
             "similarity_score": round(float(1.0 - best_distance), 2) if best_distance != float('inf') else 1.0,
+            "facial_area": encoding_res.get('facial_area'),
+            "frame_dims": encoding_res.get('frame_dims'),
             "employee": {
                 "id": matched_employee.id,
                 "code": matched_employee.code,

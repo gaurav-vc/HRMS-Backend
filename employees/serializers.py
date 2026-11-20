@@ -12,6 +12,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
     designation_name = serializers.CharField(source='designation.title', read_only=True)
     role_name = serializers.CharField(source='dynamic_role.name', read_only=True)
     site_name = serializers.CharField(source='site.name', read_only=True)
+    site_is_saturday_working = serializers.SerializerMethodField()
     entity_name = serializers.CharField(source='entity.name', read_only=True)
     salary_structure_name = serializers.SerializerMethodField()
     manager_name = serializers.SerializerMethodField()
@@ -19,6 +20,16 @@ class EmployeeSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(required=False, allow_blank=True, allow_null=True)
     phone = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     is_wfh = serializers.SerializerMethodField()
+
+    def get_site_is_saturday_working(self, obj):
+        if obj.site and getattr(obj.site, 'is_saturday_working', False):
+            return True
+        try:
+            from leaves.models import LeavePolicyConfiguration
+            conf = LeavePolicyConfiguration.get_settings()
+            return bool(getattr(conf, 'is_saturday_working', False))
+        except Exception:
+            return False
     
     class Meta:
         model = Employee
