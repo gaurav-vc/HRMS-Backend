@@ -16,3 +16,10 @@ local_settings.py
 
 db.sqlite3-journal
 db.sqlite3
+
+# DeepFace & AI Model Weights (Large binary files downloaded automatically at runtime)
+.deepface/
+weights/
+*.h5
+*.hdf5
+
