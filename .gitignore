@@ -22,4 +22,5 @@ db.sqlite3
 weights/
 *.h5
 *.hdf5
+media/punch_photos/
 
