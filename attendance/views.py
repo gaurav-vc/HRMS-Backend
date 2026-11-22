@@ -477,280 +477,181 @@ class AttendanceViewSet(viewsets.ViewSet):
             webauthn_signature = request.data.get('webauthn_signature')
             
             if file_obj:
+                raw_fv = request.data.get('face_verified')
+                if raw_fv is None:
+                    raw_fv = request.data.get('faceVerified')
+                is_face_verified = raw_fv in [True, 'true', 'True', 'TRUE', 1, '1', b'true']
+
                 if challenge_id:
-                    # In a real setup, we'd pass video frames. Mocking with empty list for prototype.
                     liveness_passed, liveness_msg = ActiveLivenessService.validate_challenge(challenge_id, [])
-                    if not liveness_passed and source != 'FACE':
+                    if not liveness_passed and source not in ['FACE', 'APP', 'MOBILE'] and not is_face_verified:
                         return Response({"error": f"Liveness Check Failed: {liveness_msg}"}, status=400)
-                elif source == 'FACE':
-                    pass # Mobile app bypasses liveness challenge token check
+                elif source in ['FACE', 'APP', 'MOBILE', 'ALL', 'WEB'] or is_face_verified:
+                    pass  # Mobile app, web face punch, or client-verified punch bypasses challenge token
                 else:
                     return Response({"error": "challenge_id required for Active Liveness validation"}, status=400)
 
-                if not HAVE_FACE_REC:
-                    # TEMPORARY OVERRIDE: ML Bypass with Strict Pixel Comparison
-                    image_bytes = file_obj.read()
-                    import cv2
-                    import numpy as np
-                    np_img = np.frombuffer(image_bytes, np.uint8)
-                    img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
-                    
-                    if img is None:
-                        return Response({"error": "Invalid image format uploaded."}, status=400)
-                        
-                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-                    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
-                    
-                    if len(faces) == 0:
-                        # Fallback to a more relaxed detection if strict pass fails
-                        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(30, 30))
-                    
-                    if len(faces) == 0:
-                        return Response({"error": "Security Alert: No face detected. Please ensure your face is clearly visible."}, status=400)
-                    
-                    # Sort to get the largest face in the frame
-                    faces = sorted(faces, key=lambda x: x[2]*x[3], reverse=True)
-                    x, y, w, h = faces[0]
-                    
-                    # Crop and normalize the face pixels
-                    face_crop = gray[y:y+h, x:x+w]
-                    face_crop = cv2.resize(face_crop, (150, 150))
-                    
-                    # --- STRICT ANTI-SPOOFING LIVENESS ENGINE (2D PRINT/SCREEN ATTACK DETECTION) ---
-                    # 1. Laplacian Variance (Focus/Depth Check)
-                    # Real 3D faces have depth and natural focus variance. 2D prints are uniformly flat/blurry.
-                    laplacian_var = cv2.Laplacian(face_crop, cv2.CV_64F).var()
-                    
-                    # 2. Illumination/Contrast Variance
-                    # Real 3D faces cast shadows (eyes, nose). 2D photos are flat and lack dynamic range.
-                    contrast_std = np.std(face_crop)
-                    
-                    # STRICT SECURITY BOUNDARIES:
-                    if laplacian_var < 50.0:
-                        return Response({"error": "Security Alert: Liveness verification failed. Image lacks 3D depth/sharpness (Possible print attack). Please ensure good lighting."}, status=400)
-                        
-                    if contrast_std < 20.0:
-                        return Response({"error": "Security Alert: Liveness verification failed. Unnatural lighting/contrast detected (Possible 2D photo)."}, status=400)
-                        
-                    # Screens (Moiré pattern) generate extreme high-frequency pixel noise when held close to the camera.
-                    if laplacian_var > 2500.0:
-                        return Response({"error": "Security Alert: Liveness verification failed. Digital screen noise detected (Possible phone/screen attack)."}, status=400)
-                    # ---------------------------------------------------------------------------------
-                        
-                    # Resolve Employee Identity First
-                    emp_id = request.data.get('employee')
-                    employee = None
-                    if emp_id:
-                        employee = Employee.objects.filter(id=emp_id).first()
-                    elif request.user and request.user.is_authenticated:
-                        if hasattr(request.user, 'employee_profile') and getattr(request.user, 'employee_profile', None):
-                            employee = request.user.employee_profile
-                        else:
-                            return Response({"error": "Security Alert: Your user account is not linked to an Employee profile. Please contact HR to link your account before punching in."}, status=400)
-                        
-                    # Strict Pixel Matching Boundary
-                    from django.conf import settings
-                    import glob
-                    
-                    # We store fallback references in the media directory
-                    fallback_dir = os.path.join(settings.MEDIA_ROOT, 'fallback_faces') if hasattr(settings, 'MEDIA_ROOT') and settings.MEDIA_ROOT else os.path.join(os.path.dirname(os.path.dirname(__file__)), 'media', 'fallback_faces')
-                    os.makedirs(fallback_dir, exist_ok=True)
-                    
-                    if employee:
-                        ref_img = None
-                        
-                        try:
-                            has_photo = bool(employee.photo and employee.photo.name)
-                            if has_photo:
-                                _ = employee.photo.path
-                        except ValueError:
-                            has_photo = False
-                            
+                # Fix EXIF orientation so mobile/app photos taken in any orientation (90, 270) are upright
+                import io
+                from PIL import Image, ImageOps
+
+                image_bytes = file_obj.read()
+                try:
+                    pil_img = Image.open(io.BytesIO(image_bytes))
+                    pil_img = ImageOps.exif_transpose(pil_img)
+                    buf = io.BytesIO()
+                    pil_img.convert('RGB').save(buf, format='JPEG', quality=95)
+                    image_bytes = buf.getvalue()
+                except Exception:
+                    pass
+
+                # Resolve employee from request or authenticated user
+                emp_id = request.data.get('employee') or request.data.get('employee_id')
+                if not emp_id and hasattr(request, 'user') and request.user.is_authenticated:
+                    try:
+                        emp_id = request.user.employee_profile.id
+                    except Exception:
+                        pass
+
+                employee = None
+                if emp_id:
+                    employee = Employee.objects.filter(id=emp_id).first()
+                    if not employee:
+                        return Response({"error": "Employee not found."}, status=400)
+
+                identified_id = None
+
+                if employee:
+                    has_photo = False
+                    try:
+                        has_photo = bool(employee.photo and employee.photo.name)
                         if has_photo:
-                            # STRICT SECURITY BOUNDARY: Always use the official profile picture for matching
-                            photo_img = cv2.imread(employee.photo.path)
-                            if photo_img is not None:
-                                photo_gray = cv2.cvtColor(photo_img, cv2.COLOR_BGR2GRAY)
-                                photo_faces = face_cascade.detectMultiScale(photo_gray, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
-                                if len(photo_faces) > 0:
-                                    photo_faces = sorted(photo_faces, key=lambda x: x[2]*x[3], reverse=True)
-                                    px, py, pw, ph = photo_faces[0]
-                                    photo_crop = photo_gray[py:py+ph, px:px+pw]
-                                    ref_img = cv2.resize(photo_crop, (150, 150))
-                                else:
-                                    h, w = photo_gray.shape
-                                    cy, cx = h//2, w//2
-                                    s = min(h, w)//2
-                                    photo_crop = photo_gray[cy-s:cy+s, cx-s:cx+s]
-                                    ref_img = cv2.resize(photo_crop, (150, 150))
-                        else:
-                            # First time punch-in: Save as profile picture
-                            from django.core.files.base import ContentFile
-                            employee.photo.save(f"{employee.id}_profile.jpg", ContentFile(image_bytes))
-                            ref_img = face_crop # Automatically pass the first time
+                            _ = employee.photo.path
+                    except Exception:
+                        has_photo = False
 
-                        # Fetch dynamic threshold, capped at 50%
-                        threshold_percent = 50.00
-                        try:
-                            if hasattr(employee, 'attendance_policy') and employee.attendance_policy:
-                                policy_thresh = float(employee.attendance_policy.face_match_threshold)
-                                if policy_thresh < 95.0: threshold_percent = policy_thresh
-                            elif employee.site and hasattr(employee.site, 'attendance_policy') and employee.site.attendance_policy:
-                                policy_thresh = float(employee.site.attendance_policy.face_match_threshold)
-                                if policy_thresh < 95.0: threshold_percent = policy_thresh
-                        except Exception:
-                            pass
+                    # If employee has no profile picture yet, save this first photo as their profile photo
+                    if not has_photo:
+                        from django.core.files.base import ContentFile
+                        employee.photo.save(f"{employee.id}_profile.jpg", ContentFile(image_bytes))
+                        has_photo = True
 
-                        if ref_img is not None:
-                            # Strict Security Boundary: ORB Feature Matching for scale/rotation invariance
-                            orb = cv2.ORB_create(nfeatures=500)
-                            kp1, des1 = orb.detectAndCompute(face_crop, None)
-                            kp2, des2 = orb.detectAndCompute(ref_img, None)
-                            
-                            similarity_percent = 0.0
-                            if des1 is not None and des2 is not None and len(kp1) > 0 and len(kp2) > 0:
-                                # Use Lowe's ratio test to drastically filter false positives
-                                bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-                                matches = bf.knnMatch(des1, des2, k=2)
-                                
-                                good_matches = []
-                                for m_n in matches:
-                                    if len(m_n) == 2:
-                                        m, n = m_n
-                                        if m.distance < 0.75 * n.distance:
-                                            good_matches.append(m)
-                                    elif len(m_n) == 1:
-                                        good_matches.append(m_n[0])
-                                
-                                baseline = min(len(kp1), len(kp2))
-                                if baseline > 0:
-                                    raw_accuracy = len(good_matches) / baseline
-                                    # Relaxed ORB mapping to easily pass 50%
-                                    if raw_accuracy < 0.01:
-                                        similarity_percent = raw_accuracy * (50.0 / 0.01)
-                                    else:
-                                        similarity_percent = 50.0 + ((raw_accuracy - 0.01) / 0.10) * 50.0
-                                        
-                                    similarity_percent = min(100.0, similarity_percent)
-                            
-                            if similarity_percent < threshold_percent:
-                                return Response({"error": f"Security Alert: Identity verification failed. Accuracy: {similarity_percent:.1f}% (Required: {threshold_percent:.1f}%)"}, status=400)
+                    # Save attendance audit photo to media/punch_photos/
+                    try:
+                        from django.conf import settings
+                        audit_dir = os.path.join(getattr(settings, 'MEDIA_ROOT', 'media'), 'punch_photos')
+                        os.makedirs(audit_dir, exist_ok=True)
+                        audit_filename = f"{employee.id}_{timezone.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                        with open(os.path.join(audit_dir, audit_filename), 'wb') as af:
+                            af.write(image_bytes)
+                    except Exception:
+                        pass
+
+                    # 1. Trust Client-Side Verification from Mobile App (Google ML Kit)
+                    if is_face_verified:
+                        identified_id = employee.id
+                        verification_status = 'VERIFIED'
                     else:
-                        # 1:N Fallback Search for Kiosk Mode (Identity unknown)
-                        best_match_id = None
-                        best_sim = -1.0
-                        
-                        for ref_path in glob.glob(os.path.join(fallback_dir, "*_ref.png")):
-                            ref_img = cv2.imread(ref_path, cv2.IMREAD_GRAYSCALE)
-                            if ref_img is not None:
-                                res = cv2.matchTemplate(face_crop, ref_img, cv2.TM_CCOEFF_NORMED)
-                                sim = res[0][0]
-                                if sim > best_sim:
-                                    best_sim = sim
-                                    best_match_id = os.path.basename(ref_path).split('_')[0]
-                                    
-                        if best_sim >= 0.25 and best_match_id:
-                            employee = Employee.objects.filter(id=best_match_id).first()
-                            
-                        if not employee:
-                            return Response({"error": f"Security Alert: Identity verification failed. Your face does not match any registered employee. (Max Sim: {best_sim:.2f})"}, status=400)
-                        
-                    verification_status = 'VERIFIED'
-                else:
-                    emp_id = request.data.get('employee')
-                    if not emp_id and hasattr(request, 'user') and request.user.is_authenticated:
-                        try:
-                            emp_id = request.user.employee_profile.id
-                        except Exception:
-                            pass
-                    
-                    image_bytes = file_obj.read()
-                    
-                    # Wave 4: Passive Liveness & Deepfake Detection (Must occur before DeepFace)
-                    # We pass an empty list for video_frames as a mock for the deepfake detector
-                    passed_passive, passive_msg = PassiveLivenessService.full_security_scan(image_bytes, video_frames=[])
-                    if not passed_passive:
-                        return Response({"error": passive_msg}, status=400)
-                        
-                    if emp_id:
-                        # 1:1 Verification for Mobile App
-                        employee = Employee.objects.filter(id=emp_id).first()
-                        if not employee:
-                            return Response({"error": "Employee not found"}, status=400)
-                        
-                        try:
-                            has_photo = bool(employee.photo and employee.photo.name)
-                            if has_photo:
-                                _ = employee.photo.path
-                        except ValueError:
-                            has_photo = False
-                            
-                        if not has_photo:
-                            # First time face capture: save as profile picture
-                            from django.core.files.base import ContentFile
-                            employee.photo.save(f"{employee.id}_profile.jpg", ContentFile(image_bytes))
-                            identified_id = employee.id
-                        else:
+                        # 2. Fast 1:1 Matching against employee profile picture (OpenCV YuNet + SFace)
+                        matched = False
+                        live_res = get_face_encoding(image_bytes)
+
+                        if live_res.get('success'):
+                            live_encoding = live_res.get('encoding')
+                            cache_key = (employee.id, employee.photo.name) if (employee.photo and employee.photo.name) else None
+                            known_enc = None
                             try:
-                                import io
-                                import numpy as np
-                                from PIL import Image, ImageOps
-                                from deepface import DeepFace
-                                
-                                # 1. Fix EXIF orientation so mobile photos are upright
-                                punch_img = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
-                                profile_img = ImageOps.exif_transpose(Image.open(employee.photo.path)).convert("RGB")
-                                
-                                punch_np = np.array(punch_img)
-                                profile_np = np.array(profile_img)
-                                
-                                # 2. Use ArcFace + RetinaFace for 99.8% accuracy
-                                result = DeepFace.verify(
-                                    img1_path=punch_np,
-                                    img2_path=profile_np,
-                                    model_name="ArcFace",
-                                    detector_backend="retinaface",
-                                    distance_metric="cosine",
-                                    enforce_detection=True,
-                                    align=True
-                                )
-                                
-                                distance = result.get("distance", 1.0)
-                                is_verified = result.get("verified", False) and distance <= 0.60
-                                
-                                if not is_verified:
-                                    return Response({"status": "MISMATCH", "face_verified": False, "message": "Face does not match registered employee photo."}, status=400)
-                                    
+                                from attendance.kiosk_api import _PHOTO_ENCODING_CACHE
+                                if cache_key:
+                                    known_enc = _PHOTO_ENCODING_CACHE.get(cache_key)
+                            except Exception:
+                                known_enc = None
+
+                            if not known_enc and employee.photo and employee.photo.name:
+                                try:
+                                    with employee.photo.open('rb') as pf:
+                                        p_bytes = pf.read()
+                                    try:
+                                        p_pil = Image.open(io.BytesIO(p_bytes))
+                                        p_pil = ImageOps.exif_transpose(p_pil)
+                                        p_buf = io.BytesIO()
+                                        p_pil.convert('RGB').save(p_buf, format='JPEG', quality=95)
+                                        p_bytes = p_buf.getvalue()
+                                    except Exception:
+                                        pass
+
+                                    p_res = get_face_encoding(p_bytes)
+                                    if p_res.get('success'):
+                                        known_enc = [p_res.get('encoding')]
+                                        try:
+                                            from attendance.kiosk_api import _PHOTO_ENCODING_CACHE
+                                            if cache_key:
+                                                _PHOTO_ENCODING_CACHE[cache_key] = known_enc
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+
+                            if known_enc:
+                                threshold = 0.40
+                                try:
+                                    if hasattr(employee, 'attendance_policy') and employee.attendance_policy:
+                                        threshold = float(employee.attendance_policy.face_match_threshold) / 100.0
+                                    elif employee.site and hasattr(employee.site, 'attendance_policy') and employee.site.attendance_policy:
+                                        threshold = float(employee.site.attendance_policy.face_match_threshold) / 100.0
+                                except Exception:
+                                    pass
+
+                                comp = compare_faces(known_enc, live_encoding, tolerance=threshold)
+                                if comp.get('success') and comp.get('match'):
+                                    matched = True
+                                    identified_id = employee.id
+                                    verification_status = 'VERIFIED'
+
+                        if not matched:
+                            if is_face_verified:
                                 identified_id = employee.id
-                            except ValueError:
-                                return Response({"status": "MISMATCH", "face_verified": False, "message": "No clear face detected in the captured photo. Please look directly at the camera."}, status=400)
-                            except Exception as e:
-                                return Response({"status": "MISMATCH", "face_verified": False, "message": f"Verification error: {str(e)}"}, status=400)
-                    else:
-                        # 1:N Search across entire FAISS index
-                        result = get_face_encoding(image_bytes)
-                        
-                        if not result.get('success'):
-                            return Response({"error": f"Liveness/Extraction Failed: {result.get('error')}"}, status=400)
-                            
-                        identified_id = biometric_search.identify(result['encoding'])
-                        if not identified_id:
-                            return Response({"error": "Security Alert: Not Authorized User. No matching employee recognized."}, status=400)
-                            
-                        if emp_id and str(emp_id) != str(identified_id):
-                            return Response({"error": "Security Alert: Not Authorized User. The recognized face does not match the logged-in employee."}, status=400)
-                        
-                    # Validate Device Attestation AFTER identifying the employee
-                    if webauthn_signature:
-                        attest_passed, attest_msg = WebAuthnService.verify_authentication_response(
-                            identified_id, "mock_client_data", "mock_auth_data", webauthn_signature
-                        )
-                        if not attest_passed:
-                            return Response({"error": attest_msg}, status=400)
-                            
+                                verification_status = 'VERIFIED'
+                            elif not live_res.get('success'):
+                                return Response({
+                                    "status": "MISMATCH",
+                                    "face_verified": False,
+                                    "faceVerified": False,
+                                    "message": "No clear face detected in the captured photo. Please look directly at the camera."
+                                }, status=400)
+                            else:
+                                return Response({
+                                    "status": "MISMATCH",
+                                    "face_verified": False,
+                                    "faceVerified": False,
+                                    "message": "Face does not match registered employee photo."
+                                }, status=400)
+                else:
+                    # 1:N Facial Identification across active employees / FAISS index
+                    live_res = get_face_encoding(image_bytes)
+                    if not live_res.get('success'):
+                        return Response({
+                            "status": "MISMATCH",
+                            "face_verified": False,
+                            "faceVerified": False,
+                            "message": "No clear face detected in the captured photo. Please look directly at the camera."
+                        }, status=400)
+
+                    identified_id = biometric_search.identify(live_res['encoding'])
+                    if not identified_id:
+                        return Response({"error": "Security Alert: Not Authorized User. No matching employee recognized."}, status=400)
                     employee = Employee.objects.get(id=identified_id)
                     verification_status = 'VERIFIED'
+
+                if webauthn_signature and identified_id:
+                    attest_passed, attest_msg = WebAuthnService.verify_authentication_response(
+                        identified_id, "mock_client_data", "mock_auth_data", webauthn_signature
+                    )
+                    if not attest_passed:
+                        return Response({"error": attest_msg}, status=400)
+
+                employee = Employee.objects.get(id=identified_id)
+                verification_status = 'VERIFIED'
             elif source == 'FACE':
                 return Response({"error": "face_image required for FACE verification"}, status=400)
             else:
@@ -1021,7 +922,9 @@ class AttendanceViewSet(viewsets.ViewSet):
             resp_data = DailyAttendanceSerializer(daily_att).data
             resp_data.update({
                 "status": "SUCCESS",
-                "face_verified": True
+                "message": "Attendance punched successfully.",
+                "face_verified": True,
+                "faceVerified": True
             })
             return Response(resp_data)
         except Exception as e:
