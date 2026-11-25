@@ -5,36 +5,61 @@ from employees.models import Employee
 from .models import LoginAuditLog
 from django.utils import timezone
 
+
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     def validate(self, attrs):
         data = super().validate(attrs)
-        
-        # Automated LWD Deactivation Logic
-        if hasattr(self.user, 'employee_profile') and hasattr(self.user.employee_profile, 'exit_process'):
-            exit_process = self.user.employee_profile.exit_process
-            if exit_process.status == 'Approved' and exit_process.last_working_day <= timezone.now().date():
+
+        request = self.context.get("request")
+        ip_address = request.META.get("REMOTE_ADDR") if request else None
+
+        # Automated Employee Status & LWD Deactivation Enforcement
+        if hasattr(self.user, "employee_profile"):
+            emp = self.user.employee_profile
+            from rest_framework.exceptions import AuthenticationFailed
+
+            # Check if employee has been marked Exited / Inactive / Terminated directly
+            if getattr(emp, "status", None) in ["Exited", "Terminated", "Inactive"]:
                 self.user.is_active = False
-                self.user.save()
-                exit_process.status = 'Deactivated'
-                exit_process.save()
-                from rest_framework.exceptions import AuthenticationFailed
-                raise AuthenticationFailed("Account deactivated: Last working day has passed.")
-        
+                self.user.save(update_fields=["is_active"])
+                LoginAuditLog.objects.create(
+                    user=self.user, ip_address=ip_address, status="FAILED_INACTIVE_EMPLOYEE"
+                )
+                raise AuthenticationFailed(
+                    "Account inactive: Employee status is marked as exited or inactive."
+                )
+
+            # Check separation / exit process and LWD
+            if hasattr(emp, "exit_process"):
+                exit_process = emp.exit_process
+                if (
+                    exit_process.status in ["Approved", "Completed", "Deactivated"]
+                    and exit_process.last_working_day <= timezone.now().date()
+                ):
+                    self.user.is_active = False
+                    self.user.save(update_fields=["is_active"])
+                    if exit_process.status != "Deactivated":
+                        exit_process.status = "Deactivated"
+                        exit_process.save(update_fields=["status"])
+                    LoginAuditLog.objects.create(
+                        user=self.user, ip_address=ip_address, status="FAILED_LWD_PASSED"
+                    )
+                    raise AuthenticationFailed(
+                        "Account deactivated: Last working day has passed."
+                    )
+
         # Log successful login
-        request = self.context.get('request')
-        ip_address = request.META.get('REMOTE_ADDR') if request else None
-        
         LoginAuditLog.objects.create(
-            user=self.user,
-            ip_address=ip_address,
-            status='SUCCESS'
+            user=self.user, ip_address=ip_address, status="SUCCESS"
         )
-        
+
         return data
+
 
 class UserProfileSerializer(serializers.ModelSerializer):
     role = serializers.SerializerMethodField()
     employee_id = serializers.SerializerMethodField()
+    employee_pk = serializers.SerializerMethodField()
     first_name = serializers.SerializerMethodField()
     last_name = serializers.SerializerMethodField()
     permissions = serializers.SerializerMethodField()
@@ -51,10 +76,48 @@ class UserProfileSerializer(serializers.ModelSerializer):
     has_all_entity_access = serializers.SerializerMethodField()
     can_manage_users = serializers.SerializerMethodField()
     site_id = serializers.SerializerMethodField()
-    
+    can_view_confidential = serializers.SerializerMethodField()
+    is_ceo = serializers.SerializerMethodField()
+
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'role', 'employee_id', 'first_name', 'last_name', 'permissions', 'role_name', 'dashboard_type', 'site_name', 'site_id', 'org_name', 'photo_url', 'is_wfh', 'branding_text', 'logo_url', 'is_superuser', 'site_modules', 'access_scope', 'has_all_entity_access', 'can_manage_users')
+        fields = (
+            "id",
+            "username",
+            "email",
+            "role",
+            "employee_id",
+            "employee_pk",
+            "first_name",
+            "last_name",
+            "permissions",
+            "role_name",
+            "dashboard_type",
+            "site_name",
+            "site_id",
+            "org_name",
+            "photo_url",
+            "is_wfh",
+            "branding_text",
+            "logo_url",
+            "is_superuser",
+            "site_modules",
+            "access_scope",
+            "has_all_entity_access",
+            "can_manage_users",
+            "can_view_confidential",
+            "is_ceo",
+        )
+
+    def get_can_view_confidential(self, obj):
+        from authentication.permissions import is_ceo_user
+
+        return is_ceo_user(obj)
+
+    def get_is_ceo(self, obj):
+        from authentication.permissions import is_ceo_user
+
+        return is_ceo_user(obj)
 
     def get_site_id(self, obj):
         if obj.is_superuser:
@@ -66,11 +129,11 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
     def get_access_scope(self, obj):
         if obj.is_superuser:
-            return 'Corporate'
+            return "Corporate"
         emp = self._get_employee(obj)
         if emp and emp.dynamic_role and emp.dynamic_role.access_scope:
             return emp.dynamic_role.access_scope
-        return 'Self'
+        return "Self"
 
     def get_can_manage_users(self, obj):
         if obj.is_superuser:
@@ -84,17 +147,23 @@ class UserProfileSerializer(serializers.ModelSerializer):
         emp = self._get_employee(obj)
         if not emp:
             return False
-        dynamic_role = getattr(emp, 'dynamic_role', None)
+        dynamic_role = getattr(emp, "dynamic_role", None)
         if dynamic_role:
-            scope = str(dynamic_role.access_scope or '').strip().lower()
-            if scope in ('corporate', 'region', 'all', 'all entities', 'global'):
+            scope = str(dynamic_role.access_scope or "").strip().lower()
+            if scope in ("corporate", "region", "all", "all entities", "global"):
                 return True
             if dynamic_role.cross_department_access or dynamic_role.can_manage_users:
                 return True
             perms = dynamic_role.permissions or {}
-            if perms.get('allowed_entities') == 'all' or perms.get('all_entities') is True:
+            if (
+                perms.get("allowed_entities") == "all"
+                or perms.get("all_entities") is True
+            ):
                 return True
-            if isinstance(perms.get('allowed_entities'), list) and len(perms.get('allowed_entities')) > 1:
+            if (
+                isinstance(perms.get("allowed_entities"), list)
+                and len(perms.get("allowed_entities")) > 1
+            ):
                 return True
         return False
 
@@ -102,9 +171,10 @@ class UserProfileSerializer(serializers.ModelSerializer):
         # Strict boundary: Superuser is the system platform admin, NOT a site employee
         if obj.is_superuser:
             return None
-        emp = getattr(obj, 'employee_profile', None)
+        emp = getattr(obj, "employee_profile", None)
         if not emp:
             from employees.models import Employee
+
             if obj.email:
                 emp = Employee.objects.filter(email__iexact=obj.email).first()
             if not emp and obj.username:
@@ -112,7 +182,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             if emp and not emp.user:
                 try:
                     emp.user = obj
-                    emp.save(update_fields=['user'])
+                    emp.save(update_fields=["user"])
                 except Exception:
                     pass
         elif emp:
@@ -125,6 +195,10 @@ class UserProfileSerializer(serializers.ModelSerializer):
     def get_employee_id(self, obj):
         emp = self._get_employee(obj)
         return emp.code if emp else None
+
+    def get_employee_pk(self, obj):
+        emp = self._get_employee(obj)
+        return emp.id if emp else None
 
     def get_first_name(self, obj):
         emp = self._get_employee(obj)
@@ -141,39 +215,43 @@ class UserProfileSerializer(serializers.ModelSerializer):
     def get_role(self, obj):
         # Strict security boundary: ONLY superuser accounts can ever be super_admin
         if obj.is_superuser:
-            return 'super_admin'
-        
+            return "super_admin"
+
         from organisation.models import Site
+
         if Site.objects.filter(contact_email=obj.email).exists():
-            return 'site_admin'
-            
+            return "site_admin"
+
         emp = self._get_employee(obj)
         if emp:
             # Self-healing: if an employee was previously assigned 'super_admin' role in the DB, heal it
-            if emp.role == 'super_admin':
-                emp.role = 'employee'
+            if emp.role == "super_admin":
+                emp.role = "employee"
                 try:
-                    emp.save(update_fields=['role'])
+                    emp.save(update_fields=["role"])
                 except Exception:
                     pass
 
             if emp.dynamic_role:
-                perms_dash = (emp.dynamic_role.permissions or {}).get('dashboard_type')
+                perms_dash = (emp.dynamic_role.permissions or {}).get("dashboard_type")
                 if perms_dash:
                     return str(perms_dash).lower()
-                if getattr(emp.dynamic_role, 'dashboard_type', None):
+                if getattr(emp.dynamic_role, "dashboard_type", None):
                     return str(emp.dynamic_role.dashboard_type).lower()
 
-            if emp.role and emp.role not in ['employee', 'super_admin']:
+            if emp.role and emp.role not in ["employee", "super_admin"]:
                 return emp.role
 
-            return emp.role if emp.role != 'super_admin' else 'employee'
-        return 'employee'
+            return emp.role if emp.role != "super_admin" else "employee"
+        return "employee"
 
     def _get_user_site(self, obj):
         from organisation.models import Site
+
         # First priority: Main site (parent_site is None, is_sub_site is False) matching contact email
-        site = Site.objects.filter(contact_email=obj.email, is_sub_site=False, parent_site__isnull=True).first()
+        site = Site.objects.filter(
+            contact_email=obj.email, is_sub_site=False, parent_site__isnull=True
+        ).first()
         if site:
             return site
         # Second priority: Match via employee profile
@@ -185,7 +263,9 @@ class UserProfileSerializer(serializers.ModelSerializer):
                 return emp.site.parent_site
             return emp.site
         if emp and emp.enrolled_sites.exists():
-            enrolled_main = emp.enrolled_sites.filter(is_sub_site=False, parent_site__isnull=True).first()
+            enrolled_main = emp.enrolled_sites.filter(
+                is_sub_site=False, parent_site__isnull=True
+            ).first()
             if enrolled_main:
                 return enrolled_main
             first_enrolled = emp.enrolled_sites.first()
@@ -195,7 +275,11 @@ class UserProfileSerializer(serializers.ModelSerializer):
         # Third priority: Any site matching contact email, but resolving to its parent if it's a sub-site
         any_site = Site.objects.filter(contact_email=obj.email).first()
         if any_site:
-            return any_site.parent_site if (any_site.is_sub_site and any_site.parent_site) else any_site
+            return (
+                any_site.parent_site
+                if (any_site.is_sub_site and any_site.parent_site)
+                else any_site
+            )
         return None
 
     def get_site_modules(self, obj):
@@ -205,7 +289,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
         if site and site.modules is not None:
             mods = []
             for m in site.modules:
-                m_name = m if isinstance(m, str) else m.get('name', '')
+                m_name = m if isinstance(m, str) else m.get("name", "")
                 if m_name and m_name not in mods:
                     mods.append(m_name)
             return mods
@@ -218,62 +302,87 @@ class UserProfileSerializer(serializers.ModelSerializer):
         emp = self._get_employee(obj)
         if emp and emp.dynamic_role:
             permissions.update(emp.dynamic_role.permissions or {})
-            permissions['can_approve'] = bool(emp.dynamic_role.can_approve)
-            permissions['can_manage_users'] = bool(emp.dynamic_role.can_manage_users)
-            permissions['access_scope'] = emp.dynamic_role.access_scope or 'Self'
-            scope_lower = str(emp.dynamic_role.access_scope or '').strip().lower()
-            permissions['has_all_entity_access'] = bool(
-                scope_lower in ('corporate', 'region', 'all', 'all entities', 'global') or
-                emp.dynamic_role.cross_department_access or
-                emp.dynamic_role.can_manage_users or
-                (emp.dynamic_role.permissions and (
-                    emp.dynamic_role.permissions.get('allowed_entities') == 'all' or
-                    emp.dynamic_role.permissions.get('all_entities') is True or
-                    (isinstance(emp.dynamic_role.permissions.get('allowed_entities'), list) and len(emp.dynamic_role.permissions.get('allowed_entities')) > 1)
-                ))
+            permissions["can_approve"] = bool(emp.dynamic_role.can_approve)
+            permissions["can_manage_users"] = bool(emp.dynamic_role.can_manage_users)
+            permissions["access_scope"] = emp.dynamic_role.access_scope or "Self"
+            scope_lower = str(emp.dynamic_role.access_scope or "").strip().lower()
+            permissions["has_all_entity_access"] = bool(
+                scope_lower in ("corporate", "region", "all", "all entities", "global")
+                or emp.dynamic_role.cross_department_access
+                or emp.dynamic_role.can_manage_users
+                or (
+                    emp.dynamic_role.permissions
+                    and (
+                        emp.dynamic_role.permissions.get("allowed_entities") == "all"
+                        or emp.dynamic_role.permissions.get("all_entities") is True
+                        or (
+                            isinstance(
+                                emp.dynamic_role.permissions.get("allowed_entities"),
+                                list,
+                            )
+                            and len(
+                                emp.dynamic_role.permissions.get("allowed_entities")
+                            )
+                            > 1
+                        )
+                    )
+                )
             )
-            if emp.dynamic_role.dashboard_type and not permissions.get('dashboard_type'):
-                permissions['dashboard_type'] = str(emp.dynamic_role.dashboard_type).lower()
-            
+            if emp.dynamic_role.dashboard_type and not permissions.get(
+                "dashboard_type"
+            ):
+                permissions["dashboard_type"] = str(
+                    emp.dynamic_role.dashboard_type
+                ).lower()
+
         site = self._get_user_site(obj)
         is_site_admin = bool(
-            (emp and emp.role in ('site_admin', 'admin')) or
-            (site and site.contact_email and obj.email and site.contact_email.strip().lower() == obj.email.strip().lower()) or
-            (emp and emp.dynamic_role and getattr(emp.dynamic_role, 'code', None) == 'SITE_ADMIN')
+            (emp and emp.role in ("site_admin", "admin"))
+            or (
+                site
+                and site.contact_email
+                and obj.email
+                and site.contact_email.strip().lower() == obj.email.strip().lower()
+            )
+            or (
+                emp
+                and emp.dynamic_role
+                and getattr(emp.dynamic_role, "code", None) == "SITE_ADMIN"
+            )
         )
 
         if site and site.modules is not None:
             allowed_modules = set()
             for mod in site.modules:
-                mod_name = mod if isinstance(mod, str) else mod.get('name', '')
+                mod_name = mod if isinstance(mod, str) else mod.get("name", "")
                 if mod_name:
                     allowed_modules.add(mod_name)
-            
+
             # Map aliases
-            if 'Sub Sites' in allowed_modules:
-                allowed_modules.add('Sites')
-            if 'Sites' in allowed_modules:
-                allowed_modules.add('Sub Sites')
+            if "Sub Sites" in allowed_modules:
+                allowed_modules.add("Sites")
+            if "Sites" in allowed_modules:
+                allowed_modules.add("Sub Sites")
 
             # Special workflow and non-module permission flags that must ALWAYS be preserved
             SPECIAL_WORKFLOW_KEYS = {
-                'can_approve',
-                'can_run_payroll',
-                'can_approve_payroll',
-                'can_view_confidential_payroll',
-                'can_release_salary',
-                'can_add_ctc',
-                'can_add_compensation',
-                'can_view_confidential',
-                'can_process_payroll',
-                'allowed_entities',
-                'dashboard_type',
-                'access_scope',
-                'has_all_entity_access',
-                'can_manage_users',
-                'can_bypass_geofence',
-                'bypass_geofence',
-                'remote_punch',
+                "can_approve",
+                "can_run_payroll",
+                "can_approve_payroll",
+                "can_view_confidential_payroll",
+                "can_release_salary",
+                "can_add_ctc",
+                "can_add_compensation",
+                "can_view_confidential",
+                "can_process_payroll",
+                "allowed_entities",
+                "dashboard_type",
+                "access_scope",
+                "has_all_entity_access",
+                "can_manage_users",
+                "can_bypass_geofence",
+                "bypass_geofence",
+                "remote_punch",
             }
 
             # Filter module-level permissions strictly by site's allowed modules,
@@ -286,22 +395,30 @@ class UserProfileSerializer(serializers.ModelSerializer):
             # For Site Admin, ensure full CRUD for site-assigned modules (excluding workflow-controlled Run Payroll)
             if is_site_admin:
                 for mod_name in allowed_modules:
-                    if mod_name != 'Run Payroll' and mod_name not in filtered_permissions:
-                        filtered_permissions[mod_name] = {'view': True, 'create': True, 'update': True, 'delete': True}
+                    if (
+                        mod_name != "Run Payroll"
+                        and mod_name not in filtered_permissions
+                    ):
+                        filtered_permissions[mod_name] = {
+                            "view": True,
+                            "create": True,
+                            "update": True,
+                            "delete": True,
+                        }
 
             # Align 'Run Payroll' module permissions strictly with the special workflow toggles
-            if 'Payroll' in allowed_modules or 'Run Payroll' in allowed_modules:
-                has_run = bool(filtered_permissions.get('can_run_payroll'))
-                has_approve = bool(filtered_permissions.get('can_approve_payroll'))
+            if "Payroll" in allowed_modules or "Run Payroll" in allowed_modules:
+                has_run = bool(filtered_permissions.get("can_run_payroll"))
+                has_approve = bool(filtered_permissions.get("can_approve_payroll"))
                 if has_run or has_approve:
-                    filtered_permissions['Run Payroll'] = {
-                        'view': True,
-                        'create': has_run,
-                        'update': has_approve,
-                        'delete': False
+                    filtered_permissions["Run Payroll"] = {
+                        "view": True,
+                        "create": has_run,
+                        "update": has_approve,
+                        "delete": False,
                     }
                 else:
-                    filtered_permissions.pop('Run Payroll', None)
+                    filtered_permissions.pop("Run Payroll", None)
 
             return filtered_permissions
 
@@ -309,31 +426,33 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
     def get_role_name(self, obj):
         if obj.is_superuser:
-            return 'Super Admin'
+            return "Super Admin"
         from organisation.models import Site
+
         if Site.objects.filter(contact_email=obj.email).exists():
-            return 'Site Admin'
+            return "Site Admin"
         emp = self._get_employee(obj)
         if emp and emp.dynamic_role and emp.dynamic_role.name:
             return emp.dynamic_role.name
         if emp and emp.role:
             from employees.models import ROLE_CHOICES
-            return dict(ROLE_CHOICES).get(emp.role, emp.role.replace('_', ' ').title())
-        return 'Employee'
+
+            return dict(ROLE_CHOICES).get(emp.role, emp.role.replace("_", " ").title())
+        return "Employee"
 
     def get_dashboard_type(self, obj):
         if obj.is_superuser:
-            return 'superadmin'
+            return "superadmin"
         emp = self._get_employee(obj)
         if emp and emp.dynamic_role:
-            perms_dash = (emp.dynamic_role.permissions or {}).get('dashboard_type')
+            perms_dash = (emp.dynamic_role.permissions or {}).get("dashboard_type")
             if perms_dash:
                 return str(perms_dash).lower()
-            if getattr(emp.dynamic_role, 'dashboard_type', None):
+            if getattr(emp.dynamic_role, "dashboard_type", None):
                 return str(emp.dynamic_role.dashboard_type).lower()
         if emp and emp.role:
             return str(emp.role).lower()
-        return 'employee'
+        return "employee"
 
     def get_site_name(self, obj):
         if obj.is_superuser:
@@ -342,7 +461,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
         if site:
             return site.name
         emp = self._get_employee(obj)
-        if emp and hasattr(emp, 'site') and emp.site:
+        if emp and hasattr(emp, "site") and emp.site:
             return emp.site.name
         return None
 
@@ -353,7 +472,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
         if site and site.organization:
             return site.organization.name
         emp = self._get_employee(obj)
-        if emp and hasattr(emp, 'site') and emp.site:
+        if emp and hasattr(emp, "site") and emp.site:
             if emp.site.organization:
                 return emp.site.organization.name
         return None
@@ -363,7 +482,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             return None
         emp = self._get_employee(obj)
         if emp and emp.photo:
-            request = self.context.get('request')
+            request = self.context.get("request")
             if request:
                 return request.build_absolute_uri(emp.photo.url)
             return emp.photo.url
@@ -374,24 +493,28 @@ class UserProfileSerializer(serializers.ModelSerializer):
             return True
         emp = self._get_employee(obj)
         if emp:
-            if hasattr(emp, 'dynamic_role') and emp.dynamic_role:
+            if hasattr(emp, "dynamic_role") and emp.dynamic_role:
                 perms = emp.dynamic_role.permissions or {}
-                att_perms = perms.get('attendance', {})
-                if isinstance(att_perms, dict) and (att_perms.get('bypass_geofence') or att_perms.get('remote_punch')):
+                att_perms = perms.get("attendance", {})
+                if isinstance(att_perms, dict) and (
+                    att_perms.get("bypass_geofence") or att_perms.get("remote_punch")
+                ):
                     return True
-                if perms.get('bypass_geofence') or perms.get('remote_punch'):
+                if perms.get("bypass_geofence") or perms.get("remote_punch"):
                     return True
-                scope = str(emp.dynamic_role.access_scope or '').strip().lower()
-                if scope in ('corporate', 'region'):
+                scope = str(emp.dynamic_role.access_scope or "").strip().lower()
+                if scope in ("corporate", "region"):
                     return True
-                if getattr(emp.dynamic_role, 'can_manage_users', False):
+                if getattr(emp.dynamic_role, "can_manage_users", False):
                     return True
             from organisation.models import AttendancePolicy
+
             return AttendancePolicy.objects.filter(wfh_employees=emp).exists()
         return False
 
     def _get_main_site(self, obj):
         from authentication.permissions import _get_tenant_site
+
         return _get_tenant_site(obj)
 
     def get_branding_text(self, obj):
@@ -407,9 +530,8 @@ class UserProfileSerializer(serializers.ModelSerializer):
             return None
         site = self._get_main_site(obj)
         if site and site.logo:
-            request = self.context.get('request')
+            request = self.context.get("request")
             if request:
                 return request.build_absolute_uri(site.logo.url)
             return site.logo.url
         return None
-

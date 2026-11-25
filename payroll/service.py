@@ -4,29 +4,50 @@ from django.db import transaction
 from django.utils import timezone
 from employees.models import Employee
 from .models import (
-    PayrollRun, Payslip, PayslipLineItem, SimulatedPayslip, SimulatedLineItem,
-    PayrollException, ComponentRule, PayrollSettings, PayslipAllocationSnapshot,
-    Reimbursement
+    PayrollRun,
+    Payslip,
+    PayslipLineItem,
+    SimulatedPayslip,
+    SimulatedLineItem,
+    PayrollException,
+    ComponentRule,
+    PayrollSettings,
+    PayslipAllocationSnapshot,
+    Reimbursement,
 )
-from .engine import build_dag_and_sort, evaluate_component, calculate_tds
+from .engine import (
+    build_dag_and_sort,
+    evaluate_component,
+    calculate_tds,
+    calculate_professional_tds,
+)
+
 
 class PayrollPrerequisiteError(ValueError):
     """Raised when active employees within a payroll run entity lack required salary structures or CTC."""
+
     def __init__(self, message, missing_employees=None):
         super().__init__(message)
         self.missing_employees = missing_employees or []
+
 
 class LockService:
     @staticmethod
     def get_employee_entity(employee):
         if not employee:
             return None
-        if getattr(employee, 'entity', None):
+        if getattr(employee, "entity", None):
             return employee.entity
-        if getattr(employee, 'site', None) and getattr(employee.site, 'branch', None) and getattr(employee.site.branch, 'entity', None):
+        if (
+            getattr(employee, "site", None)
+            and getattr(employee.site, "branch", None)
+            and getattr(employee.site.branch, "entity", None)
+        ):
             return employee.site.branch.entity
-        if getattr(employee, 'department', None) and getattr(employee.department, 'entity', None):
-            return getattr(employee.department, 'entity', None)
+        if getattr(employee, "department", None) and getattr(
+            employee.department, "entity", None
+        ):
+            return getattr(employee.department, "entity", None)
         return None
 
     @staticmethod
@@ -40,6 +61,7 @@ class LockService:
             return False
 
         import datetime
+
         target_date = date.date() if isinstance(date, datetime.datetime) else date
 
         emp_entity = LockService.get_employee_entity(employee)
@@ -47,14 +69,16 @@ class LockService:
             return False
 
         # Runs that are locked or finalized (not Draft or Processing) strictly for this employee's entity
-        runs = PayrollRun.objects.filter(entity=emp_entity).exclude(status__in=['Draft', 'Processing'])
+        runs = PayrollRun.objects.filter(entity=emp_entity).exclude(
+            status__in=["Draft", "Processing"]
+        )
 
         # 1. Lock check by lock_date cutoff
         if runs.filter(lock_date__isnull=False, lock_date__gte=target_date).exists():
             return True
 
         # 2. Lock check by payroll period (YYYY-MM)
-        period_str = target_date.strftime('%Y-%m')
+        period_str = target_date.strftime("%Y-%m")
         if runs.filter(period=period_str).exists():
             return True
 
@@ -76,14 +100,18 @@ class LockService:
         # Check if attendance is linked to an OT entry processed in a finalized payroll run
         try:
             from ot_engine.models import OTPayrollEntry
-            if OTPayrollEntry.objects.filter(
-                ot_entry__request__attendance=attendance
-            ).exclude(payroll_run__status__in=['Draft', 'Processing']).exists():
+
+            if (
+                OTPayrollEntry.objects.filter(ot_entry__request__attendance=attendance)
+                .exclude(payroll_run__status__in=["Draft", "Processing"])
+                .exists()
+            ):
                 return True
         except Exception:
             pass
 
         return False
+
 
 class PayrollService:
     @staticmethod
@@ -93,53 +121,73 @@ class PayrollService:
         from attendance.models import DailyAttendance
         from leaves.models import LeaveRequest, Holiday
         from django.db.models import Sum, Count, Q
-        
+
         try:
-            year, month = map(int, run.period.split('-'))
+            year, month = map(int, run.period.split("-"))
             start_date = datetime(year, month, 1).date()
             last_day = calendar.monthrange(year, month)[1]
             end_date = datetime(year, month, last_day).date()
         except Exception:
             return {}, 22
-            
+
         # 1. Total Days
         total_days = last_day
-        
+
         # 2. Weekends & Holidays (Globally for the entity)
-        weekends = sum(1 for d in range(1, last_day + 1) if calendar.weekday(year, month, d) >= 5)
+        weekends = sum(
+            1 for d in range(1, last_day + 1) if calendar.weekday(year, month, d) >= 5
+        )
         holidays = Holiday.objects.filter(date__range=[start_date, end_date]).count()
         free_paid_days = weekends + holidays
-        
+
         # 3. Pre-aggregate attendance (Punches)
-        emp_filter = Q(employee__entity=run.entity) | Q(employee__branch__entity=run.entity) | Q(employee__site__branch__entity=run.entity)
-        
+        emp_filter = (
+            Q(employee__entity=run.entity)
+            | Q(employee__branch__entity=run.entity)
+            | Q(employee__site__branch__entity=run.entity)
+        )
+
         # Synchronize overtime_hours with shift qualification rules for all punches in period
-        for att in DailyAttendance.objects.filter(emp_filter, attendance_date__range=[start_date, end_date], total_work_hours__gt=0):
+        for att in DailyAttendance.objects.filter(
+            emp_filter,
+            attendance_date__range=[start_date, end_date],
+            total_work_hours__gt=0,
+        ):
             correct_ot = att.compute_overtime(float(att.total_work_hours))
             if float(att.overtime_hours or 0) != float(correct_ot):
-                DailyAttendance.objects.filter(id=att.id).update(overtime_hours=correct_ot)
-                
-        attendance_qs = DailyAttendance.objects.filter(
-            emp_filter,
-            attendance_date__range=[start_date, end_date]
-        ).values('employee_id').annotate(
-            present_count=Count('id', filter=Q(attendance_status__in=['Present', 'Late'])),
-            late_count=Count('id', filter=Q(attendance_status='Late')),
-            half_day_count=Count('id', filter=Q(attendance_status='Half Day')),
-            absent_count=Count('id', filter=Q(attendance_status='Absent')),
-            total_overtime=Sum('overtime_hours'),
-            total_late_deductions=Sum('late_deduction_amount')
+                DailyAttendance.objects.filter(id=att.id).update(
+                    overtime_hours=correct_ot
+                )
+
+        # 3. Pre-aggregate attendance (Punches) - ONLY APPROVED RECORDS
+        attendance_qs = (
+            DailyAttendance.objects.filter(
+                emp_filter,
+                attendance_date__range=[start_date, end_date],
+                is_approved=True,
+            )
+            .values("employee_id")
+            .annotate(
+                present_count=Count(
+                    "id", filter=Q(attendance_status__in=["Present", "Late"])
+                ),
+                late_count=Count("id", filter=Q(attendance_status="Late")),
+                half_day_count=Count("id", filter=Q(attendance_status="Half Day")),
+                absent_count=Count("id", filter=Q(attendance_status="Absent")),
+                total_overtime=Sum("overtime_hours"),
+                total_late_deductions=Sum("late_deduction_amount"),
+            )
         )
-        att_map = {item['employee_id']: item for item in attendance_qs}
-        
+        att_map = {item["employee_id"]: item for item in attendance_qs}
+
         # 4. Pre-aggregate Paid Leaves
         leaves_qs = LeaveRequest.objects.filter(
             emp_filter,
-            status='Approved',
+            status="Approved",
             start_date__lte=end_date,
             end_date__gte=start_date,
         )
-        
+
         leave_map = {}
         lop_map = {}
         for leave in leaves_qs:
@@ -148,42 +196,55 @@ class PayrollService:
             o_end = min(leave.end_date, end_date)
             days = (o_end - o_start).days + 1
             if days > 0:
-                if 'loss of pay' in (leave.leave_type.name or '').lower() or 'lop' in (leave.leave_type.name or '').lower() or leave.sub_type == 'LOP':
-                    lop_map[leave.employee_id] = lop_map.get(leave.employee_id, 0) + days
+                if (
+                    "loss of pay" in (leave.leave_type.name or "").lower()
+                    or "lop" in (leave.leave_type.name or "").lower()
+                    or leave.sub_type == "LOP"
+                ):
+                    lop_map[leave.employee_id] = (
+                        lop_map.get(leave.employee_id, 0) + days
+                    )
                 else:
-                    leave_map[leave.employee_id] = leave_map.get(leave.employee_id, 0) + days
-                
+                    leave_map[leave.employee_id] = (
+                        leave_map.get(leave.employee_id, 0) + days
+                    )
+
         # 5. Pre-aggregate YTD Gross and TDS for TDS calculation
         financial_year_start = f"{year}-04" if month >= 4 else f"{year-1}-04"
-        ytd_qs = Payslip.objects.filter(
-            emp_filter,
-            period__gte=financial_year_start,
-            period__lt=run.period
-        ).values('employee_id').annotate(
-            ytd_gross=Sum('gross'),
-            ytd_tds=Sum('lines__amount', filter=Q(lines__rule__name__icontains='TDS'))
+        ytd_qs = (
+            Payslip.objects.filter(
+                emp_filter, period__gte=financial_year_start, period__lt=run.period
+            )
+            .values("employee_id")
+            .annotate(
+                ytd_gross=Sum("gross"),
+                ytd_tds=Sum(
+                    "lines__amount", filter=Q(lines__rule__name__icontains="TDS")
+                ),
+            )
         )
-        ytd_map = {item['employee_id']: item for item in ytd_qs}
+        ytd_map = {item["employee_id"]: item for item in ytd_qs}
 
         # 6. Pre-aggregate Approved Reimbursements
-        reimb_qs = Reimbursement.objects.filter(
-            emp_filter,
-            status='Approved'
-        ).values('employee_id').annotate(total_reimb=Sum('amount'))
-        reimb_map = {item['employee_id']: item['total_reimb'] for item in reimb_qs}
+        reimb_qs = (
+            Reimbursement.objects.filter(emp_filter, status="Approved")
+            .values("employee_id")
+            .annotate(total_reimb=Sum("amount"))
+        )
+        reimb_map = {item["employee_id"]: item["total_reimb"] for item in reimb_qs}
 
         return {
-            'total_days': total_days,
-            'free_paid_days': free_paid_days,
-            'att_map': att_map,
-            'leave_map': leave_map,
-            'lop_map': lop_map,
-            'ytd_map': ytd_map,
-            'reimb_map': reimb_map,
-            'month': month,
-            'year': year,
-            'start_date': start_date,
-            'end_date': end_date,
+            "total_days": total_days,
+            "free_paid_days": free_paid_days,
+            "att_map": att_map,
+            "leave_map": leave_map,
+            "lop_map": lop_map,
+            "ytd_map": ytd_map,
+            "reimb_map": reimb_map,
+            "month": month,
+            "year": year,
+            "start_date": start_date,
+            "end_date": end_date,
         }
 
     @staticmethod
@@ -196,140 +257,200 @@ class PayrollService:
         - min_hours_for_ot: Minimum threshold hours
         """
         from attendance.models import ShiftAssignment, ShiftDefinition
+
         emp_shift = None
         shift_def = None
-        start_d = precomputed_data.get('start_date') if precomputed_data else None
-        end_d = precomputed_data.get('end_date') if precomputed_data else None
+        start_d = precomputed_data.get("start_date") if precomputed_data else None
+        end_d = precomputed_data.get("end_date") if precomputed_data else None
 
         try:
             if start_d and end_d:
-                emp_shift = ShiftAssignment.objects.filter(
-                    employee=employee, date__gte=start_d, date__lte=end_d
-                ).select_related('shift').first()
+                emp_shift = (
+                    ShiftAssignment.objects.filter(
+                        employee=employee, date__gte=start_d, date__lte=end_d
+                    )
+                    .select_related("shift")
+                    .first()
+                )
             if not emp_shift:
-                emp_shift = ShiftAssignment.objects.filter(
-                    employee=employee
-                ).order_by('-date').select_related('shift').first()
+                emp_shift = (
+                    ShiftAssignment.objects.filter(employee=employee)
+                    .order_by("-date")
+                    .select_related("shift")
+                    .first()
+                )
 
             if emp_shift and emp_shift.shift:
                 shift_def = emp_shift.shift
-            elif getattr(employee, 'site', None):
-                shift_def = ShiftDefinition.objects.filter(site=employee.site, is_active=True).first()
+            elif getattr(employee, "site", None):
+                shift_def = ShiftDefinition.objects.filter(
+                    site=employee.site, is_active=True
+                ).first()
             if not shift_def:
                 shift_def = ShiftDefinition.objects.filter(is_active=True).first()
         except Exception:
             pass
 
         if shift_def:
-            multiplier = Decimal(str(shift_def.ot_multiplier if shift_def.ot_multiplier is not None else 1.0))
+            multiplier = Decimal(
+                str(
+                    shift_def.ot_multiplier
+                    if shift_def.ot_multiplier is not None
+                    else 1.0
+                )
+            )
             base_hours = Decimal(str(shift_def.ot_calculation_base_hours or 8.0))
             is_enabled = bool(shift_def.is_ot_enabled)
             min_ot = Decimal(str(shift_def.min_hours_for_ot or 0.0))
             return {
-                'shift': shift_def,
-                'ot_multiplier': multiplier,
-                'base_hours': base_hours,
-                'is_ot_enabled': is_enabled,
-                'min_hours_for_ot': min_ot,
+                "shift": shift_def,
+                "ot_multiplier": multiplier,
+                "base_hours": base_hours,
+                "is_ot_enabled": is_enabled,
+                "min_hours_for_ot": min_ot,
             }
 
         return {
-            'shift': None,
-            'ot_multiplier': Decimal('1.00'),
-            'base_hours': Decimal('8.00'),
-            'is_ot_enabled': True,
-            'min_hours_for_ot': Decimal('0.00'),
+            "shift": None,
+            "ot_multiplier": Decimal("1.00"),
+            "base_hours": Decimal("8.00"),
+            "is_ot_enabled": True,
+            "min_hours_for_ot": Decimal("0.00"),
         }
 
     @staticmethod
     def _get_context_for_employee(employee, precomputed_data, emp_override=None):
         settings = PayrollSettings.objects.first() or PayrollSettings()
-        
-        total_days = precomputed_data.get('total_days', 30)
-        free_paid_days = precomputed_data.get('free_paid_days', 8)
-        start_date = precomputed_data.get('start_date')
-        end_date = precomputed_data.get('end_date')
+
+        total_days = precomputed_data.get("total_days", 30)
+        free_paid_days = precomputed_data.get("free_paid_days", 8)
+        start_date = precomputed_data.get("start_date")
+        end_date = precomputed_data.get("end_date")
 
         # 1. Period Eligibility (respecting employee Date of Joining and Exit Relieving Date)
         period_eligible_days = float(total_days)
         if start_date and end_date:
-            emp_doj = getattr(employee, 'doj', None)
+            emp_doj = getattr(employee, "doj", None)
             if emp_doj:
                 if emp_doj > end_date:
                     period_eligible_days = 0.0
                 elif emp_doj > start_date:
                     period_eligible_days = float((end_date - emp_doj).days + 1)
-            
-            exit_proc = getattr(employee, 'exit_process', None)
-            if exit_proc and getattr(exit_proc, 'relieving_date', None):
+
+            exit_proc = getattr(employee, "exit_process", None)
+            if exit_proc and getattr(exit_proc, "relieving_date", None):
                 relieving = exit_proc.relieving_date
                 if relieving < start_date:
                     period_eligible_days = 0.0
                 elif relieving < end_date:
-                    period_eligible_days = min(period_eligible_days, float((relieving - start_date).days + 1))
-        
-        emp_att = precomputed_data.get('att_map', {}).get(employee.id, {})
-        present_count = emp_att.get('present_count', 0)
-        late_count = emp_att.get('late_count', 0)
-        half_day_count = emp_att.get('half_day_count', 0)
-        absent_count = emp_att.get('absent_count', 0)
-        overtime_hours = emp_att.get('total_overtime', Decimal('0.00')) or Decimal('0.00')
-        
-        paid_leave_days = precomputed_data.get('leave_map', {}).get(employee.id, 0)
-        lop_days = precomputed_data.get('lop_map', {}).get(employee.id, 0)
-        
+                    period_eligible_days = min(
+                        period_eligible_days, float((relieving - start_date).days + 1)
+                    )
+
+        emp_att = precomputed_data.get("att_map", {}).get(employee.id, {})
+        present_count = emp_att.get("present_count", 0)
+        late_count = emp_att.get("late_count", 0)
+        half_day_count = emp_att.get("half_day_count", 0)
+        absent_count = emp_att.get("absent_count", 0)
+        overtime_hours = emp_att.get("total_overtime", Decimal("0.00")) or Decimal(
+            "0.00"
+        )
+
+        paid_leave_days = precomputed_data.get("leave_map", {}).get(employee.id, 0)
+        lop_days = precomputed_data.get("lop_map", {}).get(employee.id, 0)
+
         late_penalty_days = (late_count // 3) * 0.5
-        
+
         # Override attendance variables if provided (check both camel/snake case due to DRF middleware)
         if emp_override:
-            if 'leaves' in emp_override: paid_leave_days = float(emp_override['leaves'] or 0)
-            elif 'paid_leave_days' in emp_override: paid_leave_days = float(emp_override['paid_leave_days'] or 0)
-            elif 'annual_leaves' in emp_override: paid_leave_days = float(emp_override['annual_leaves'] or 0)
-            elif 'annualLeaves' in emp_override: paid_leave_days = float(emp_override['annualLeaves'] or 0)
+            if "leaves" in emp_override:
+                paid_leave_days = float(emp_override["leaves"] or 0)
+            elif "paid_leave_days" in emp_override:
+                paid_leave_days = float(emp_override["paid_leave_days"] or 0)
+            elif "annual_leaves" in emp_override:
+                paid_leave_days = float(emp_override["annual_leaves"] or 0)
+            elif "annualLeaves" in emp_override:
+                paid_leave_days = float(emp_override["annualLeaves"] or 0)
 
-            if 'lop_days' in emp_override: lop_days = float(emp_override['lop_days'] or 0)
-            elif 'lopDays' in emp_override: lop_days = float(emp_override['lopDays'] or 0)
-            elif 'lop' in emp_override: lop_days = float(emp_override['lop'] or 0)
-            
-            if 'half_days' in emp_override: half_day_count = float(emp_override['half_days'] or 0)
-            elif 'halfDays' in emp_override: half_day_count = float(emp_override['halfDays'] or 0)
-            
-            if 'late_penalties' in emp_override: late_penalty_days = float(emp_override['late_penalties'] or 0)
-            elif 'latePenalties' in emp_override: late_penalty_days = float(emp_override['latePenalties'] or 0)
-            
-            if 'ot' in emp_override: overtime_hours = Decimal(str(emp_override['ot'] or 0))
-            elif 'ot_hours' in emp_override: overtime_hours = Decimal(str(emp_override['ot_hours'] or 0))
-            elif 'overtimeHours' in emp_override: overtime_hours = Decimal(str(emp_override['overtimeHours'] or 0))
-            elif 'overtime' in emp_override: overtime_hours = Decimal(str(emp_override['overtime'] or 0))
+            if "lop_days" in emp_override:
+                lop_days = float(emp_override["lop_days"] or 0)
+            elif "lopDays" in emp_override:
+                lop_days = float(emp_override["lopDays"] or 0)
+            elif "lop" in emp_override:
+                lop_days = float(emp_override["lop"] or 0)
 
-            if 'present_days' in emp_override: present_count = float(emp_override['present_days'] or 0)
-            elif 'presentDays' in emp_override: present_count = float(emp_override['presentDays'] or 0)
-        
+            if "half_days" in emp_override:
+                half_day_count = float(emp_override["half_days"] or 0)
+            elif "halfDays" in emp_override:
+                half_day_count = float(emp_override["halfDays"] or 0)
+
+            if "late_penalties" in emp_override:
+                late_penalty_days = float(emp_override["late_penalties"] or 0)
+            elif "latePenalties" in emp_override:
+                late_penalty_days = float(emp_override["latePenalties"] or 0)
+
+            if "ot" in emp_override:
+                overtime_hours = Decimal(str(emp_override["ot"] or 0))
+            elif "ot_hours" in emp_override:
+                overtime_hours = Decimal(str(emp_override["ot_hours"] or 0))
+            elif "overtimeHours" in emp_override:
+                overtime_hours = Decimal(str(emp_override["overtimeHours"] or 0))
+            elif "overtime" in emp_override:
+                overtime_hours = Decimal(str(emp_override["overtime"] or 0))
+
+            if "present_days" in emp_override:
+                present_count = float(emp_override["present_days"] or 0)
+            elif "presentDays" in emp_override:
+                present_count = float(emp_override["presentDays"] or 0)
+
         worked_days = float(present_count) + (float(half_day_count) * 0.5)
-        total_att_records = float(present_count) + float(late_count) + float(half_day_count) + float(absent_count)
+        total_att_records = (
+            float(present_count)
+            + float(late_count)
+            + float(half_day_count)
+            + float(absent_count)
+        )
 
         # Determine payable days cleanly
         if period_eligible_days <= 0.0:
             calculated_paid_days = 0.0
         elif total_att_records > 0:
             # Daily punch logs exist for this employee
-            if worked_days == 0 and paid_leave_days == 0 and absent_count >= period_eligible_days:
+            if (
+                worked_days == 0
+                and paid_leave_days == 0
+                and absent_count >= period_eligible_days
+            ):
                 calculated_paid_days = 0.0
             else:
                 calculated_paid_days = max(
                     0.0,
-                    period_eligible_days - float(absent_count) - (float(half_day_count) * 0.5) - float(lop_days) - float(late_penalty_days)
+                    period_eligible_days
+                    - float(absent_count)
+                    - (float(half_day_count) * 0.5)
+                    - float(lop_days)
+                    - float(late_penalty_days),
                 )
         else:
             # Exception-based attendance: active contracts receive standard monthly pay minus approved LOP
             calculated_paid_days = max(0.0, period_eligible_days - float(lop_days))
-            
+
         # Determine payable days with mathematical precision
-        calculated_override_payable = max(0.0, period_eligible_days - float(lop_days) - (float(half_day_count) * 0.5) - float(late_penalty_days))
+        calculated_override_payable = max(
+            0.0,
+            period_eligible_days
+            - float(lop_days)
+            - (float(half_day_count) * 0.5)
+            - float(late_penalty_days),
+        )
 
         if emp_override:
-            for key in ['totalDays', 'total_days']:
-                if key in emp_override and emp_override[key] is not None and str(emp_override[key]).strip() != '':
+            for key in ["totalDays", "total_days"]:
+                if (
+                    key in emp_override
+                    and emp_override[key] is not None
+                    and str(emp_override[key]).strip() != ""
+                ):
                     try:
                         total_days = float(emp_override[key])
                         period_eligible_days = float(total_days)
@@ -338,8 +459,19 @@ class PayrollService:
                         pass
 
             user_days_paid = None
-            for key in ['daysPaid', 'days_paid', 'payable_days', 'payableDays']:
-                if key in emp_override and emp_override[key] is not None and str(emp_override[key]).strip() != '':
+            for key in [
+                "daysPaid",
+                "days_paid",
+                "paid_days",
+                "paidDays",
+                "payable_days",
+                "payableDays",
+            ]:
+                if (
+                    key in emp_override
+                    and emp_override[key] is not None
+                    and str(emp_override[key]).strip() != ""
+                ):
                     try:
                         user_days_paid = float(emp_override[key])
                         break
@@ -347,8 +479,12 @@ class PayrollService:
                         pass
 
             user_present_days = None
-            for key in ['presentDays', 'present_days', 'actual_present_days']:
-                if key in emp_override and emp_override[key] is not None and str(emp_override[key]).strip() != '':
+            for key in ["presentDays", "present_days", "actual_present_days"]:
+                if (
+                    key in emp_override
+                    and emp_override[key] is not None
+                    and str(emp_override[key]).strip() != ""
+                ):
                     try:
                         user_present_days = float(emp_override[key])
                         break
@@ -366,239 +502,442 @@ class PayrollService:
                 worked_days = user_present_days
         else:
             present_days = max(0.0, min(calculated_paid_days, float(total_days)))
-        
-        reimbursement_amount = precomputed_data.get('reimb_map', {}).get(employee.id, Decimal('0.00'))
+
+        reimbursement_amount = precomputed_data.get("reimb_map", {}).get(
+            employee.id, Decimal("0.00")
+        )
         if not reimbursement_amount:
-            reimbursement_amount = Decimal('0.00')
-        
+            reimbursement_amount = Decimal("0.00")
+
         # Dynamically resolve all Shift Definition parameters (multiplier, base hours, min threshold, master toggle)
-        shift_cfg = PayrollService.resolve_employee_shift_config(employee, precomputed_data)
-        ot_mult = shift_cfg['ot_multiplier']
-        shift_base_h = shift_cfg['base_hours']
-        if not shift_cfg['is_ot_enabled']:
-            overtime_hours = Decimal('0.00')
+        shift_cfg = PayrollService.resolve_employee_shift_config(
+            employee, precomputed_data
+        )
+        ot_mult = shift_cfg["ot_multiplier"]
+        shift_base_h = shift_cfg["base_hours"]
+        if not shift_cfg["is_ot_enabled"]:
+            overtime_hours = Decimal("0.00")
 
         return {
-            'ctc': Decimal(employee.ctc or 0),
-            'monthly_ctc': Decimal(employee.ctc or 0) / Decimal(12),
-            'present_days': Decimal(str(present_days)),
-            'actual_present_days': Decimal(str(worked_days)),
-            'total_days': Decimal(str(total_days)),
-            'overtime_hours': Decimal(str(overtime_hours)),
-            'ot_hours': Decimal(str(overtime_hours)),
-            'ot_multiplier': ot_mult,
-            'shift_base_hours': shift_base_h,
-            'absent_days': Decimal(str(absent_count)),
-            'lop_days': Decimal(str(lop_days)),
-            'half_day_count': Decimal(str(half_day_count)),
-            'late_penalty_days': Decimal(str(late_penalty_days)),
-            'paid_days': Decimal(str(present_days)),
-            'paid_leave_days': Decimal(str(paid_leave_days)),
-            'annual_leaves': Decimal(str(paid_leave_days)),
-            'pf_wage_limit': settings.pf_wage_limit,
-            'esic_wage_limit': settings.esic_wage_limit,
-            'state': 'KA', 
-            'current_month': precomputed_data.get('month', 1),
-            'gender': getattr(employee, 'gender', 'Male'),
-            'reimbursement': Decimal(str(reimbursement_amount)),
-            'late_deduction_amount': Decimal(str(emp_att.get('total_late_deductions', 0) or 0)),
+            "ctc": Decimal(employee.ctc or 0),
+            "monthly_ctc": Decimal(employee.ctc or 0) / Decimal(12),
+            "present_days": Decimal(str(present_days)),
+            "actual_present_days": Decimal(str(worked_days)),
+            "total_days": Decimal(str(total_days)),
+            "overtime_hours": Decimal(str(overtime_hours)),
+            "ot_hours": Decimal(str(overtime_hours)),
+            "ot_multiplier": ot_mult,
+            "shift_base_hours": shift_base_h,
+            "absent_days": Decimal(str(absent_count)),
+            "lop_days": Decimal(str(lop_days)),
+            "half_day_count": Decimal(str(half_day_count)),
+            "late_penalty_days": Decimal(str(late_penalty_days)),
+            "paid_days": Decimal(str(present_days)),
+            "paid_leave_days": Decimal(str(paid_leave_days)),
+            "annual_leaves": Decimal(str(paid_leave_days)),
+            "pf_wage_limit": settings.pf_wage_limit,
+            "esic_wage_limit": settings.esic_wage_limit,
+            "state": "KA",
+            "current_month": precomputed_data.get("month", 1),
+            "gender": getattr(employee, "gender", "Male"),
+            "reimbursement": Decimal(str(reimbursement_amount)),
+            "late_deduction_amount": Decimal(
+                str(emp_att.get("total_late_deductions", 0) or 0)
+            ),
         }
 
     @staticmethod
-    def process_employee_in_memory(employee, run, precomputed_data, is_simulation=False, include_variable_bonus=False, emp_override=None, include_leaves_encashment=False):
-        rules_dag = getattr(employee, '_cached_dag', [])
-        context = PayrollService._get_context_for_employee(employee, precomputed_data, emp_override=emp_override)
-        
-        total_gross = Decimal('0.00')
-        total_deductions = Decimal('0.00')
+    def process_employee_in_memory(
+        employee,
+        run,
+        precomputed_data,
+        is_simulation=False,
+        include_variable_bonus=False,
+        emp_override=None,
+        include_leaves_encashment=False,
+    ):
+        rules_dag = getattr(employee, "_cached_dag", [])
+        context = PayrollService._get_context_for_employee(
+            employee, precomputed_data, emp_override=emp_override
+        )
+
+        total_gross = Decimal("0.00")
+        total_deductions = Decimal("0.00")
         line_items = []
-        
+
         # Inject defaults to prevent engine crashes if components are completely deleted
-        context['basic'] = Decimal('0.00')
-        context['hra'] = Decimal('0.00')
-        context['non_balancing_gross'] = Decimal('0.00')
-        
+        context["basic"] = Decimal("0.00")
+        context["hra"] = Decimal("0.00")
+        context["non_balancing_gross"] = Decimal("0.00")
+
         # Ensure OT parameters are resolved dynamically from Shift Definition
-        context['ot_hours'] = context.get('overtime_hours', Decimal('0.00')) 
-        if 'ot_multiplier' not in context or context['ot_multiplier'] is None:
-            shift_cfg = PayrollService.resolve_employee_shift_config(employee, precomputed_data)
-            context['ot_multiplier'] = shift_cfg['ot_multiplier']
-            context['shift_base_hours'] = shift_cfg['base_hours'] 
-        
+        context["ot_hours"] = context.get("overtime_hours", Decimal("0.00"))
+        if "ot_multiplier" not in context or context["ot_multiplier"] is None:
+            shift_cfg = PayrollService.resolve_employee_shift_config(
+                employee, precomputed_data
+            )
+            context["ot_multiplier"] = shift_cfg["ot_multiplier"]
+            context["shift_base_hours"] = shift_cfg["base_hours"]
+
+        worker_type = getattr(employee, "worker_type", "Salaried")
+        tds_applicable = getattr(employee, "tds_applicable", False)
+        is_professional_contractor = worker_type in ["Professional", "Contractor"]
+
         for rule in rules_dag:
-            # PF Applicability Filter
-            if rule.name == 'Provident Fund' and not getattr(employee, 'pf_applicable', False):
+            r_name_upper = (rule.name or "").upper()
+
+            # Labor Statutory Exemption: Independent professionals & contractors are exempt from PF, ESIC, and PT
+            if is_professional_contractor:
+                if (
+                    "PROVIDENT" in r_name_upper
+                    or "PF" in r_name_upper
+                    or "ESI" in r_name_upper
+                    or "PROFESSIONAL TAX" in r_name_upper
+                    or r_name_upper == "PT"
+                ):
+                    continue
+
+            # PF Applicability Filter for salaried staff
+            if ("PROVIDENT" in r_name_upper or r_name_upper == "PF") and not getattr(
+                employee, "pf_applicable", False
+            ):
                 continue
-                
-            if context.get('present_days', Decimal('1')) == Decimal('0'):
-                val = Decimal('0.00')
-            elif rule.is_statutory and ('TDS' in rule.name.upper() or 'INCOME TAX' in rule.name.upper()):
-                ytd_data = precomputed_data.get('ytd_map', {}).get(employee.id, {})
-                ytd_gross = ytd_data.get('ytd_gross') or Decimal('0.00')
-                ytd_tax_paid = ytd_data.get('ytd_tds') or Decimal('0.00')
-                remaining_months = max(1, 12 - precomputed_data.get('month', 1))
-                
-                emp_regime = getattr(employee, 'tax_regime', 'New')
-                emp_deductions = Decimal(str(getattr(employee, 'tax_saving_deductions', '0.00')))
-                
-                val = calculate_tds(ytd_gross, ytd_tax_paid, total_gross, remaining_months, regime=emp_regime, gender=context.get('gender', 'Male'), deductions=emp_deductions)
+
+            # TDS / Income Tax Applicability Filter
+            if "TDS" in r_name_upper or "INCOME TAX" in r_name_upper:
+                if not tds_applicable:
+                    val = Decimal("0.00")
+                elif is_professional_contractor:
+                    tds_sec = getattr(employee, "tds_section", "194J_10")
+                    c_rate = getattr(employee, "tds_rate", Decimal("10.00"))
+                    emp_pan = getattr(employee, "pan", None)
+                    val, _, _ = calculate_professional_tds(
+                        total_gross,
+                        tds_section=tds_sec,
+                        custom_rate=c_rate,
+                        pan=emp_pan,
+                    )
+                else:
+                    emp_pan = getattr(employee, "pan", None)
+                    pan_clean = str(emp_pan or "").strip().upper()
+                    is_pan_missing = (
+                        not pan_clean
+                        or pan_clean in ["N/A", "NONE", "NAN", "XXXXX0000X"]
+                        or len(pan_clean) < 5
+                    )
+                    emp_tds_rate = getattr(employee, "tds_rate", None)
+
+                    # Section 206AA: If PAN is not provided, mandatory 20% penalty rate
+                    if is_pan_missing:
+                        val = (total_gross * Decimal("0.20")).quantize(
+                            Decimal("1.00"), rounding=decimal.ROUND_HALF_UP
+                        )
+                    elif emp_tds_rate and Decimal(str(emp_tds_rate)) > Decimal("0.00"):
+                        # User-configured custom TDS deduction rate on employee profile
+                        custom_pct = Decimal(str(emp_tds_rate)) / Decimal("100.0")
+                        val = (total_gross * custom_pct).quantize(
+                            Decimal("1.00"), rounding=decimal.ROUND_HALF_UP
+                        )
+                    else:
+                        ytd_data = precomputed_data.get("ytd_map", {}).get(
+                            employee.id, {}
+                        )
+                        ytd_gross = ytd_data.get("ytd_gross") or Decimal("0.00")
+                        ytd_tax_paid = ytd_data.get("ytd_tds") or Decimal("0.00")
+                        cur_month = (
+                            precomputed_data.get("month", timezone.now().month)
+                            if precomputed_data
+                            else timezone.now().month
+                        )
+                        remaining_months = max(1, 12 - ((cur_month - 4) % 12))
+
+                        emp_regime = getattr(employee, "tax_regime", "New")
+                        emp_deductions = Decimal(
+                            str(getattr(employee, "tax_saving_deductions", "0.00"))
+                        )
+
+                        val = calculate_tds(
+                            ytd_gross,
+                            ytd_tax_paid,
+                            total_gross,
+                            remaining_months,
+                            regime=emp_regime,
+                            gender=context.get("gender", "Male"),
+                            deductions=emp_deductions,
+                        )
             else:
-                context['non_balancing_gross'] = total_gross
-                val = evaluate_component(rule, context)
-            
+                if rule.calc == "Balancing":
+                    emp_ctc = Decimal(str(employee.ctc or 0))
+                    monthly_ctc = emp_ctc / Decimal("12.0")
+                    # Prorate target gross based on present_days / total_days
+                    total_d = context.get("total_days", Decimal("30.00")) or Decimal(
+                        "30.00"
+                    )
+                    pres_d = context.get("present_days", total_d)
+                    target_gross = monthly_ctc
+                    if total_d > Decimal("0.00"):
+                        target_gross = target_gross * (pres_d / total_d)
+                    val = max(Decimal("0.00"), target_gross - total_gross).quantize(
+                        Decimal("0.01"), rounding=decimal.ROUND_HALF_UP
+                    )
+                elif context.get("present_days", Decimal("1")) == Decimal("0"):
+                    val = Decimal("0.00")
+                else:
+                    context["non_balancing_gross"] = total_gross
+                    val = evaluate_component(rule, context)
+
             context[rule.name] = val
-            if getattr(rule, 'variable_code', None):
+            if getattr(rule, "variable_code", None):
                 context[rule.variable_code] = val
-                
+
             # Legacy alias injections (to be retired in Phase 11)
             name_lower = rule.name.lower()
-            if 'basic' in name_lower:
-                context['basic'] = val
-            if 'hra' in name_lower:
-                context['hra'] = val
-            
-            if rule.type == 'Earning':
+            if "basic" in name_lower:
+                context["basic"] = val
+            if "hra" in name_lower:
+                context["hra"] = val
+
+            if rule.type == "Earning":
                 total_gross += val
-            elif rule.type == 'Deduction':
+            elif rule.type == "Deduction":
                 total_deductions += val
-            elif rule.type == 'Employer Contribution':
-                pass 
-                
-            line_items.append({'rule': rule, 'amount': val})
-            
+            elif rule.type == "Employer Contribution":
+                pass
+
+            line_items.append({"rule": rule, "amount": val})
+
+        # ==========================================
+        # TDS INJECTION (Section 192 / Section 194J / 194C)
+        # ==========================================
+        tds_already_handled = any(
+            "TDS" in getattr(item["rule"], "name", "").upper()
+            or "INCOME TAX" in getattr(item["rule"], "name", "").upper()
+            for item in line_items
+        )
+        if not tds_already_handled and tds_applicable:
+            eff_rate = Decimal("0.00")
+            is_penalty = False
+            if is_professional_contractor:
+                tds_sec = getattr(employee, "tds_section", "194J_10")
+                c_rate = getattr(employee, "tds_rate", Decimal("10.00"))
+                emp_pan = getattr(employee, "pan", None)
+                tds_val, eff_rate, is_penalty = calculate_professional_tds(
+                    total_gross, tds_section=tds_sec, custom_rate=c_rate, pan=emp_pan
+                )
+                sec_code = "194C" if "194C" in tds_sec else "194J"
+            else:
+                emp_pan = getattr(employee, "pan", None)
+                pan_clean = str(emp_pan or "").strip().upper()
+                is_penalty = (
+                    not pan_clean
+                    or pan_clean in ["N/A", "NONE", "NAN", "XXXXX0000X"]
+                    or len(pan_clean) < 10
+                )
+                emp_tds_rate = getattr(employee, "tds_rate", None)
+                if is_penalty:
+                    eff_rate = Decimal("20.00")
+                    tds_val = (total_gross * Decimal("0.20")).quantize(
+                        Decimal("1.00"), rounding=decimal.ROUND_HALF_UP
+                    )
+                elif emp_tds_rate and Decimal(str(emp_tds_rate)) > Decimal("0.00"):
+                    eff_rate = Decimal(str(emp_tds_rate))
+                    tds_val = (total_gross * (eff_rate / Decimal("100.0"))).quantize(
+                        Decimal("1.00"), rounding=decimal.ROUND_HALF_UP
+                    )
+                else:
+                    cur_month = (
+                        precomputed_data.get("month", timezone.now().month)
+                        if precomputed_data
+                        else timezone.now().month
+                    )
+                    remaining_months = max(1, 12 - ((cur_month - 4) % 12))
+                    tds_val = calculate_tds(
+                        Decimal("0.00"),
+                        Decimal("0.00"),
+                        total_gross,
+                        remaining_months,
+                        regime=getattr(employee, "tax_regime", "New"),
+                        gender=context.get("gender", "Male"),
+                        deductions=Decimal(
+                            str(getattr(employee, "tax_saving_deductions", "0.00"))
+                        ),
+                    )
+                sec_code = "192"
+
+            if tds_val > Decimal("0.00"):
+                total_deductions += tds_val
+                penalty_tag = " [Sec 206AA No-PAN Penalty]" if is_penalty else ""
+                rate_str = f" ({eff_rate}%)" if eff_rate > Decimal("0.00") else ""
+                rule_name = f"TDS u/s {sec_code}{rate_str}{penalty_tag}"
+
+                virtual_tds_rule, _ = ComponentRule.objects.get_or_create(
+                    name=rule_name,
+                    defaults={
+                        "type": "Deduction",
+                        "formula": "0",
+                        "is_statutory": True,
+                        "effective_from": timezone.now().date(),
+                    },
+                )
+                line_items.append({"rule": virtual_tds_rule, "amount": tds_val})
+                context[rule_name] = tds_val
+                context["tds"] = tds_val
+
         # ==========================================
         # RETRO ARREARS INJECTION
         # ==========================================
-        from payroll.models import RetroPayrollEntry, ComponentRule
-        
-        total_arrears = Decimal('0.00')
-        
-        if emp_override and 'arrears' in emp_override:
-            total_arrears = Decimal(str(emp_override['arrears'] or 0))
-        elif run:
+        from payroll.models import RetroPayrollEntry
+
+        total_arrears = Decimal("0.00")
+
+        if emp_override and "arrears" in emp_override:
+            total_arrears = Decimal(str(emp_override["arrears"] or 0))
+        elif run and getattr(employee, "id", None):
             if run.pk:
                 retros = RetroPayrollEntry.objects.filter(
                     original_payslip__employee=employee,
                     target_run=run,
-                    approved_for_merge=True
+                    approved_for_merge=True,
                 )
             else:
                 retros = RetroPayrollEntry.objects.filter(
                     original_payslip__employee=employee,
                     target_run__period=run.period,
                     target_run__entity=run.entity,
-                    approved_for_merge=True
+                    approved_for_merge=True,
                 )
             total_arrears = sum(r.diff_amount for r in retros)
-        
+
         if total_arrears != 0:
             total_gross += total_arrears
-            
+
             # Create a virtual ComponentRule reference for the LineItem
             virtual_rule, _ = ComponentRule.objects.get_or_create(
                 name="Retroactive Arrears",
                 type="Earning",
-                defaults={
-                    'formula': "0",
-                    'effective_from': "2020-01-01"
-                }
+                defaults={"formula": "0", "effective_from": "2020-01-01"},
             )
-            line_items.append({'rule': virtual_rule, 'amount': total_arrears})
-            
+            line_items.append({"rule": virtual_rule, "amount": total_arrears})
+
         # ==========================================
         # VARIABLE BONUS INJECTION
         # ==========================================
-        if include_variable_bonus and getattr(employee, 'bonus_applicable', False):
-            bonus_amount = Decimal('0.00')
-            bonus_type = getattr(employee, 'bonus_type', None)
-            bonus_val = Decimal(str(getattr(employee, 'bonus_value', '0.00') or '0.00'))
+        if include_variable_bonus and getattr(employee, "bonus_applicable", False):
+            bonus_amount = Decimal("0.00")
+            bonus_type = getattr(employee, "bonus_type", None)
+            bonus_val = Decimal(str(getattr(employee, "bonus_value", "0.00") or "0.00"))
             emp_ctc = Decimal(str(employee.ctc or 0))
-            
-            if bonus_type == 'Fixed Amount':
+
+            if bonus_type == "Fixed Amount":
                 bonus_amount = bonus_val
-            elif bonus_type == 'Percentage':
-                bonus_amount = (emp_ctc * bonus_val) / Decimal('100.0')
-            elif bonus_type == 'Monthly Salary':
-                months_multiplier = Decimal(str(getattr(employee, 'bonus_months', 1) or 1))
-                bonus_amount = (emp_ctc / Decimal('12.0')) * months_multiplier
-                
+            elif bonus_type == "Percentage":
+                bonus_amount = (emp_ctc * bonus_val) / Decimal("100.0")
+            elif bonus_type == "Monthly Salary":
+                months_multiplier = Decimal(
+                    str(getattr(employee, "bonus_months", 1) or 1)
+                )
+                bonus_amount = (emp_ctc / Decimal("12.0")) * months_multiplier
+
             if bonus_amount > emp_ctc:
-                raise ValueError(f"CRITICAL ERROR: Calculated Variable Bonus ({bonus_amount}) exceeds the Total CTC ({emp_ctc}) for employee {employee.code}. Execution halted to prevent miscalculation.")
-                
+                raise ValueError(
+                    f"CRITICAL ERROR: Calculated Variable Bonus ({bonus_amount}) exceeds the Total CTC ({emp_ctc}) for employee {employee.code}. Execution halted to prevent miscalculation."
+                )
+
             if bonus_amount > 0:
                 total_gross += bonus_amount
                 virtual_bonus_rule, _ = ComponentRule.objects.get_or_create(
                     name="Variable Bonus",
                     type="Earning",
-                    defaults={'formula': "0", 'effective_from': "2020-01-01"}
+                    defaults={"formula": "0", "effective_from": "2020-01-01"},
                 )
-                line_items.append({'rule': virtual_bonus_rule, 'amount': round(bonus_amount, 2)})
-            
+                line_items.append(
+                    {"rule": virtual_bonus_rule, "amount": round(bonus_amount, 2)}
+                )
+
         # ==========================================
         # AUTOMATED REIMBURSEMENT INJECTION
         # ==========================================
-        reimbursement_amt = context.get('reimbursement', Decimal('0.00'))
+        reimbursement_amt = context.get("reimbursement", Decimal("0.00"))
         if reimbursement_amt > 0:
             found_reimb = False
             for item in line_items:
-                if 'REIMBURSEMENT' in getattr(item['rule'], 'name', '').upper():
-                    diff = reimbursement_amt - item['amount']
+                if "REIMBURSEMENT" in getattr(item["rule"], "name", "").upper():
+                    diff = reimbursement_amt - item["amount"]
                     if diff != 0:
                         total_gross += diff
-                        item['amount'] = reimbursement_amt
+                        item["amount"] = reimbursement_amt
                     found_reimb = True
                     break
-                    
+
             if not found_reimb:
                 total_gross += reimbursement_amt
                 virtual_reimb_rule, _ = ComponentRule.objects.get_or_create(
-                    name="Reimbursement", 
-                    defaults={'type': 'Earning', 'formula': 'reimbursement', 'is_statutory': False, 'effective_from': timezone.now().date()}
+                    name="Reimbursement",
+                    defaults={
+                        "type": "Earning",
+                        "formula": "reimbursement",
+                        "is_statutory": False,
+                        "effective_from": timezone.now().date(),
+                    },
                 )
-                line_items.append({'rule': virtual_reimb_rule, 'amount': reimbursement_amt})
+                line_items.append(
+                    {"rule": virtual_reimb_rule, "amount": reimbursement_amt}
+                )
 
         # ==========================================
         # OVERTIME (OT) PAY INJECTION
         # ==========================================
-        ot_hours = context.get('ot_hours', Decimal('0.00')) or Decimal('0.00')
+        ot_hours = context.get("ot_hours", Decimal("0.00")) or Decimal("0.00")
         if ot_hours > 0:
             # Check if an existing component rule already handled Overtime
             already_handled = any(
-                ('OVERTIME' in getattr(item['rule'], 'name', '').upper() or
-                 getattr(item['rule'], 'variable_code', '') in ['OT', 'OVERTIME', 'OT_PAY'] or
-                 'ot_hours' in (getattr(item['rule'], 'formula', '') or ''))
+                (
+                    "OVERTIME" in getattr(item["rule"], "name", "").upper()
+                    or getattr(item["rule"], "variable_code", "")
+                    in ["OT", "OVERTIME", "OT_PAY"]
+                    or "ot_hours" in (getattr(item["rule"], "formula", "") or "")
+                )
                 for item in line_items
             )
             if not already_handled:
-                total_days = context.get('total_days', Decimal('30.00'))
+                total_days = context.get("total_days", Decimal("30.00"))
                 if total_days <= 0:
-                    total_days = Decimal('30.00')
-                basic_amt = context.get('basic', Decimal('0.00'))
-                if basic_amt <= 0:
-                    emp_ctc = Decimal(str(employee.ctc or 0))
-                    # Standard labor fallback: 50% of monthly CTC as basic wage if separate basic component not defined
-                    basic_amt = (emp_ctc / Decimal('12.0')) * Decimal('0.50') if emp_ctc > 0 else Decimal('0.00')
-                
+                    total_days = Decimal("30.00")
+                # Requirement: Overtime calculation based on Total Salary (Monthly CTC)
+                emp_ctc = Decimal(str(employee.ctc or 0))
+                monthly_ctc = (
+                    (emp_ctc / Decimal("12.0"))
+                    if emp_ctc > Decimal("0.00")
+                    else Decimal("0.00")
+                )
+                if monthly_ctc <= Decimal("0.00"):
+                    monthly_ctc = context.get("basic", Decimal("0.00"))
+
                 # Dynamic hourly rate calculation based on Shift Definition base hours and dynamic multiplier
-                base_h = Decimal(str(context.get('shift_base_hours', 8.0)))
-                hourly_rate = basic_amt / total_days / base_h
-                multiplier = Decimal(str(context.get('ot_multiplier', 1.0)))
-                ot_pay = (hourly_rate * multiplier * ot_hours).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
-                
+                base_h = Decimal(str(context.get("shift_base_hours", 8.0)))
+                if base_h <= Decimal("0.00"):
+                    base_h = Decimal("8.00")
+                hourly_rate = monthly_ctc / total_days / base_h
+                multiplier = Decimal(str(context.get("ot_multiplier", 1.0)))
+                ot_pay = (hourly_rate * multiplier * ot_hours).quantize(
+                    Decimal("0.01"), rounding=decimal.ROUND_HALF_UP
+                )
+
                 if ot_pay > 0:
                     total_gross += ot_pay
                     virtual_ot_rule, _ = ComponentRule.objects.get_or_create(
                         name="Overtime Allowance",
                         defaults={
-                            'type': 'Earning',
-                            'formula': f'ot_hours * (basic / total_days / {base_h}) * {multiplier}',
-                            'is_statutory': False,
-                            'effective_from': timezone.now().date()
-                        }
+                            "type": "Earning",
+                            "formula": f"ot_hours * ((ctc / 12) / total_days / {base_h}) * {multiplier}",
+                            "is_statutory": False,
+                            "effective_from": timezone.now().date(),
+                        },
                     )
-                    line_items.append({'rule': virtual_ot_rule, 'amount': ot_pay})
-                    context['Overtime Allowance'] = ot_pay
-                    context['ot_pay'] = ot_pay
+                    line_items.append({"rule": virtual_ot_rule, "amount": ot_pay})
+                    context["Overtime Allowance"] = ot_pay
+                    context["overtimePay"] = ot_pay
+                    context["ot_pay"] = ot_pay
 
         # ==========================================
         # LEAVE ENCASHMENT INJECTION
@@ -606,210 +945,453 @@ class PayrollService:
         if include_leaves_encashment:
             from leaves.models import LeaveBalance
             from django.db.models import F
-            
+
             try:
-                current_year = int(run.period.split('-')[0])
-                balances = LeaveBalance.objects.filter(employee=employee, year=current_year, remaining_days__gt=0)
-                
-                encashable_leaves = Decimal('0.00')
+                current_year = int(run.period.split("-")[0])
+                balances = LeaveBalance.objects.filter(
+                    employee=employee, year=current_year, remaining_days__gt=0
+                )
+
+                encashable_leaves = Decimal("0.00")
                 balances_to_reset = []
                 for bal in balances:
-                    name = (bal.leave_type.name or '').upper()
-                    if 'ANNUAL' in name or 'EARNED' in name or 'AL' in name:
+                    name = (bal.leave_type.name or "").upper()
+                    if "ANNUAL" in name or "EARNED" in name or "AL" in name:
                         encashable_leaves += bal.remaining_days
                         balances_to_reset.append(bal)
-                
+
                 if encashable_leaves > 0:
-                    total_days_in_month = context.get('total_days', Decimal('30.00'))
+                    total_days_in_month = context.get("total_days", Decimal("30.00"))
                     if total_days_in_month <= 0:
-                        total_days_in_month = Decimal('30.00')
-                        
-                    daily_rate = context.get('basic', Decimal('0.00')) / Decimal(str(total_days_in_month))
+                        total_days_in_month = Decimal("30.00")
+
+                    daily_rate = context.get("basic", Decimal("0.00")) / Decimal(
+                        str(total_days_in_month)
+                    )
                     if daily_rate <= 0:
-                        daily_rate = (Decimal(str(employee.ctc or 0)) / Decimal('12.0')) / Decimal(str(total_days_in_month))
-                        
+                        daily_rate = (
+                            Decimal(str(employee.ctc or 0)) / Decimal("12.0")
+                        ) / Decimal(str(total_days_in_month))
+
                     encashment_amount = Decimal(str(encashable_leaves)) * daily_rate
-                    
+
                     if encashment_amount > 0:
                         total_gross += encashment_amount
                         virtual_leave_rule, _ = ComponentRule.objects.get_or_create(
                             name="Leave Encashment",
-                            defaults={'type': 'Earning', 'formula': '0', 'effective_from': "2020-01-01"}
+                            defaults={
+                                "type": "Earning",
+                                "formula": "0",
+                                "effective_from": "2020-01-01",
+                            },
                         )
-                        line_items.append({'rule': virtual_leave_rule, 'amount': round(encashment_amount, 2)})
-                        
+                        line_items.append(
+                            {
+                                "rule": virtual_leave_rule,
+                                "amount": round(encashment_amount, 2),
+                            }
+                        )
+
                         if not is_simulation:
                             for bal in balances_to_reset:
-                                bal.used_days = F('used_days') + bal.remaining_days
-                                bal.remaining_days = Decimal('0.00')
-                                bal.save(update_fields=['used_days', 'remaining_days'])
+                                bal.used_days = F("used_days") + bal.remaining_days
+                                bal.remaining_days = Decimal("0.00")
+                                bal.save(update_fields=["used_days", "remaining_days"])
             except Exception as e:
                 import traceback
+
                 print(f"Error processing leave encashment: {e}")
                 traceback.print_exc()
 
         # ==========================================
+        # RECONCILE TDS ON FINAL TOTAL GROSS
+        # Ensures TDS accurately covers final total_gross (including Overtime Allowance, Bonus, Arrears)
+        # ==========================================
+        if tds_applicable:
+            for item in line_items:
+                r_up = getattr(item["rule"], "name", "").upper()
+                if "TDS" in r_up or "INCOME TAX" in r_up:
+                    old_tds = item["amount"]
+                    if is_professional_contractor:
+                        tds_sec = getattr(employee, "tds_section", "194J_10")
+                        c_rate = getattr(employee, "tds_rate", Decimal("10.00"))
+                        new_tds, _, _ = calculate_professional_tds(
+                            total_gross,
+                            tds_section=tds_sec,
+                            custom_rate=c_rate,
+                            pan=getattr(employee, "pan", None),
+                        )
+                    else:
+                        emp_pan = getattr(employee, "pan", None)
+                        pan_clean = str(emp_pan or "").strip().upper()
+                        is_pan_missing = (
+                            not pan_clean
+                            or pan_clean in ["N/A", "NONE", "NAN", "XXXXX0000X"]
+                            or len(pan_clean) < 5
+                        )
+                        emp_tds_rate = getattr(employee, "tds_rate", None)
+                        if is_pan_missing:
+                            new_tds = (total_gross * Decimal("0.20")).quantize(
+                                Decimal("1.00"), rounding=decimal.ROUND_HALF_UP
+                            )
+                        elif emp_tds_rate and Decimal(str(emp_tds_rate)) > Decimal(
+                            "0.00"
+                        ):
+                            custom_pct = Decimal(str(emp_tds_rate)) / Decimal("100.0")
+                            new_tds = (total_gross * custom_pct).quantize(
+                                Decimal("1.00"), rounding=decimal.ROUND_HALF_UP
+                            )
+                        else:
+                            ytd_data = (
+                                precomputed_data.get("ytd_map", {}).get(employee.id, {})
+                                if precomputed_data
+                                else {}
+                            )
+                            ytd_gross = ytd_data.get("ytd_gross") or Decimal("0.00")
+                            ytd_tax_paid = ytd_data.get("ytd_tds") or Decimal("0.00")
+                            cur_month = (
+                                precomputed_data.get("month", timezone.now().month)
+                                if precomputed_data
+                                else timezone.now().month
+                            )
+                            remaining_months = max(1, 12 - ((cur_month - 4) % 12))
+                            new_tds = calculate_tds(
+                                ytd_gross,
+                                ytd_tax_paid,
+                                total_gross,
+                                remaining_months,
+                                regime=getattr(employee, "tax_regime", "New"),
+                                gender=context.get("gender", "Male"),
+                                deductions=Decimal(
+                                    str(
+                                        getattr(
+                                            employee, "tax_saving_deductions", "0.00"
+                                        )
+                                    )
+                                ),
+                            )
+                    diff = new_tds - old_tds
+                    if diff != 0:
+                        item["amount"] = new_tds
+                        total_deductions += diff
+                        context[item["rule"].name] = new_tds
+                        context["tds"] = new_tds
+                        context["Income Tax"] = new_tds
+                    break
+
+        # ==========================================
         # PUNCTUALITY & LATE DEDUCTIONS INJECTION
         # ==========================================
-        late_deduction_val = context.get('late_deduction_amount', Decimal('0.00'))
-        if late_deduction_val > Decimal('0.00'):
-            late_deduction_val = late_deduction_val.quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+        late_deduction_val = context.get("late_deduction_amount", Decimal("0.00"))
+        if late_deduction_val > Decimal("0.00"):
+            late_deduction_val = late_deduction_val.quantize(
+                Decimal("0.01"), rounding=decimal.ROUND_HALF_UP
+            )
             total_deductions += late_deduction_val
             virtual_punct_rule, _ = ComponentRule.objects.get_or_create(
                 name="Punctuality & Late Deductions",
                 defaults={
-                    'type': 'Deduction',
-                    'formula': '0',
-                    'is_statutory': False,
-                    'effective_from': timezone.now().date()
-                }
+                    "type": "Deduction",
+                    "formula": "0",
+                    "is_statutory": False,
+                    "effective_from": timezone.now().date(),
+                },
             )
-            line_items.append({'rule': virtual_punct_rule, 'amount': late_deduction_val})
+            line_items.append(
+                {"rule": virtual_punct_rule, "amount": late_deduction_val}
+            )
 
         # ==========================================
         # EMPLOYEE WALLET (SECURITY DEPOSIT) INJECTION
         # ==========================================
         from payroll.models import EmployeeWallet, WalletPolicy
-        wallet = EmployeeWallet.objects.filter(employee_id=employee.id).first() if hasattr(employee, 'id') else None
+
+        wallet = (
+            EmployeeWallet.objects.filter(employee_id=employee.id).first()
+            if hasattr(employee, "id")
+            else None
+        )
 
         wallet_policy = None
-        if getattr(employee, 'site_id', None):
-            wallet_policy = WalletPolicy.objects.filter(site_id=employee.site_id).first()
-        if not wallet_policy and getattr(employee, 'entity_id', None):
-            wallet_policy = WalletPolicy.objects.filter(organization_id=employee.entity_id).first()
+        if getattr(employee, "site_id", None):
+            wallet_policy = WalletPolicy.objects.filter(
+                site_id=employee.site_id
+            ).first()
+        if not wallet_policy and getattr(employee, "entity_id", None):
+            wallet_policy = WalletPolicy.objects.filter(
+                organization_id=employee.entity_id
+            ).first()
 
         if wallet and wallet.is_active and wallet_policy and wallet_policy.is_enabled:
             ceiling = Decimal(str(wallet.effective_ceiling))
             current_bal = Decimal(str(wallet.current_balance))
-            remaining_capacity = max(Decimal('0.00'), ceiling - current_bal)
+            remaining_capacity = max(Decimal("0.00"), ceiling - current_bal)
 
-            if remaining_capacity > Decimal('0.00'):
+            if remaining_capacity > Decimal("0.00"):
                 # Calculate nominal monthly cut with strict Decimal precision
-                if wallet_policy.deduction_basis == 'GROSS':
-                    nominal_cut = (total_gross * Decimal(str(wallet_policy.deduction_rate))) / Decimal('100.00')
-                elif wallet_policy.deduction_basis == 'BASIC':
-                    nominal_cut = (Decimal(str(context.get('basic', 0))) * Decimal(str(wallet_policy.deduction_rate))) / Decimal('100.00')
+                if wallet_policy.deduction_basis == "GROSS":
+                    nominal_cut = (
+                        total_gross * Decimal(str(wallet_policy.deduction_rate))
+                    ) / Decimal("100.00")
+                elif wallet_policy.deduction_basis == "BASIC":
+                    nominal_cut = (
+                        Decimal(str(context.get("basic", 0)))
+                        * Decimal(str(wallet_policy.deduction_rate))
+                    ) / Decimal("100.00")
                 else:  # FIXED
                     nominal_cut = Decimal(str(wallet_policy.deduction_rate))
 
                 # Clamp deduction so it never exceeds ceiling by even 0.01 paise
-                wallet_deduction = min(nominal_cut, remaining_capacity).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+                wallet_deduction = min(nominal_cut, remaining_capacity).quantize(
+                    Decimal("0.01"), rounding=decimal.ROUND_HALF_UP
+                )
 
-                if wallet_deduction > Decimal('0.00'):
+                if wallet_deduction > Decimal("0.00"):
                     total_deductions += wallet_deduction
                     virtual_wallet_rule, _ = ComponentRule.objects.get_or_create(
                         name="Security Deposit (Wallet)",
                         defaults={
-                            'type': 'Deduction',
-                            'formula': '0',
-                            'is_statutory': False,
-                            'effective_from': timezone.now().date()
-                        }
+                            "type": "Deduction",
+                            "formula": "0",
+                            "is_statutory": False,
+                            "effective_from": timezone.now().date(),
+                        },
                     )
-                    line_items.append({'rule': virtual_wallet_rule, 'amount': wallet_deduction})
+                    line_items.append(
+                        {"rule": virtual_wallet_rule, "amount": wallet_deduction}
+                    )
 
         # ==========================================
         # DISCIPLINARY MEMO DEDUCTIONS INJECTION
         # ==========================================
         from payroll.models import EmployeeDisciplinaryMemo
+
         pending_memos = EmployeeDisciplinaryMemo.objects.filter(
-            employee_id=employee.id,
-            status='PENDING',
-            is_active=True
+            employee_id=employee.id, status="PENDING", is_active=True
         )
         for memo in pending_memos:
-            memo_val = Decimal(str(memo.amount or '0.00')).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
-            if memo_val > Decimal('0.00'):
+            memo_val = Decimal(str(memo.amount or "0.00")).quantize(
+                Decimal("0.01"), rounding=decimal.ROUND_HALF_UP
+            )
+            if memo_val > Decimal("0.00"):
                 total_deductions += memo_val
-                reason_clean = (memo.infraction_reason or "Disciplinary Penalty").strip()
+                reason_clean = (
+                    memo.infraction_reason or "Disciplinary Penalty"
+                ).strip()
                 virtual_memo_rule, _ = ComponentRule.objects.get_or_create(
                     name=f"Disciplinary Memo: {reason_clean}",
                     defaults={
-                        'type': 'Deduction',
-                        'formula': '0',
-                        'is_statutory': False,
-                        'effective_from': timezone.now().date()
-                    }
+                        "type": "Deduction",
+                        "formula": "0",
+                        "is_statutory": False,
+                        "effective_from": timezone.now().date(),
+                    },
                 )
-                line_items.append({'rule': virtual_memo_rule, 'amount': memo_val})
+                line_items.append({"rule": virtual_memo_rule, "amount": memo_val})
+
+        # ==========================================
+        # LOAN EMI DEDUCTIONS INJECTION
+        # ==========================================
+        from payroll.models import Loan, LoanInstallment
+
+        period_str = getattr(run, "period", None) or precomputed_data.get("period")
+        if period_str and hasattr(employee, "id"):
+            active_loans = Loan.objects.filter(employee_id=employee.id, status="Active")
+            for loan in active_loans:
+                inst = loan.installments.filter(period=period_str).first()
+                if inst and inst.status == "PENDING":
+                    emi_val = Decimal(str(inst.emi_amount or "0.00")).quantize(
+                        Decimal("0.01"), rounding=decimal.ROUND_HALF_UP
+                    )
+                    # Capacity check: ensure non-statutory loan recovery does not push net pay negative
+                    available_cap = max(Decimal("0.00"), total_gross - total_deductions)
+                    recoverable_emi = min(emi_val, available_cap)
+                    if recoverable_emi > Decimal("0.00"):
+                        total_deductions += recoverable_emi
+                        loan_name = f"Loan EMI: {loan.type}".strip()
+                        virtual_loan_rule, _ = ComponentRule.objects.get_or_create(
+                            name=loan_name,
+                            defaults={
+                                "type": "Deduction",
+                                "formula": "0",
+                                "is_statutory": False,
+                                "effective_from": timezone.now().date(),
+                            },
+                        )
+                        line_items.append(
+                            {"rule": virtual_loan_rule, "amount": recoverable_emi}
+                        )
+                elif inst and inst.status == "SKIPPED":
+                    remarks = context.setdefault("loan_remarks", [])
+                    strategy_label = (
+                        "Tenure Extended"
+                        if inst.skip_strategy == "EXTEND_TENURE"
+                        else "Catch-up Next Month"
+                    )
+                    reason_info = f" ({inst.skip_reason})" if inst.skip_reason else ""
+                    remarks.append(
+                        f"EMI for {loan.type} deferred by Management [{strategy_label}]{reason_info}"
+                    )
+
+        # ==========================================
+        # SALARY ADVANCE RECOVERY INJECTION
+        # ==========================================
+        from payroll.models import SalaryAdvance, SalaryAdvanceInstallment
+
+        if period_str and hasattr(employee, "id"):
+            active_advances = SalaryAdvance.objects.filter(
+                employee_id=employee.id, status="Disbursed"
+            )
+            for adv in active_advances:
+                inst = adv.installments.filter(period=period_str).first()
+                if inst and inst.status == "PENDING":
+                    rec_val = Decimal(str(inst.amount or "0.00")).quantize(
+                        Decimal("0.01"), rounding=decimal.ROUND_HALF_UP
+                    )
+                    # Capacity check: ensure non-statutory advance recovery does not push net pay negative
+                    available_cap = max(Decimal("0.00"), total_gross - total_deductions)
+                    recoverable_adv = min(rec_val, available_cap)
+                    if recoverable_adv > Decimal("0.00"):
+                        total_deductions += recoverable_adv
+                        adv_rule, _ = ComponentRule.objects.get_or_create(
+                            name="Salary Advance Recovery",
+                            defaults={
+                                "type": "Deduction",
+                                "formula": "0",
+                                "is_statutory": False,
+                                "effective_from": timezone.now().date(),
+                            },
+                        )
+                        line_items.append({"rule": adv_rule, "amount": recoverable_adv})
 
         # ==========================================
         # 100% MATHEMATICAL PRECISION & INVARIANT VERIFICATION
         # ==========================================
         # Ensure every individual line item amount is quantized to exact paise
         for item in line_items:
-            item['amount'] = Decimal(str(item['amount'])).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+            item["amount"] = Decimal(str(item["amount"])).quantize(
+                Decimal("0.01"), rounding=decimal.ROUND_HALF_UP
+            )
 
-        total_gross = sum((item['amount'] for item in line_items if item['rule'].type == 'Earning'), Decimal('0.00')).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
-        total_deductions = sum((item['amount'] for item in line_items if item['rule'].type == 'Deduction'), Decimal('0.00')).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+        total_gross = sum(
+            (item["amount"] for item in line_items if item["rule"].type == "Earning"),
+            Decimal("0.00"),
+        ).quantize(Decimal("0.01"), rounding=decimal.ROUND_HALF_UP)
+        total_deductions = sum(
+            (item["amount"] for item in line_items if item["rule"].type == "Deduction"),
+            Decimal("0.00"),
+        ).quantize(Decimal("0.01"), rounding=decimal.ROUND_HALF_UP)
 
-        net = (total_gross - total_deductions).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
-        if net < Decimal('0.00'):
-            diff = (total_deductions - total_gross).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+        net = (total_gross - total_deductions).quantize(
+            Decimal("0.01"), rounding=decimal.ROUND_HALF_UP
+        )
+        if net < Decimal("0.00"):
+            diff = (total_deductions - total_gross).quantize(
+                Decimal("0.01"), rounding=decimal.ROUND_HALF_UP
+            )
             virtual_adjustment, _ = ComponentRule.objects.get_or_create(
                 name="Negative Pay Adjustment",
-                defaults={'type': 'Earning', 'formula': "0", 'effective_from': timezone.now().date()}
+                defaults={
+                    "type": "Earning",
+                    "formula": "0",
+                    "effective_from": timezone.now().date(),
+                },
             )
-            line_items.append({'rule': virtual_adjustment, 'amount': diff})
-            total_gross = (total_gross + diff).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
-            net = Decimal('0.00')
+            line_items.append({"rule": virtual_adjustment, "amount": diff})
+            total_gross = (total_gross + diff).quantize(
+                Decimal("0.01"), rounding=decimal.ROUND_HALF_UP
+            )
+            net = Decimal("0.00")
 
         return total_gross, total_deductions, net, line_items
 
     @staticmethod
-    def _run_async_worker(run_id, is_simulation, overrides=None, include_variable_bonus=False, include_leaves_encashment=False):
+    def _run_async_worker(
+        run_id,
+        is_simulation,
+        overrides=None,
+        include_variable_bonus=False,
+        include_leaves_encashment=False,
+    ):
         # We use a raw thread here strictly because Celery is not installed in the environment.
         # In a real enterprise setup (Wave 7), this MUST be a celery @shared_task.
         import threading
-        
+
         def worker():
             from django.db import connection
+
             try:
                 run = PayrollRun.objects.get(id=run_id)
                 from django.db.models import Q
+
                 if is_simulation:
                     SimulatedPayslip.objects.filter(run=run).delete()
-                    employees = Employee.objects.filter(Q(entity=run.entity) | Q(branch__entity=run.entity) | Q(site__branch__entity=run.entity), status='Active')
+                    employees = Employee.objects.filter(
+                        Q(entity=run.entity)
+                        | Q(branch__entity=run.entity)
+                        | Q(site__branch__entity=run.entity),
+                        status="Active",
+                    )
                 else:
                     # Cleanly re-generate payslips for this run so attendance and parameter changes take immediate effect
                     Payslip.objects.filter(run=run).delete()
-                    employees = Employee.objects.filter(Q(entity=run.entity) | Q(branch__entity=run.entity) | Q(site__branch__entity=run.entity), status='Active')
-                    
+                    employees = Employee.objects.filter(
+                        Q(entity=run.entity)
+                        | Q(branch__entity=run.entity)
+                        | Q(site__branch__entity=run.entity),
+                        status="Active",
+                    )
+
                 # PREFETCH to kill N+1 queries
-                employees = employees.select_related('salary_structure').prefetch_related(
-                    'salary_structure__components', 
-                    'allocations', 
-                    'allocations__cost_center'
+                employees = employees.select_related(
+                    "salary_structure"
+                ).prefetch_related(
+                    "salary_structure__components",
+                    "allocations",
+                    "allocations__cost_center",
                 )
-                
+
                 # PRECOMPUTE aggregations to kill N+1 queries
                 precomputed_data = PayrollService._precompute_payroll_data(run)
-                
+
                 # Cache DAGs to avoid rebuilding for identical structures
                 dag_cache = {}
                 from payroll.models import SalaryStructure
-                default_struct = SalaryStructure.objects.filter(status='Active').first()
+
+                default_struct = SalaryStructure.objects.filter(status="Active").first()
                 for emp in employees:
                     struct = (
-                        emp.salary_structure or
-                        (emp.site and SalaryStructure.objects.filter(site=emp.site, status='Active').first()) or
-                        (emp.entity and SalaryStructure.objects.filter(site__branch__entity=emp.entity, status='Active').first()) or
-                        default_struct
+                        emp.salary_structure
+                        or (
+                            emp.site
+                            and SalaryStructure.objects.filter(
+                                site=emp.site, status="Active"
+                            ).first()
+                        )
+                        or (
+                            emp.entity
+                            and SalaryStructure.objects.filter(
+                                site__branch__entity=emp.entity, status="Active"
+                            ).first()
+                        )
+                        or default_struct
                     )
                     if struct:
                         emp.salary_structure = struct
                         if struct.id not in dag_cache:
                             emp_rules = list(struct.components.all())
-                            dag_cache[struct.id] = build_dag_and_sort(emp_rules) if emp_rules else []
+                            dag_cache[struct.id] = (
+                                build_dag_and_sort(emp_rules) if emp_rules else []
+                            )
                         emp._cached_dag = dag_cache[struct.id]
                     else:
                         emp._cached_dag = []
-                
+
                 slips_to_create = []
                 slip_lines_data = []
                 allocations_data = []
                 exceptions = []
-                
+
                 # O(1) Loop
                 for emp in employees:
                     try:
@@ -819,48 +1401,120 @@ class PayrollService:
                                 emp._cached_dag = dag_cache.get(default_struct.id, [])
 
                         # Dynamic validation: if employee lacks valid CTC or salary structure, record in PayrollException and skip
-                        if not emp.salary_structure or not emp.salary_structure.components.exists() or not emp.ctc or emp.ctc <= 0:
+                        if (
+                            not emp.salary_structure
+                            or not emp.salary_structure.components.exists()
+                            or not emp.ctc
+                            or emp.ctc <= 0
+                        ):
                             if not is_simulation:
-                                exceptions.append(PayrollException(
-                                    run=run,
-                                    employee=emp,
-                                    error_trace=f"Skipped in payroll run: Employee {emp.code} has missing Salary Structure or CTC (Current CTC: {emp.ctc or 0}).",
-                                    resolved=False
-                                ))
+                                exceptions.append(
+                                    PayrollException(
+                                        run=run,
+                                        employee=emp,
+                                        error_trace=f"Skipped in payroll run: Employee {emp.code} has missing Salary Structure or CTC (Current CTC: {emp.ctc or 0}).",
+                                        resolved=False,
+                                    )
+                                )
                             continue
-                            
+
                         emp_override = None
                         if overrides:
-                            emp_override = next((o for o in overrides if str(o.get('id', '')) == str(emp.id)), None)
-                            
-                        gross, ded, net, line_items = PayrollService.process_employee_in_memory(
-                            emp, run, precomputed_data, is_simulation, include_variable_bonus, emp_override=emp_override, include_leaves_encashment=include_leaves_encashment
+                            emp_override = next(
+                                (
+                                    o
+                                    for o in overrides
+                                    if str(o.get("id", "")) == str(emp.id)
+                                ),
+                                None,
+                            )
+
+                        gross, ded, net, line_items = (
+                            PayrollService.process_employee_in_memory(
+                                emp,
+                                run,
+                                precomputed_data,
+                                is_simulation,
+                                include_variable_bonus,
+                                emp_override=emp_override,
+                                include_leaves_encashment=include_leaves_encashment,
+                            )
                         )
-                        
-                        context = PayrollService._get_context_for_employee(emp, precomputed_data, emp_override=emp_override)
-                        
+
+                        context = PayrollService._get_context_for_employee(
+                            emp, precomputed_data, emp_override=emp_override
+                        )
+
                         if emp_override:
                             # Apply any specific manual component adjustments if passed
                             for item in line_items:
-                                rule_name = getattr(item['rule'], 'name', '').upper()
-                                if 'PF' in rule_name and 'pf' in emp_override and emp_override.get('hasManualPf'):
-                                    item['amount'] = Decimal(str(emp_override['pf']))
-                                elif ('PT' in rule_name or 'PROFESSIONAL TAX' in rule_name) and 'pt' in emp_override and emp_override.get('hasManualPt'):
-                                    item['amount'] = Decimal(str(emp_override['pt']))
-                                elif 'REIMBURSEMENT' in rule_name and 'reimbursement' in emp_override and emp_override['reimbursement'] is not None:
-                                    item['amount'] = Decimal(str(emp_override['reimbursement']))
-                                elif ('INCENTIVE' in rule_name or 'BONUS' in rule_name) and 'incentive' in emp_override and emp_override['incentive'] is not None:
-                                    item['amount'] = Decimal(str(emp_override['incentive']))
-                                elif ('OVERTIME' in rule_name or 'OT' in rule_name) and ('overtimePay' in emp_override or 'otAmount' in emp_override):
-                                    ot_override_amt = emp_override.get('overtimePay') if emp_override.get('overtimePay') is not None else emp_override.get('otAmount')
+                                rule_name = getattr(item["rule"], "name", "").upper()
+                                if (
+                                    "PF" in rule_name
+                                    and "pf" in emp_override
+                                    and emp_override.get("hasManualPf")
+                                ):
+                                    item["amount"] = Decimal(str(emp_override["pf"]))
+                                elif (
+                                    (
+                                        "PT" in rule_name
+                                        or "PROFESSIONAL TAX" in rule_name
+                                    )
+                                    and "pt" in emp_override
+                                    and emp_override.get("hasManualPt")
+                                ):
+                                    item["amount"] = Decimal(str(emp_override["pt"]))
+                                elif (
+                                    "REIMBURSEMENT" in rule_name
+                                    and "reimbursement" in emp_override
+                                    and emp_override["reimbursement"] is not None
+                                ):
+                                    item["amount"] = Decimal(
+                                        str(emp_override["reimbursement"])
+                                    )
+                                elif (
+                                    ("INCENTIVE" in rule_name or "BONUS" in rule_name)
+                                    and "incentive" in emp_override
+                                    and emp_override["incentive"] is not None
+                                ):
+                                    item["amount"] = Decimal(
+                                        str(emp_override["incentive"])
+                                    )
+                                elif (
+                                    "OVERTIME" in rule_name or "OT" in rule_name
+                                ) and (
+                                    "overtimePay" in emp_override
+                                    or "otAmount" in emp_override
+                                ):
+                                    ot_override_amt = (
+                                        emp_override.get("overtimePay")
+                                        if emp_override.get("overtimePay") is not None
+                                        else emp_override.get("otAmount")
+                                    )
                                     if ot_override_amt is not None:
-                                        item['amount'] = Decimal(str(ot_override_amt))
+                                        item["amount"] = Decimal(str(ot_override_amt))
 
                             # Re-verify and maintain 100% strict mathematical invariant:
-                            gross = sum((item['amount'] for item in line_items if item['rule'].type == 'Earning'), Decimal('0.00')).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
-                            ded = sum((item['amount'] for item in line_items if item['rule'].type == 'Deduction'), Decimal('0.00')).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
-                            net = (gross - ded).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
-                        
+                            gross = sum(
+                                (
+                                    item["amount"]
+                                    for item in line_items
+                                    if item["rule"].type == "Earning"
+                                ),
+                                Decimal("0.00"),
+                            ).quantize(Decimal("0.01"), rounding=decimal.ROUND_HALF_UP)
+                            ded = sum(
+                                (
+                                    item["amount"]
+                                    for item in line_items
+                                    if item["rule"].type == "Deduction"
+                                ),
+                                Decimal("0.00"),
+                            ).quantize(Decimal("0.01"), rounding=decimal.ROUND_HALF_UP)
+                            net = (gross - ded).quantize(
+                                Decimal("0.01"), rounding=decimal.ROUND_HALF_UP
+                            )
+
                         serializable_snapshot = {}
                         for k, v in context.items():
                             if isinstance(v, Decimal):
@@ -870,72 +1524,196 @@ class PayrollService:
 
                         if is_simulation:
                             slip = SimulatedPayslip(
-                                employee=emp, run=run, period=run.period, gross=gross, deductions=ded, net=net,
-                                days_present=Decimal(str(context.get('actual_present_days', context.get('present_days', 0)))),
-                                days_paid=Decimal(str(context.get('paid_days', context.get('present_days', 0)))),
-                                total_days=Decimal(str(context.get('total_days', 30))),
-                                lop_days=Decimal(str(context.get('lop_days', 0))),
-                                half_days=Decimal(str(context.get('half_day_count', 0))),
-                                late_penalty_days=Decimal(str(context.get('late_penalty_days', 0))),
-                                ot_hours=Decimal(str(context.get('ot_hours', context.get('overtime_hours', 0)))),
-                                annual_leaves=Decimal(str(context.get('annual_leaves', context.get('paid_leave_days', 0)))),
+                                employee=emp,
+                                run=run,
+                                period=run.period,
+                                gross=gross,
+                                deductions=ded,
+                                net=net,
+                                days_present=Decimal(
+                                    str(
+                                        context.get(
+                                            "actual_present_days",
+                                            context.get("present_days", 0),
+                                        )
+                                    )
+                                ),
+                                days_paid=Decimal(
+                                    str(
+                                        context.get(
+                                            "paid_days", context.get("present_days", 0)
+                                        )
+                                    )
+                                ),
+                                total_days=Decimal(str(context.get("total_days", 30))),
+                                lop_days=Decimal(str(context.get("lop_days", 0))),
+                                half_days=Decimal(
+                                    str(context.get("half_day_count", 0))
+                                ),
+                                late_penalty_days=Decimal(
+                                    str(context.get("late_penalty_days", 0))
+                                ),
+                                ot_hours=Decimal(
+                                    str(
+                                        context.get(
+                                            "ot_hours", context.get("overtime_hours", 0)
+                                        )
+                                    )
+                                ),
+                                annual_leaves=Decimal(
+                                    str(
+                                        context.get(
+                                            "annual_leaves",
+                                            context.get("paid_leave_days", 0),
+                                        )
+                                    )
+                                ),
                                 attendance_snapshot=serializable_snapshot,
                             )
                         else:
                             slip = Payslip(
-                                employee=emp, run=run, period=run.period, gross=gross, deductions=ded, net=net,
-                                days_present=Decimal(str(context.get('actual_present_days', context.get('present_days', 0)))),
-                                days_paid=Decimal(str(context.get('paid_days', context.get('present_days', 0)))),
-                                total_days=Decimal(str(context.get('total_days', 30))),
-                                lop_days=Decimal(str(context.get('lop_days', 0))),
-                                half_days=Decimal(str(context.get('half_day_count', 0))),
-                                late_penalty_days=Decimal(str(context.get('late_penalty_days', 0))),
-                                ot_hours=Decimal(str(context.get('ot_hours', context.get('overtime_hours', 0)))),
-                                annual_leaves=Decimal(str(context.get('annual_leaves', context.get('paid_leave_days', 0)))),
+                                employee=emp,
+                                run=run,
+                                period=run.period,
+                                gross=gross,
+                                deductions=ded,
+                                net=net,
+                                days_present=Decimal(
+                                    str(
+                                        context.get(
+                                            "actual_present_days",
+                                            context.get("present_days", 0),
+                                        )
+                                    )
+                                ),
+                                days_paid=Decimal(
+                                    str(
+                                        context.get(
+                                            "paid_days", context.get("present_days", 0)
+                                        )
+                                    )
+                                ),
+                                total_days=Decimal(str(context.get("total_days", 30))),
+                                lop_days=Decimal(str(context.get("lop_days", 0))),
+                                half_days=Decimal(
+                                    str(context.get("half_day_count", 0))
+                                ),
+                                late_penalty_days=Decimal(
+                                    str(context.get("late_penalty_days", 0))
+                                ),
+                                ot_hours=Decimal(
+                                    str(
+                                        context.get(
+                                            "ot_hours", context.get("overtime_hours", 0)
+                                        )
+                                    )
+                                ),
+                                annual_leaves=Decimal(
+                                    str(
+                                        context.get(
+                                            "annual_leaves",
+                                            context.get("paid_leave_days", 0),
+                                        )
+                                    )
+                                ),
                                 attendance_snapshot=serializable_snapshot,
                             )
-                            
+
                         slips_to_create.append(slip)
                         slip_lines_data.append(line_items)
                         allocations_data.append(list(emp.allocations.all()))
-                        
+
                     except Exception as e:
                         if not is_simulation:
-                            exceptions.append(PayrollException(run=run, employee=emp, error_trace=str(e), resolved=False))
-                
+                            exceptions.append(
+                                PayrollException(
+                                    run=run,
+                                    employee=emp,
+                                    error_trace=str(e),
+                                    resolved=False,
+                                )
+                            )
+
                 # BATCH INSERTS (Transaction-protected)
                 from django.db import transaction
+
                 with transaction.atomic():
                     if is_simulation:
-                        created_slips = SimulatedPayslip.objects.bulk_create(slips_to_create, batch_size=5000)
+                        created_slips = SimulatedPayslip.objects.bulk_create(
+                            slips_to_create, batch_size=5000
+                        )
                         line_objects = []
                         for slip, lines in zip(created_slips, slip_lines_data):
-                            line_objects.extend([SimulatedLineItem(payslip=slip, rule=item['rule'], amount=item['amount']) for item in lines])
-                        SimulatedLineItem.objects.bulk_create(line_objects, batch_size=5000)
+                            line_objects.extend(
+                                [
+                                    SimulatedLineItem(
+                                        payslip=slip,
+                                        rule=item["rule"],
+                                        amount=item["amount"],
+                                    )
+                                    for item in lines
+                                ]
+                            )
+                        SimulatedLineItem.objects.bulk_create(
+                            line_objects, batch_size=5000
+                        )
                     else:
-                        created_slips = Payslip.objects.bulk_create(slips_to_create, batch_size=5000)
+                        created_slips = Payslip.objects.bulk_create(
+                            slips_to_create, batch_size=5000
+                        )
                         line_objects = []
                         alloc_objects = []
-                        for slip, lines, allocs in zip(created_slips, slip_lines_data, allocations_data):
-                            line_objects.extend([PayslipLineItem(payslip=slip, rule=item['rule'], amount=item['amount']) for item in lines])
-                            alloc_objects.extend([PayslipAllocationSnapshot(payslip=slip, cost_center=a.cost_center, percentage=a.percentage) for a in allocs])
-                        PayslipLineItem.objects.bulk_create(line_objects, batch_size=5000)
-                        PayslipAllocationSnapshot.objects.bulk_create(alloc_objects, batch_size=5000)
+                        for slip, lines, allocs in zip(
+                            created_slips, slip_lines_data, allocations_data
+                        ):
+                            line_objects.extend(
+                                [
+                                    PayslipLineItem(
+                                        payslip=slip,
+                                        rule=item["rule"],
+                                        amount=item["amount"],
+                                    )
+                                    for item in lines
+                                ]
+                            )
+                            alloc_objects.extend(
+                                [
+                                    PayslipAllocationSnapshot(
+                                        payslip=slip,
+                                        cost_center=a.cost_center,
+                                        percentage=a.percentage,
+                                    )
+                                    for a in allocs
+                                ]
+                            )
+                        PayslipLineItem.objects.bulk_create(
+                            line_objects, batch_size=5000
+                        )
+                        PayslipAllocationSnapshot.objects.bulk_create(
+                            alloc_objects, batch_size=5000
+                        )
                         if exceptions:
-                            PayrollException.objects.bulk_create(exceptions, batch_size=5000)
-                    
+                            PayrollException.objects.bulk_create(
+                                exceptions, batch_size=5000
+                            )
+
                     if not is_simulation:
                         # Resolve fixed exceptions
                         successful_emp_ids = [s.employee_id for s in slips_to_create]
-                        PayrollException.objects.filter(run=run, employee_id__in=successful_emp_ids).update(resolved=True)
-                                
-                    has_exceptions = PayrollException.objects.filter(run=run, resolved=False).exists()
-                    run.status = 'Maker-Submitted'
-                    run.save(update_fields=['status'])
+                        PayrollException.objects.filter(
+                            run=run, employee_id__in=successful_emp_ids
+                        ).update(resolved=True)
+
+                    has_exceptions = PayrollException.objects.filter(
+                        run=run, resolved=False
+                    ).exists()
+                    run.status = "Maker-Submitted"
+                    run.save(update_fields=["status"])
                     # Notify Approvers
                     from employees.models import Notification
 
                     from authentication.permissions import coerce_permission_bool
+
                     for approver in Employee.objects.filter(status="Active"):
                         if (
                             approver.dynamic_role
@@ -950,13 +1728,13 @@ class PayrollService:
                                 recipient=approver,
                                 title="Payroll Ready for Review",
                                 message=f"Payroll for {run.period} has been processed and is awaiting your approval.",
-                                related_run_id=run.id
+                                related_run_id=run.id,
                             )
                 run.save()
             finally:
                 if is_simulation:
                     connection.close()
-                
+
         if is_simulation:
             thread = threading.Thread(target=worker)
             thread.daemon = True
@@ -966,19 +1744,31 @@ class PayrollService:
             worker()
 
     @staticmethod
-    def execute_run(run_id, overrides=None, include_variable_bonus=False, include_leaves_encashment=False):
+    def execute_run(
+        run_id,
+        overrides=None,
+        include_variable_bonus=False,
+        include_leaves_encashment=False,
+    ):
         run = PayrollRun.objects.get(id=run_id)
-        if run.status in ['Frozen', 'Disbursed']:
+        if run.status in ["Frozen", "Disbursed"]:
             raise ValueError("Cannot execute a run that is Frozen or Disbursed")
 
         # Double-check that all active employees in this entity have Salary Structure and CTC
         from employees.models import Employee
         from django.db.models import Q
-        active_emps = Employee.objects.filter(
-            Q(entity=run.entity) | Q(branch__entity=run.entity) | Q(site__branch__entity=run.entity),
-            status='Active'
-        ).select_related('salary_structure', 'department', 'designation').prefetch_related('salary_structure__components')
-        
+
+        active_emps = (
+            Employee.objects.filter(
+                Q(entity=run.entity)
+                | Q(branch__entity=run.entity)
+                | Q(site__branch__entity=run.entity),
+                status="Active",
+            )
+            .select_related("salary_structure", "department", "designation")
+            .prefetch_related("salary_structure__components")
+        )
+
         missing_records = []
         missing_employees = []
         for emp in active_emps:
@@ -989,30 +1779,57 @@ class PayrollService:
             if not emp.ctc or emp.ctc <= 0:
                 missing_records.append(f"{emp.code} (Missing CTC)")
                 missing_fields.append("CTC")
-                
+
             if missing_fields:
-                missing_employees.append({
-                    'id': emp.id,
-                    'code': emp.code or f"EMP{emp.id}",
-                    'name': f"{emp.first_name} {emp.last_name}".strip() or "Unnamed",
-                    'department': emp.department.name if getattr(emp, 'department', None) else 'N/A',
-                    'designation': emp.designation.title if getattr(emp, 'designation', None) else 'N/A',
-                    'entity': run.entity.name if run.entity else 'N/A',
-                    'entity_id': run.entity.id if run.entity else None,
-                    'missing': missing_fields,
-                    'missing_salary_structure': "Salary Structure" in missing_fields,
-                    'missing_ctc': "CTC" in missing_fields,
-                })
-                
-        valid_emps_count = sum(1 for e in active_emps if (e.salary_structure and e.salary_structure.components.exists() and e.ctc and e.ctc > 0))
+                missing_employees.append(
+                    {
+                        "id": emp.id,
+                        "code": emp.code or f"EMP{emp.id}",
+                        "name": f"{emp.first_name} {emp.last_name}".strip()
+                        or "Unnamed",
+                        "department": (
+                            emp.department.name
+                            if getattr(emp, "department", None)
+                            else "N/A"
+                        ),
+                        "designation": (
+                            emp.designation.title
+                            if getattr(emp, "designation", None)
+                            else "N/A"
+                        ),
+                        "entity": run.entity.name if run.entity else "N/A",
+                        "entity_id": run.entity.id if run.entity else None,
+                        "missing": missing_fields,
+                        "missing_salary_structure": "Salary Structure"
+                        in missing_fields,
+                        "missing_ctc": "CTC" in missing_fields,
+                    }
+                )
+
+        valid_emps_count = sum(
+            1
+            for e in active_emps
+            if (
+                e.salary_structure
+                and e.salary_structure.components.exists()
+                and e.ctc
+                and e.ctc > 0
+            )
+        )
         if valid_emps_count == 0:
             msg = f"Cannot execute payroll. None of the {len(active_emps)} active employees have a configured CTC and Salary Structure."
             raise PayrollPrerequisiteError(msg, missing_employees=missing_employees)
 
-        run.status = 'Processing'
+        run.status = "Processing"
         run.save()
-        is_simulation = (run.run_type == 'Simulation')
-        PayrollService._run_async_worker(run_id, is_simulation, overrides=overrides, include_variable_bonus=include_variable_bonus, include_leaves_encashment=include_leaves_encashment)
+        is_simulation = run.run_type == "Simulation"
+        PayrollService._run_async_worker(
+            run_id,
+            is_simulation,
+            overrides=overrides,
+            include_variable_bonus=include_variable_bonus,
+            include_leaves_encashment=include_leaves_encashment,
+        )
         run.refresh_from_db()
         return run
 
@@ -1021,81 +1838,107 @@ class PayrollService:
         run = PayrollRun.objects.get(id=run_id)
         if not overrides:
             return
-            
+
         precomputed_data = PayrollService._precompute_payroll_data(run)
-        
+
         # Find next active run
         from datetime import datetime
         import calendar
-        
+
         # Calculate exact next period string
-        y, m = map(int, run.period.split('-'))
+        y, m = map(int, run.period.split("-"))
         m += 1
         if m > 12:
             m = 1
             y += 1
         next_period = f"{y}-{m:02d}"
-        
+
         # Find or create the exact next run for this entity
-        next_run = PayrollRun.objects.filter(entity=run.entity, period=next_period).first()
+        next_run = PayrollRun.objects.filter(
+            entity=run.entity, period=next_period
+        ).first()
         if not next_run:
             next_run, _ = PayrollRun.objects.get_or_create(
                 period=next_period,
                 entity=run.entity,
-                run_type='Live',
-                defaults={'status': 'Draft'}
+                run_type="Live",
+                defaults={"status": "Draft"},
             )
-            
+
         from payroll.models import RetroPayrollEntry
-        
+
         logs = []
-        logs.append(f"DEBUG file_arrears: started for run_id={run_id} overrides count: {len(overrides)}")
+        logs.append(
+            f"DEBUG file_arrears: started for run_id={run_id} overrides count: {len(overrides)}"
+        )
         for override in overrides:
-            emp_id = override.get('id')
-            if not emp_id: continue
-            logs.append(f"DEBUG file_arrears: processing emp_id={emp_id}, override_presentDays={override.get('presentDays')}")
+            emp_id = override.get("id")
+            if not emp_id:
+                continue
+            logs.append(
+                f"DEBUG file_arrears: processing emp_id={emp_id}, override_presentDays={override.get('presentDays')}"
+            )
             try:
                 emp = Employee.objects.get(id=emp_id)
                 original_slip = Payslip.objects.filter(employee=emp, run=run).first()
                 if not original_slip:
-                    logs.append(f"DEBUG file_arrears: No original_slip found for emp_id={emp_id} run={run.id}!")
+                    logs.append(
+                        f"DEBUG file_arrears: No original_slip found for emp_id={emp_id} run={run.id}!"
+                    )
                     continue
-                
-                logs.append(f"DEBUG file_arrears: Found original_slip net={original_slip.net}")
-                
+
+                logs.append(
+                    f"DEBUG file_arrears: Found original_slip net={original_slip.net}"
+                )
+
                 # Pre-cache DAG
                 struct = emp.salary_structure
                 if struct:
                     emp._cached_dag = build_dag_and_sort(list(struct.components.all()))
                 else:
                     emp._cached_dag = []
-                    
+
                 gross, ded, net, line_items = PayrollService.process_employee_in_memory(
-                    emp, run, precomputed_data, is_simulation=True, emp_override=override
+                    emp,
+                    run,
+                    precomputed_data,
+                    is_simulation=True,
+                    emp_override=override,
                 )
-                
-                context = PayrollService._get_context_for_employee(emp, precomputed_data, emp_override=override)
-                logs.append(f"DEBUG file_arrears: context present_days={context.get('present_days')}, total_days={context.get('total_days')}")
-                
+
+                context = PayrollService._get_context_for_employee(
+                    emp, precomputed_data, emp_override=override
+                )
+                logs.append(
+                    f"DEBUG file_arrears: context present_days={context.get('present_days')}, total_days={context.get('total_days')}"
+                )
+
                 diff_amount = net - original_slip.net
-                logs.append(f"DEBUG file_arrears: Calculated new net={net}, diff_amount={diff_amount}")
-                
+                logs.append(
+                    f"DEBUG file_arrears: Calculated new net={net}, diff_amount={diff_amount}"
+                )
+
                 if diff_amount != 0:
                     RetroPayrollEntry.objects.update_or_create(
                         original_payslip=original_slip,
                         target_run=next_run,
                         defaults={
-                            'diff_amount': diff_amount,
-                            'approved_for_merge': True
-                        }
+                            "diff_amount": diff_amount,
+                            "approved_for_merge": True,
+                        },
                     )
-                    logs.append(f"DEBUG file_arrears: Created RetroPayrollEntry for diff={diff_amount}")
+                    logs.append(
+                        f"DEBUG file_arrears: Created RetroPayrollEntry for diff={diff_amount}"
+                    )
                 else:
                     logs.append(f"DEBUG file_arrears: Diff is 0, no entry created.")
             except Exception as e:
                 import traceback
-                logs.append(f"DEBUG file_arrears: Failed to process arrears for {emp_id}: {e}")
+
+                logs.append(
+                    f"DEBUG file_arrears: Failed to process arrears for {emp_id}: {e}"
+                )
                 traceback.print_exc()
                 pass
-                
+
         return logs

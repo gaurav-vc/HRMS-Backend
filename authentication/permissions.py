@@ -10,7 +10,7 @@ def coerce_permission_bool(val):
     if val is True or val == 1:
         return True
     if isinstance(val, str):
-        return val.strip().lower() in ('true', '1', 'yes', 't')
+        return val.strip().lower() in ("true", "1", "yes", "t")
     return False
 
 
@@ -22,7 +22,15 @@ def _has_view_perm(val):
     if val is True or val == 1:
         return True
     if isinstance(val, str):
-        return val.strip().lower() in ('true', '1', 'yes', 't', 'self', 'selected_entities', 'all')
+        return val.strip().lower() in (
+            "true",
+            "1",
+            "yes",
+            "t",
+            "self",
+            "selected_entities",
+            "all",
+        )
     return False
 
 
@@ -31,7 +39,7 @@ def check_user_permission(user, permission_name):
     Dynamically checks whether `user` holds a specific permission toggle
     (e.g., 'can_run_payroll', 'can_view_confidential_payroll', 'can_approve_payroll',
            'can_release_salary', 'can_add_ctc').
-    
+
     Order of precedence:
       1. Django Superuser -> Always True
       2. Super Admin role -> True
@@ -40,9 +48,12 @@ def check_user_permission(user, permission_name):
     if not user or not user.is_authenticated:
         return False
     # Precedence 1 & 2: Superuser and Super Admin have universal operational permissions
-    if user.is_superuser or (getattr(user, 'employee_profile', None) and user.employee_profile.role == 'super_admin'):
+    if user.is_superuser or (
+        getattr(user, "employee_profile", None)
+        and user.employee_profile.role == "super_admin"
+    ):
         return True
-    emp = getattr(user, 'employee_profile', None)
+    emp = getattr(user, "employee_profile", None)
     if not emp:
         return False
     if emp.dynamic_role and emp.dynamic_role.permissions:
@@ -51,7 +62,79 @@ def check_user_permission(user, permission_name):
     return False
 
 
-def check_module_permission(user, module_name, action='view'):
+def is_ceo_user(user):
+    """
+    Returns True ONLY if the user is the CEO or a platform superuser.
+    Non-CEO roles (including site_admin, org_admin, manager, hr) return False.
+    Strictly prevents salary and confidential payroll leakage.
+    """
+    if not user or not user.is_authenticated:
+        return False
+    # Platform superusers retain technical audit access
+    if user.is_superuser:
+        return True
+
+    emp = getattr(user, "employee_profile", None)
+    if not emp:
+        # Check by email or username in Employee table if profile link was unattached
+        from employees.models import Employee
+
+        if user.email:
+            emp = Employee.objects.filter(email__iexact=user.email).first()
+        if not emp and user.username:
+            emp = Employee.objects.filter(code__iexact=user.username).first()
+
+    if not emp:
+        return False
+
+    if emp.role == "super_admin":
+        return True
+
+    # 1. Direct Employee Code Check
+    if emp.code == "CEO001":
+        return True
+
+    # 2. Dynamic Role Name Check
+    if emp.dynamic_role and "ceo" in str(emp.dynamic_role.name).lower():
+        return True
+
+    # 3. Department Check
+    if emp.department and str(emp.department.name).strip().upper() == "CEO":
+        return True
+
+    # 4. Designation Title Check
+    if emp.designation and "ceo" in str(emp.designation.title).lower():
+        return True
+
+    # 5. Explicit Dynamic Role Permission (Strictly confidential view permission only)
+    # Notice: can_run_payroll, can_approve_payroll, is_admin DO NOT grant confidential view!
+    if emp.dynamic_role and emp.dynamic_role.permissions:
+        perms = emp.dynamic_role.permissions
+        if coerce_permission_bool(
+            perms.get("can_view_confidential_payroll")
+        ) or coerce_permission_bool(perms.get("can_view_confidential")):
+            return True
+
+    return False
+
+
+def can_view_salary(user, target_employee=None):
+    """
+    Returns True if user is authorized to view salary details.
+    - CEO or superuser -> Can view ANY employee's salary.
+    - Regular employee -> Can ONLY view their OWN salary (if target_employee matches).
+    - Other roles -> False (sees 'xxxx' / masked).
+    """
+    if is_ceo_user(user):
+        return True
+    if target_employee and getattr(target_employee, "user_id", None) == getattr(
+        user, "id", None
+    ):
+        return True
+    return False
+
+
+def check_module_permission(user, module_name, action="view"):
     """
     Dynamically checks whether `user` has 'view', 'create', 'update', or 'delete'
     for a given module (e.g., 'Entities', 'Sites', 'Employees', 'Salary Structure', etc.).
@@ -59,16 +142,19 @@ def check_module_permission(user, module_name, action='view'):
     if not user or not user.is_authenticated:
         return False
     # Superuser and Super Admin have access to all modules
-    if user.is_superuser or (getattr(user, 'employee_profile', None) and user.employee_profile.role == 'super_admin'):
+    if user.is_superuser or (
+        getattr(user, "employee_profile", None)
+        and user.employee_profile.role == "super_admin"
+    ):
         return True
 
-    emp = getattr(user, 'employee_profile', None)
+    emp = getattr(user, "employee_profile", None)
 
     # Check site modules if user is site contact
     site = _get_tenant_site(user)
     if site and site.modules:
         for mod in site.modules:
-            mod_name = mod if isinstance(mod, str) else mod.get('name', '')
+            mod_name = mod if isinstance(mod, str) else mod.get("name", "")
             if mod_name == module_name:
                 return True
 
@@ -77,7 +163,7 @@ def check_module_permission(user, module_name, action='view'):
         mod_perm = perms.get(module_name)
         if isinstance(mod_perm, dict):
             val = mod_perm.get(action)
-            if action == 'view':
+            if action == "view":
                 return _has_view_perm(val)
             return _is_truthy(val)
 
@@ -102,12 +188,16 @@ def user_can_approve(user, module=None):
     """
     if not user or not user.is_authenticated:
         return False
-    if user.is_superuser or (getattr(user, 'employee_profile', None) and user.employee_profile.role == 'super_admin'):
+    if user.is_superuser or (
+        getattr(user, "employee_profile", None)
+        and user.employee_profile.role == "super_admin"
+    ):
         return True
-        
-    emp = getattr(user, 'employee_profile', None)
+
+    emp = getattr(user, "employee_profile", None)
     if not emp and user.email:
         from employees.models import Employee
+
         emp = Employee.objects.filter(email__iexact=user.email).first()
 
     if not emp or not emp.dynamic_role:
@@ -117,36 +207,49 @@ def user_can_approve(user, module=None):
     perms = role.permissions or {}
 
     # 1. Module-specific approval workflow checks
-    if module in ['Payroll', 'Run Payroll', 'Payroll Overview']:
+    if module in ["Payroll", "Run Payroll", "Payroll Overview"]:
         # Strictly require payroll approval capability
-        if _is_truthy(perms.get('can_approve_payroll')) or _is_truthy(perms.get('can_approve')):
+        if _is_truthy(perms.get("can_approve_payroll")) or _is_truthy(
+            perms.get("can_approve")
+        ):
             return True
-        p_perm = perms.get('Run Payroll') or perms.get('Payroll')
-        if isinstance(p_perm, dict) and (_is_truthy(p_perm.get('approve')) or _is_truthy(p_perm.get('update'))):
+        p_perm = perms.get("Run Payroll") or perms.get("Payroll")
+        if isinstance(p_perm, dict) and (
+            _is_truthy(p_perm.get("approve")) or _is_truthy(p_perm.get("update"))
+        ):
             return True
         return False
 
-    if module in ['Leave Requests', 'Leaves', 'Leave Balances']:
+    if module in ["Leave Requests", "Leaves", "Leave Balances"]:
         # Strictly require leave approval capability
-        if _is_truthy(perms.get('can_approve_leaves')) or _is_truthy(perms.get('can_approve')):
+        if _is_truthy(perms.get("can_approve_leaves")) or _is_truthy(
+            perms.get("can_approve")
+        ):
             return True
-        l_perm = perms.get('Leave Requests') or perms.get('Leaves')
-        if isinstance(l_perm, dict) and (_is_truthy(l_perm.get('approve')) or _is_truthy(l_perm.get('update'))):
+        l_perm = perms.get("Leave Requests") or perms.get("Leaves")
+        if isinstance(l_perm, dict) and (
+            _is_truthy(l_perm.get("approve")) or _is_truthy(l_perm.get("update"))
+        ):
             return True
         return False
 
     # 2. General module permissions if specified
     if module and module in perms:
         m_perm = perms.get(module)
-        if isinstance(m_perm, dict) and (_is_truthy(m_perm.get('approve')) or _is_truthy(m_perm.get('update'))):
+        if isinstance(m_perm, dict) and (
+            _is_truthy(m_perm.get("approve")) or _is_truthy(m_perm.get("update"))
+        ):
             return True
         return False
 
     # 3. Generic fallback when no module is specified
-    if getattr(role, 'can_approve', False):
+    if getattr(role, "can_approve", False):
         return True
 
-    return any(_is_truthy(perms.get(k)) for k in ['can_approve', 'can_approve_payroll', 'can_approve_leaves'])
+    return any(
+        _is_truthy(perms.get(k))
+        for k in ["can_approve", "can_approve_payroll", "can_approve_leaves"]
+    )
 
 
 class BaseRolePermission(permissions.BasePermission):
@@ -159,16 +262,19 @@ class BaseRolePermission(permissions.BasePermission):
         # Superuser and Super Admin have universal access
         if request.user.is_superuser:
             return True
-        if getattr(request.user, 'employee_profile', None) and request.user.employee_profile.role == 'super_admin':
+        if (
+            getattr(request.user, "employee_profile", None)
+            and request.user.employee_profile.role == "super_admin"
+        ):
             return True
 
         # Explicit action-level dynamic approval check
-        action_name = getattr(view, 'action', None)
-        rbac_module = getattr(view, 'rbac_module', None)
-        if action_name in ['approve', 'reject', 'approve_override']:
+        action_name = getattr(view, "action", None)
+        rbac_module = getattr(view, "rbac_module", None)
+        if action_name in ["approve", "reject", "approve_override"]:
             return user_can_approve(request.user, module=rbac_module)
 
-        employee = getattr(request.user, 'employee_profile', None)
+        employee = getattr(request.user, "employee_profile", None)
 
         site = _get_tenant_site(request.user)
 
@@ -176,44 +282,58 @@ class BaseRolePermission(permissions.BasePermission):
         if rbac_module and site and site.modules is not None:
             allowed_mods = set()
             for m in site.modules:
-                allowed_mods.add(m if isinstance(m, str) else m.get('name', ''))
-            if 'Sub Sites' in allowed_mods:
-                allowed_mods.add('Sites')
-            if 'Sites' in allowed_mods:
-                allowed_mods.add('Sub Sites')
+                allowed_mods.add(m if isinstance(m, str) else m.get("name", ""))
+            if "Sub Sites" in allowed_mods:
+                allowed_mods.add("Sites")
+            if "Sites" in allowed_mods:
+                allowed_mods.add("Sub Sites")
 
             if rbac_module not in allowed_mods:
                 return False
 
         from organisation.models import Site
+
         admin_sites = Site.objects.filter(contact_email=request.user.email)
         if admin_sites.exists():
-            if 'site_admin' in self.allowed_roles:
+            if "site_admin" in self.allowed_roles:
                 return True
             # For Site Admins accessing HR features like Payroll, grant access if module is enabled
             rbac_aliases = [rbac_module] if rbac_module else []
-            if rbac_module == 'Sites':
-                rbac_aliases.append('Sub Sites')
-            elif rbac_module == 'Sub Sites':
-                rbac_aliases.append('Sites')
+            if rbac_module == "Sites":
+                rbac_aliases.append("Sub Sites")
+            elif rbac_module == "Sub Sites":
+                rbac_aliases.append("Sites")
 
             for s in admin_sites:
                 if s.modules:
-                    if rbac_aliases and any((m if isinstance(m, str) else m.get('name', '')) in rbac_aliases for m in s.modules):
+                    if rbac_aliases and any(
+                        (m if isinstance(m, str) else m.get("name", "")) in rbac_aliases
+                        for m in s.modules
+                    ):
                         return True
-                    if any((m if isinstance(m, str) else m.get('name', '')) in ['Payroll', 'Payroll Overview', 'Run Payroll', 'Salary Structure', 'Import CTC'] for m in s.modules):
+                    if any(
+                        (m if isinstance(m, str) else m.get("name", ""))
+                        in [
+                            "Payroll",
+                            "Payroll Overview",
+                            "Run Payroll",
+                            "Salary Structure",
+                            "Import CTC",
+                        ]
+                        for m in s.modules
+                    ):
                         return True
-            if 'site_admin' not in self.allowed_roles:
+            if "site_admin" not in self.allowed_roles:
                 pass  # fall through to employee check
 
         if not employee:
             return False
 
-        if employee.role == 'super_admin':
+        if employee.role == "super_admin":
             return True
 
-        if employee.role in ('admin', 'org_admin'):
-            if self.allowed_roles != ['super_admin']:
+        if employee.role in ("admin", "org_admin"):
+            if self.allowed_roles != ["super_admin"]:
                 return True
 
         if employee.dynamic_role and employee.dynamic_role.permissions:
@@ -223,70 +343,94 @@ class BaseRolePermission(permissions.BasePermission):
             mod_perm = None
             if rbac_module and rbac_module in perms:
                 mod_perm = perms.get(rbac_module)
-            elif rbac_module == 'Sites' and 'Sub Sites' in perms:
-                mod_perm = perms.get('Sub Sites')
-            elif rbac_module == 'Sub Sites' and 'Sites' in perms:
-                mod_perm = perms.get('Sites')
+            elif rbac_module == "Sites" and "Sub Sites" in perms:
+                mod_perm = perms.get("Sub Sites")
+            elif rbac_module == "Sub Sites" and "Sites" in perms:
+                mod_perm = perms.get("Sites")
 
             if mod_perm and isinstance(mod_perm, dict):
                 method = request.method
-                if method in ['GET', 'HEAD', 'OPTIONS']:
-                    if _has_view_perm(mod_perm.get('view')):
+                if method in ["GET", "HEAD", "OPTIONS"]:
+                    if _has_view_perm(mod_perm.get("view")):
                         return True
-                elif method == 'POST':
-                    if _is_truthy(mod_perm.get('create')):
+                elif method == "POST":
+                    if _is_truthy(mod_perm.get("create")):
                         return True
-                elif method in ['PUT', 'PATCH']:
-                    if _is_truthy(mod_perm.get('update')):
+                elif method in ["PUT", "PATCH"]:
+                    if _is_truthy(mod_perm.get("update")):
                         return True
-                elif method == 'DELETE':
-                    if _is_truthy(mod_perm.get('delete')):
+                elif method == "DELETE":
+                    if _is_truthy(mod_perm.get("delete")):
                         return True
 
             # 2. Special Workflow Permissions for Payroll and HR views
-            payroll_modules = ['Run Payroll', 'Payroll Overview', 'Salary Structure', 'Import CTC', 'Salary Slips', 'Compliance']
-            if rbac_module in payroll_modules or 'hr' in self.allowed_roles:
-                if any(_is_truthy(perms.get(k)) for k in ['can_run_payroll', 'can_view_confidential_payroll', 'can_approve_payroll', 'can_approve']):
+            payroll_modules = [
+                "Run Payroll",
+                "Payroll Overview",
+                "Salary Structure",
+                "Import CTC",
+                "Salary Slips",
+                "Compliance",
+            ]
+            if rbac_module in payroll_modules or "hr" in self.allowed_roles:
+                if any(
+                    _is_truthy(perms.get(k))
+                    for k in [
+                        "can_run_payroll",
+                        "can_view_confidential_payroll",
+                        "can_approve_payroll",
+                        "can_approve",
+                    ]
+                ):
                     return True
 
             # 3. Dynamic approval privilege for customized roles
-            if getattr(employee.dynamic_role, 'can_approve', False) or any(_is_truthy(perms.get(k)) for k in ['can_approve', 'can_approve_payroll', 'can_approve_leaves']):
-                if any(r in self.allowed_roles for r in ['manager', 'hr', 'site_admin']):
+            if getattr(employee.dynamic_role, "can_approve", False) or any(
+                _is_truthy(perms.get(k))
+                for k in ["can_approve", "can_approve_payroll", "can_approve_leaves"]
+            ):
+                if any(
+                    r in self.allowed_roles for r in ["manager", "hr", "site_admin"]
+                ):
                     return True
 
-            if 'site_admin' in self.allowed_roles and employee.dynamic_role.access_scope in ['Site', 'Location']:
+            if (
+                "site_admin" in self.allowed_roles
+                and employee.dynamic_role.access_scope in ["Site", "Location"]
+            ):
                 return True
 
         return employee.role in self.allowed_roles
 
 
 class IsSuperAdmin(BaseRolePermission):
-    allowed_roles = ['super_admin']
+    allowed_roles = ["super_admin"]
 
 
 class IsOrgAdmin(BaseRolePermission):
-    allowed_roles = ['org_admin']
+    allowed_roles = ["org_admin"]
 
 
 class IsSiteAdmin(BaseRolePermission):
-    allowed_roles = ['org_admin', 'site_admin']
+    allowed_roles = ["org_admin", "site_admin"]
 
 
 class IsHR(BaseRolePermission):
-    allowed_roles = ['org_admin', 'hr']
+    allowed_roles = ["org_admin", "hr"]
 
 
 class IsManager(BaseRolePermission):
-    allowed_roles = ['org_admin', 'hr', 'manager']
+    allowed_roles = ["org_admin", "hr", "manager"]
 
 
 class IsEmployee(BaseRolePermission):
-    allowed_roles = ['org_admin', 'site_admin', 'hr', 'manager', 'employee']
+    allowed_roles = ["org_admin", "site_admin", "hr", "manager", "employee"]
 
 
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
+
 
 def _get_tenant_site(user):
     """
@@ -297,24 +441,27 @@ def _get_tenant_site(user):
     if not user or not user.is_authenticated:
         return None
 
-    if hasattr(user, '_cached_tenant_site'):
+    if hasattr(user, "_cached_tenant_site"):
         return user._cached_tenant_site
 
     from organisation.models import Site
 
-    user_email = (user.email or '').strip().lower()
+    user_email = (user.email or "").strip().lower()
 
     # 1. Direct contact email match for Main Site (Super Admin Site, case-insensitive)
     if user_email:
-        main_site = Site.objects.filter(contact_email__iexact=user_email, is_sub_site=False).first()
+        main_site = Site.objects.filter(
+            contact_email__iexact=user_email, is_sub_site=False
+        ).first()
         if main_site:
             user._cached_tenant_site = main_site
             return main_site
 
     # 2. Match via employee profile
-    employee = getattr(user, 'employee_profile', None)
+    employee = getattr(user, "employee_profile", None)
     if not employee and user_email:
         from employees.models import Employee
+
         employee = Employee.objects.filter(email__iexact=user_email).first()
         if employee:
             user.employee_profile = employee
@@ -328,14 +475,20 @@ def _get_tenant_site(user):
             elif employee.site.parent_site:
                 res = employee.site.parent_site
             else:
-                enrolled_main = employee.enrolled_sites.filter(is_sub_site=False).first()
+                enrolled_main = employee.enrolled_sites.filter(
+                    is_sub_site=False
+                ).first()
                 if enrolled_main:
                     res = enrolled_main
                 elif employee.site.branch:
-                    branch_main = Site.objects.filter(branch=employee.site.branch, is_sub_site=False).first()
+                    branch_main = Site.objects.filter(
+                        branch=employee.site.branch, is_sub_site=False
+                    ).first()
                     res = branch_main if branch_main else employee.site
                 elif employee.site.organization:
-                    org_main = Site.objects.filter(organization=employee.site.organization, is_sub_site=False).first()
+                    org_main = Site.objects.filter(
+                        organization=employee.site.organization, is_sub_site=False
+                    ).first()
                     res = org_main if org_main else employee.site
             user._cached_tenant_site = res
             return res
@@ -348,35 +501,57 @@ def _get_tenant_site(user):
 
         # Fallback if employee has no direct site: resolve from branch or entity or organization
         if employee.branch_id:
-            branch_main = Site.objects.filter(branch_id=employee.branch_id, is_sub_site=False).first()
+            branch_main = Site.objects.filter(
+                branch_id=employee.branch_id, is_sub_site=False
+            ).first()
             if branch_main:
                 user._cached_tenant_site = branch_main
                 return branch_main
             branch_site = Site.objects.filter(branch_id=employee.branch_id).first()
             if branch_site:
-                res = branch_site.parent_site if (branch_site.is_sub_site and branch_site.parent_site) else branch_site
+                res = (
+                    branch_site.parent_site
+                    if (branch_site.is_sub_site and branch_site.parent_site)
+                    else branch_site
+                )
                 user._cached_tenant_site = res
                 return res
 
         if employee.entity_id:
-            entity_site = Site.objects.filter(branch__entity_id=employee.entity_id, is_sub_site=False).first()
+            entity_site = Site.objects.filter(
+                branch__entity_id=employee.entity_id, is_sub_site=False
+            ).first()
             if entity_site:
                 user._cached_tenant_site = entity_site
                 return entity_site
-            entity_site_any = Site.objects.filter(branch__entity_id=employee.entity_id).first()
+            entity_site_any = Site.objects.filter(
+                branch__entity_id=employee.entity_id
+            ).first()
             if entity_site_any:
-                res = entity_site_any.parent_site if (entity_site_any.is_sub_site and entity_site_any.parent_site) else entity_site_any
+                res = (
+                    entity_site_any.parent_site
+                    if (entity_site_any.is_sub_site and entity_site_any.parent_site)
+                    else entity_site_any
+                )
                 user._cached_tenant_site = res
                 return res
 
         if employee.organization_id:
-            org_main = Site.objects.filter(organization_id=employee.organization_id, is_sub_site=False).first()
+            org_main = Site.objects.filter(
+                organization_id=employee.organization_id, is_sub_site=False
+            ).first()
             if org_main:
                 user._cached_tenant_site = org_main
                 return org_main
-            org_any = Site.objects.filter(organization_id=employee.organization_id).first()
+            org_any = Site.objects.filter(
+                organization_id=employee.organization_id
+            ).first()
             if org_any:
-                res = org_any.parent_site if (org_any.is_sub_site and org_any.parent_site) else org_any
+                res = (
+                    org_any.parent_site
+                    if (org_any.is_sub_site and org_any.parent_site)
+                    else org_any
+                )
                 user._cached_tenant_site = res
                 return res
 
@@ -384,7 +559,11 @@ def _get_tenant_site(user):
     if user_email:
         contact_site = Site.objects.filter(contact_email__iexact=user_email).first()
         if contact_site:
-            res = contact_site.parent_site if (contact_site.is_sub_site and contact_site.parent_site) else contact_site
+            res = (
+                contact_site.parent_site
+                if (contact_site.is_sub_site and contact_site.parent_site)
+                else contact_site
+            )
             user._cached_tenant_site = res
             return res
 
@@ -402,14 +581,14 @@ def _get_tenant_scope(user):
     if not user or not user.is_authenticated:
         return set(), set(), set(), None
 
-    if hasattr(user, '_cached_tenant_scope'):
+    if hasattr(user, "_cached_tenant_scope"):
         return user._cached_tenant_scope
 
     from organisation.models import Site, Branch, Entity
     from django.db.models import Q
 
     tenant_site = _get_tenant_site(user)
-    employee = getattr(user, 'employee_profile', None)
+    employee = getattr(user, "employee_profile", None)
 
     all_site_ids = set()
     entity_ids = set()
@@ -419,17 +598,29 @@ def _get_tenant_scope(user):
         all_site_ids.add(tenant_site.id)
 
         # Include all sub-sites belonging strictly to this main site:
-        parent_sub_sites = Site.objects.filter(parent_site_id=tenant_site.id, is_sub_site=True).values_list('id', flat=True)
+        parent_sub_sites = Site.objects.filter(
+            parent_site_id=tenant_site.id, is_sub_site=True
+        ).values_list("id", flat=True)
         all_site_ids.update(parent_sub_sites)
 
         legacy_subs = Site.objects.filter(parent_site__isnull=True, is_sub_site=True)
         if tenant_site.branch_id:
-            all_site_ids.update(legacy_subs.filter(branch_id=tenant_site.branch_id).values_list('id', flat=True))
+            all_site_ids.update(
+                legacy_subs.filter(branch_id=tenant_site.branch_id).values_list(
+                    "id", flat=True
+                )
+            )
         if tenant_site.contact_email:
-            all_site_ids.update(legacy_subs.filter(contact_email__iexact=tenant_site.contact_email.strip()).values_list('id', flat=True))
+            all_site_ids.update(
+                legacy_subs.filter(
+                    contact_email__iexact=tenant_site.contact_email.strip()
+                ).values_list("id", flat=True)
+            )
 
         if tenant_site.organization_id:
-            org_entities = Entity.objects.filter(organization_id=tenant_site.organization_id).values_list('id', flat=True)
+            org_entities = Entity.objects.filter(
+                organization_id=tenant_site.organization_id
+            ).values_list("id", flat=True)
             entity_ids.update(org_entities)
         if tenant_site.branch and tenant_site.branch.entity_id:
             entity_ids.add(tenant_site.branch.entity_id)
@@ -439,9 +630,11 @@ def _get_tenant_scope(user):
     # Enrich from employee profile attributes (crucial when tenant_site is None or employee belongs to multiple entities/sites)
     if employee:
         if employee.enrolled_sites.exists():
-            enrolled_ids = employee.enrolled_sites.values_list('id', flat=True)
+            enrolled_ids = employee.enrolled_sites.values_list("id", flat=True)
             all_site_ids.update(enrolled_ids)
-            enrolled_parent_ids = employee.enrolled_sites.filter(parent_site__isnull=False).values_list('parent_site_id', flat=True)
+            enrolled_parent_ids = employee.enrolled_sites.filter(
+                parent_site__isnull=False
+            ).values_list("parent_site_id", flat=True)
             all_site_ids.update(enrolled_parent_ids)
 
         if employee.site_id:
@@ -456,26 +649,37 @@ def _get_tenant_scope(user):
                 entity_ids.add(employee.branch.entity_id)
 
         if employee.organization_id:
-            org_entities = Entity.objects.filter(organization_id=employee.organization_id).values_list('id', flat=True)
+            org_entities = Entity.objects.filter(
+                organization_id=employee.organization_id
+            ).values_list("id", flat=True)
             entity_ids.update(org_entities)
 
     # Derive branches from resolved entities
     if entity_ids:
-        ent_branches = Branch.objects.filter(entity_id__in=entity_ids).values_list('id', flat=True)
+        ent_branches = Branch.objects.filter(entity_id__in=entity_ids).values_list(
+            "id", flat=True
+        )
         branch_ids.update(ent_branches)
 
     # Derive site IDs from resolved branches/entities if site IDs are empty
     if not all_site_ids:
         if branch_ids:
-            b_sites = Site.objects.filter(branch_id__in=branch_ids).values_list('id', flat=True)
+            b_sites = Site.objects.filter(branch_id__in=branch_ids).values_list(
+                "id", flat=True
+            )
             all_site_ids.update(b_sites)
         elif entity_ids:
-            e_sites = Site.objects.filter(branch__entity_id__in=entity_ids).values_list('id', flat=True)
+            e_sites = Site.objects.filter(branch__entity_id__in=entity_ids).values_list(
+                "id", flat=True
+            )
             all_site_ids.update(e_sites)
 
     # If tenant_site was None but sites were discovered, determine canonical tenant_site
     if not tenant_site and all_site_ids:
-        tenant_site = Site.objects.filter(id__in=all_site_ids, is_sub_site=False).first() or Site.objects.filter(id__in=all_site_ids).first()
+        tenant_site = (
+            Site.objects.filter(id__in=all_site_ids, is_sub_site=False).first()
+            or Site.objects.filter(id__in=all_site_ids).first()
+        )
 
     scope_res = (all_site_ids, branch_ids, entity_ids, tenant_site)
     user._cached_tenant_scope = scope_res
@@ -487,6 +691,7 @@ def _get_admin_sites(user):
     Return a queryset of Sites that `user` administers, strictly bounded to their tenant.
     """
     from organisation.models import Site
+
     all_site_ids, _, _, _ = _get_tenant_scope(user)
     if all_site_ids:
         return Site.objects.filter(id__in=all_site_ids)
@@ -496,6 +701,7 @@ def _get_admin_sites(user):
 # ---------------------------------------------------------------------------
 # Core isolation function
 # ---------------------------------------------------------------------------
+
 
 def get_reporting_persons(employee):
     """
@@ -513,15 +719,19 @@ def get_reporting_persons(employee):
     from django.db.models import Q
 
     # 1. Direct manager
-    if getattr(employee, 'manager', None) and employee.manager.status == 'Active':
+    if getattr(employee, "manager", None) and employee.manager.status == "Active":
         reporters.append(employee.manager)
 
     # 2. Role-based reporting person from Settings (employee.dynamic_role.reporting_to)
-    if getattr(employee, 'dynamic_role', None) and employee.dynamic_role.reporting_to:
+    if getattr(employee, "dynamic_role", None) and employee.dynamic_role.reporting_to:
         target_role = employee.dynamic_role.reporting_to
-        qs = Employee.objects.filter(dynamic_role=target_role, status='Active')
+        qs = Employee.objects.filter(dynamic_role=target_role, status="Active")
         if employee.site_id:
-            site_candidates = list(qs.filter(Q(site_id=employee.site_id) | Q(enrolled_sites__id=employee.site_id)).distinct())
+            site_candidates = list(
+                qs.filter(
+                    Q(site_id=employee.site_id) | Q(enrolled_sites__id=employee.site_id)
+                ).distinct()
+            )
             if site_candidates:
                 reporters.extend(site_candidates)
             elif employee.entity_id:
@@ -561,216 +771,337 @@ def isolate_queryset(qs, user):
 
     # Superuser and Super Admin can view all data for platform oversight and audit
     is_super = bool(
-        user.is_superuser or 
-        (hasattr(user, 'employee_profile') and user.employee_profile and user.employee_profile.role == 'super_admin') or
-        (hasattr(user, 'groups') and user.groups.filter(name='Super Admin').exists())
+        user.is_superuser
+        or (
+            hasattr(user, "employee_profile")
+            and user.employee_profile
+            and user.employee_profile.role == "super_admin"
+        )
+        or (hasattr(user, "groups") and user.groups.filter(name="Super Admin").exists())
     )
     if is_super:
         return qs
 
-    employee = getattr(user, 'employee_profile', None)
+    employee = getattr(user, "employee_profile", None)
 
     # Resolve strict tenant scope for user dynamically (multi-tenant outer envelope)
-    all_tenant_site_ids, tenant_branch_ids, tenant_entity_ids, tenant_site = _get_tenant_scope(user)
+    all_tenant_site_ids, tenant_branch_ids, tenant_entity_ids, tenant_site = (
+        _get_tenant_scope(user)
+    )
 
     from django.db.models import Q
 
     if not employee:
         # User without employee profile (e.g. initial contact user)
         if all_tenant_site_ids:
-            if qs.model.__name__ == 'Site':
+            if qs.model.__name__ == "Site":
                 return qs.filter(id__in=all_tenant_site_ids)
-            if hasattr(qs.model, 'site'):
+            if hasattr(qs.model, "site"):
                 return qs.filter(site_id__in=all_tenant_site_ids)
         return qs.none()
 
     # ── DETERMINE USER ROLE AND ACCESS SCOPE ───────────────────────────────────
     role = employee.role
-    dynamic_role = getattr(employee, 'dynamic_role', None)
+    dynamic_role = getattr(employee, "dynamic_role", None)
 
     # By default, employee access scope is strictly 'Self'
-    access_scope = 'Self'
+    access_scope = "Self"
     custom_allowed_entities = []
 
     # Dynamic detection: Site Admin, Org Admin, and Admins ALWAYS have Corporate scope within their tenant boundary
     is_site_admin = bool(
-        role in ('site_admin', 'admin', 'org_admin') or
-        (tenant_site and tenant_site.contact_email and user.email and tenant_site.contact_email.strip().lower() == user.email.strip().lower()) or
-        (dynamic_role and getattr(dynamic_role, 'code', None) in ('SITE_ADMIN', 'ORG_ADMIN'))
+        role in ("site_admin", "admin", "org_admin")
+        or (
+            tenant_site
+            and tenant_site.contact_email
+            and user.email
+            and tenant_site.contact_email.strip().lower() == user.email.strip().lower()
+        )
+        or (
+            dynamic_role
+            and getattr(dynamic_role, "code", None) in ("SITE_ADMIN", "ORG_ADMIN")
+        )
     )
 
     if is_site_admin:
-        access_scope = 'Corporate'
+        access_scope = "Corporate"
     elif dynamic_role:
-        raw_scope = dynamic_role.access_scope or 'Self'
-        if raw_scope in ['Corporate', 'Region']:
-            access_scope = 'Corporate'
-        elif raw_scope in ['Location', 'Site']:
-            access_scope = 'Location'
-        elif raw_scope == 'Custom':
-            access_scope = 'Custom'
+        raw_scope = dynamic_role.access_scope or "Self"
+        if raw_scope in ["Corporate", "Region"]:
+            access_scope = "Corporate"
+        elif raw_scope in ["Location", "Site"]:
+            access_scope = "Location"
+        elif raw_scope == "Custom":
+            access_scope = "Custom"
             if dynamic_role.permissions and isinstance(dynamic_role.permissions, dict):
-                custom_allowed_entities = dynamic_role.permissions.get('allowed_entities', [])
+                custom_allowed_entities = dynamic_role.permissions.get(
+                    "allowed_entities", []
+                )
         elif dynamic_role.cross_department_access:
-            access_scope = 'Corporate'
+            access_scope = "Corporate"
         else:
-            access_scope = 'Self'
+            access_scope = "Self"
     else:
         # Standard legacy roles
-        if role in ('admin', 'org_admin'):
-            access_scope = 'Corporate'
-        elif role == 'hr':
-            access_scope = 'Location'
-        elif role == 'manager':
-            access_scope = 'Manager'
+        if role in ("admin", "org_admin"):
+            access_scope = "Corporate"
+        elif role == "hr":
+            access_scope = "Location"
+        elif role == "manager":
+            access_scope = "Manager"
         else:
-            access_scope = 'Self'
+            access_scope = "Self"
 
     # ── CASE 1: SELF DATA ONLY ('Self') ──────────────────────────────────────
-    if access_scope == 'Self':
+    if access_scope == "Self":
         # Employees: Strictly only themselves
-        if qs.model.__name__ == 'Employee':
+        if qs.model.__name__ == "Employee":
             return qs.filter(id=employee.id)
 
         # Direct employee relation: Strictly only their own records
-        if hasattr(qs.model, 'employee') and qs.model.__name__ != 'AttendancePolicy':
+        if hasattr(qs.model, "employee") and qs.model.__name__ != "AttendancePolicy":
             return qs.filter(employee=employee)
 
         # User model
-        if qs.model.__name__ == 'User':
+        if qs.model.__name__ == "User":
             return qs.filter(id=user.id)
 
         # PayrollRun: Only runs containing their own payslips
-        if qs.model.__name__ == 'PayrollRun':
+        if qs.model.__name__ == "PayrollRun":
             return qs.filter(payslip__employee=employee).distinct()
 
         # Structural models: scoped to employee's own assigned structures
-        if qs.model.__name__ == 'Entity':
+        if qs.model.__name__ == "Entity":
             return qs.filter(id=employee.entity_id) if employee.entity_id else qs.none()
 
-        if qs.model.__name__ == 'Branch':
+        if qs.model.__name__ == "Branch":
             return qs.filter(id=employee.branch_id) if employee.branch_id else qs.none()
 
-        if qs.model.__name__ == 'Department':
-            return qs.filter(id=employee.department_id) if employee.department_id else qs.none()
+        if qs.model.__name__ == "Department":
+            return (
+                qs.filter(id=employee.department_id)
+                if employee.department_id
+                else qs.none()
+            )
 
-        if qs.model.__name__ == 'Designation':
-            return qs.filter(id=employee.designation_id) if employee.designation_id else qs.none()
+        if qs.model.__name__ == "Designation":
+            return (
+                qs.filter(id=employee.designation_id)
+                if employee.designation_id
+                else qs.none()
+            )
 
-        if qs.model.__name__ == 'Site':
-            return qs.filter(Q(id=employee.site_id) | Q(id__in=employee.enrolled_sites.all())).distinct()
+        if qs.model.__name__ == "Site":
+            return qs.filter(
+                Q(id=employee.site_id) | Q(id__in=employee.enrolled_sites.all())
+            ).distinct()
 
-        if qs.model.__name__ == 'Role':
-            return qs.filter(id=employee.dynamic_role_id) if employee.dynamic_role_id else qs.none()
+        if qs.model.__name__ == "Role":
+            return (
+                qs.filter(id=employee.dynamic_role_id)
+                if employee.dynamic_role_id
+                else qs.none()
+            )
 
-        if qs.model.__name__ == 'SalaryStructure':
+        if qs.model.__name__ == "SalaryStructure":
             if employee.salary_structure_id:
                 return qs.filter(id=employee.salary_structure_id)
             if all_tenant_site_ids:
-                return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True))
+                return qs.filter(
+                    Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)
+                )
             return qs.filter(site__isnull=True)
 
-        if qs.model.__name__ == 'ComponentRule':
+        if qs.model.__name__ == "ComponentRule":
             if employee.salary_structure_id:
                 return qs.filter(structure_id=employee.salary_structure_id)
             if all_tenant_site_ids:
-                return qs.filter(Q(structure__site_id__in=all_tenant_site_ids) | Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
-            return qs.filter(Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
+                return qs.filter(
+                    Q(structure__site_id__in=all_tenant_site_ids)
+                    | Q(structure__site__isnull=True)
+                    | Q(structure__isnull=True)
+                ).distinct()
+            return qs.filter(
+                Q(structure__site__isnull=True) | Q(structure__isnull=True)
+            ).distinct()
 
-        if qs.model.__name__ == 'AttendancePolicy':
+        if qs.model.__name__ == "AttendancePolicy":
             if all_tenant_site_ids:
-                return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization__isnull=True)).distinct()
+                return qs.filter(
+                    Q(site_id__in=all_tenant_site_ids)
+                    | Q(site__isnull=True, organization__isnull=True)
+                ).distinct()
             return qs.filter(site__isnull=True, organization__isnull=True).distinct()
 
-        if qs.model.__name__ == 'Holiday':
+        if qs.model.__name__ == "Holiday":
             if all_tenant_site_ids:
-                return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)).distinct()
+                return qs.filter(
+                    Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)
+                ).distinct()
             return qs.filter(site__isnull=True).distinct()
 
-        if qs.model.__name__ == 'Organization':
-            return qs.filter(id=employee.organization_id) if employee.organization_id else qs.none()
+        if qs.model.__name__ == "Organization":
+            return (
+                qs.filter(id=employee.organization_id)
+                if employee.organization_id
+                else qs.none()
+            )
 
-        if hasattr(qs.model, 'site'):
-            return qs.filter(site_id=employee.site_id) if employee.site_id else qs.none()
+        if hasattr(qs.model, "site"):
+            return (
+                qs.filter(site_id=employee.site_id) if employee.site_id else qs.none()
+            )
 
         return qs.none()
 
     # ── CASE 2: MANAGER (themselves + their reportees) ───────────────────────
-    if access_scope == 'Manager':
-        if qs.model.__name__ == 'Employee':
+    if access_scope == "Manager":
+        if qs.model.__name__ == "Employee":
             return qs.filter(Q(id=employee.id) | Q(manager=employee)).distinct()
 
-        if hasattr(qs.model, 'employee') and qs.model.__name__ != 'AttendancePolicy':
-            return qs.filter(Q(employee=employee) | Q(employee__manager=employee)).distinct()
+        if hasattr(qs.model, "employee") and qs.model.__name__ != "AttendancePolicy":
+            return qs.filter(
+                Q(employee=employee) | Q(employee__manager=employee)
+            ).distinct()
 
-        if qs.model.__name__ == 'PayrollRun':
-            return qs.filter(payslip__employee__in=[employee.id] + list(employee.reportees.values_list('id', flat=True))).distinct()
+        if qs.model.__name__ == "PayrollRun":
+            return qs.filter(
+                payslip__employee__in=[employee.id]
+                + list(employee.reportees.values_list("id", flat=True))
+            ).distinct()
 
         # Follow Location/tenant scoping for structural models
-        if qs.model.__name__ == 'Entity':
-            return qs.filter(id__in=tenant_entity_ids) if tenant_entity_ids else (qs.filter(id=employee.entity_id) if employee.entity_id else qs.none())
-        if qs.model.__name__ == 'Branch':
-            return qs.filter(id__in=tenant_branch_ids) if tenant_branch_ids else (qs.filter(id=employee.branch_id) if employee.branch_id else qs.none())
-        if qs.model.__name__ == 'Department':
-            return qs.filter(entity_id__in=tenant_entity_ids) if tenant_entity_ids else qs.none()
-        if qs.model.__name__ == 'Designation':
-            return qs.filter(department__entity_id__in=tenant_entity_ids) if tenant_entity_ids else qs.none()
-        if qs.model.__name__ == 'Site':
-            return qs.filter(id__in=all_tenant_site_ids) if all_tenant_site_ids else qs.none()
-        if qs.model.__name__ == 'SalaryStructure':
+        if qs.model.__name__ == "Entity":
+            return (
+                qs.filter(id__in=tenant_entity_ids)
+                if tenant_entity_ids
+                else (
+                    qs.filter(id=employee.entity_id)
+                    if employee.entity_id
+                    else qs.none()
+                )
+            )
+        if qs.model.__name__ == "Branch":
+            return (
+                qs.filter(id__in=tenant_branch_ids)
+                if tenant_branch_ids
+                else (
+                    qs.filter(id=employee.branch_id)
+                    if employee.branch_id
+                    else qs.none()
+                )
+            )
+        if qs.model.__name__ == "Department":
+            return (
+                qs.filter(entity_id__in=tenant_entity_ids)
+                if tenant_entity_ids
+                else qs.none()
+            )
+        if qs.model.__name__ == "Designation":
+            return (
+                qs.filter(department__entity_id__in=tenant_entity_ids)
+                if tenant_entity_ids
+                else qs.none()
+            )
+        if qs.model.__name__ == "Site":
+            return (
+                qs.filter(id__in=all_tenant_site_ids)
+                if all_tenant_site_ids
+                else qs.none()
+            )
+        if qs.model.__name__ == "SalaryStructure":
             return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True))
-        if qs.model.__name__ == 'ComponentRule':
+        if qs.model.__name__ == "ComponentRule":
             if all_tenant_site_ids:
-                return qs.filter(Q(structure__site_id__in=all_tenant_site_ids) | Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
-            return qs.filter(Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
-        if qs.model.__name__ == 'AttendancePolicy':
-            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization__isnull=True)).distinct()
-        if qs.model.__name__ == 'Holiday':
-            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)).distinct()
-        if qs.model.__name__ == 'Role':
-            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization_id=employee.organization_id)).distinct()
-        if qs.model.__name__ == 'Organization':
-            return qs.filter(id=employee.organization_id) if employee.organization_id else qs.none()
+                return qs.filter(
+                    Q(structure__site_id__in=all_tenant_site_ids)
+                    | Q(structure__site__isnull=True)
+                    | Q(structure__isnull=True)
+                ).distinct()
+            return qs.filter(
+                Q(structure__site__isnull=True) | Q(structure__isnull=True)
+            ).distinct()
+        if qs.model.__name__ == "AttendancePolicy":
+            return qs.filter(
+                Q(site_id__in=all_tenant_site_ids)
+                | Q(site__isnull=True, organization__isnull=True)
+            ).distinct()
+        if qs.model.__name__ == "Holiday":
+            return qs.filter(
+                Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)
+            ).distinct()
+        if qs.model.__name__ == "Role":
+            return qs.filter(
+                Q(site_id__in=all_tenant_site_ids)
+                | Q(site__isnull=True, organization_id=employee.organization_id)
+            ).distinct()
+        if qs.model.__name__ == "Organization":
+            return (
+                qs.filter(id=employee.organization_id)
+                if employee.organization_id
+                else qs.none()
+            )
         return qs.none()
 
     # ── CASE 3: CUSTOM ENTITIES ('Custom') ──────────────────────────────────
-    if access_scope == 'Custom':
-        effective_entity_ids = [eid for eid in custom_allowed_entities if not tenant_entity_ids or eid in tenant_entity_ids]
+    if access_scope == "Custom":
+        effective_entity_ids = [
+            eid
+            for eid in custom_allowed_entities
+            if not tenant_entity_ids or eid in tenant_entity_ids
+        ]
 
-        if qs.model.__name__ == 'Entity':
+        if qs.model.__name__ == "Entity":
             return qs.filter(id__in=effective_entity_ids)
 
-        if qs.model.__name__ == 'Branch':
+        if qs.model.__name__ == "Branch":
             return qs.filter(entity_id__in=effective_entity_ids)
 
-        if qs.model.__name__ == 'Department':
+        if qs.model.__name__ == "Department":
             return qs.filter(entity_id__in=effective_entity_ids)
 
-        if qs.model.__name__ == 'Designation':
+        if qs.model.__name__ == "Designation":
             return qs.filter(department__entity_id__in=effective_entity_ids)
 
-        if qs.model.__name__ == 'Employee':
+        if qs.model.__name__ == "Employee":
             eq = qs.filter(entity_id__in=effective_entity_ids)
             if all_tenant_site_ids:
-                eq = eq.filter(Q(site_id__in=all_tenant_site_ids) | Q(enrolled_sites__id__in=all_tenant_site_ids))
-            return eq.exclude(role='super_admin').distinct()
+                eq = eq.filter(
+                    Q(site_id__in=all_tenant_site_ids)
+                    | Q(enrolled_sites__id__in=all_tenant_site_ids)
+                )
+            return eq.exclude(role="super_admin").distinct()
 
-        if hasattr(qs.model, 'employee') and qs.model.__name__ != 'AttendancePolicy':
+        if hasattr(qs.model, "employee") and qs.model.__name__ != "AttendancePolicy":
             return qs.filter(employee__entity_id__in=effective_entity_ids).distinct()
 
-        if qs.model.__name__ == 'PayrollRun':
+        if qs.model.__name__ == "PayrollRun":
             return qs.filter(entity_id__in=effective_entity_ids)
 
-        if qs.model.__name__ == 'Site':
-            return qs.filter(branch__entity_id__in=effective_entity_ids, id__in=all_tenant_site_ids).distinct() if all_tenant_site_ids else qs.filter(branch__entity_id__in=effective_entity_ids)
+        if qs.model.__name__ == "Site":
+            return (
+                qs.filter(
+                    branch__entity_id__in=effective_entity_ids,
+                    id__in=all_tenant_site_ids,
+                ).distinct()
+                if all_tenant_site_ids
+                else qs.filter(branch__entity_id__in=effective_entity_ids)
+            )
 
-        if qs.model.__name__ == 'SalaryStructure':
-            return qs.filter(Q(site__branch__entity_id__in=effective_entity_ids) | Q(site__isnull=True))
+        if qs.model.__name__ == "SalaryStructure":
+            return qs.filter(
+                Q(site__branch__entity_id__in=effective_entity_ids)
+                | Q(site__isnull=True)
+            )
 
-        if qs.model.__name__ == 'ComponentRule':
-            return qs.filter(Q(structure__site__branch__entity_id__in=effective_entity_ids) | Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
+        if qs.model.__name__ == "ComponentRule":
+            return qs.filter(
+                Q(structure__site__branch__entity_id__in=effective_entity_ids)
+                | Q(structure__site__isnull=True)
+                | Q(structure__isnull=True)
+            ).distinct()
 
-        if qs.model.__name__ == 'AttendancePolicy':
+        if qs.model.__name__ == "AttendancePolicy":
             cond = Q(site__isnull=True, organization__isnull=True)
             if all_tenant_site_ids:
                 cond |= Q(site_id__in=all_tenant_site_ids)
@@ -778,66 +1109,126 @@ def isolate_queryset(qs, user):
                 cond |= Q(organization_id__in=effective_entity_ids)
             return qs.filter(cond).distinct()
 
-        if qs.model.__name__ == 'Holiday':
-            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)).distinct()
+        if qs.model.__name__ == "Holiday":
+            return qs.filter(
+                Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)
+            ).distinct()
 
-        if qs.model.__name__ == 'Role':
-            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization_id=employee.organization_id)).distinct()
+        if qs.model.__name__ == "Role":
+            return qs.filter(
+                Q(site_id__in=all_tenant_site_ids)
+                | Q(site__isnull=True, organization_id=employee.organization_id)
+            ).distinct()
 
-        if qs.model.__name__ == 'Organization':
-            return qs.filter(id=employee.organization_id) if employee.organization_id else qs.none()
+        if qs.model.__name__ == "Organization":
+            return (
+                qs.filter(id=employee.organization_id)
+                if employee.organization_id
+                else qs.none()
+            )
 
         return qs.none()
 
     # ── CASE 4: LOCATION / SITE ('Location') ─────────────────────────────────
-    if access_scope == 'Location':
-        if qs.model.__name__ == 'Site':
-            return qs.filter(id__in=all_tenant_site_ids) if all_tenant_site_ids else (qs.filter(id=employee.site_id) if employee.site_id else qs.none())
+    if access_scope == "Location":
+        if qs.model.__name__ == "Site":
+            return (
+                qs.filter(id__in=all_tenant_site_ids)
+                if all_tenant_site_ids
+                else (qs.filter(id=employee.site_id) if employee.site_id else qs.none())
+            )
 
-        if qs.model.__name__ == 'Employee':
+        if qs.model.__name__ == "Employee":
             if all_tenant_site_ids:
-                return qs.filter(
-                    Q(site_id__in=all_tenant_site_ids) | Q(enrolled_sites__id__in=all_tenant_site_ids)
-                ).exclude(role='super_admin').distinct()
+                return (
+                    qs.filter(
+                        Q(site_id__in=all_tenant_site_ids)
+                        | Q(enrolled_sites__id__in=all_tenant_site_ids)
+                    )
+                    .exclude(role="super_admin")
+                    .distinct()
+                )
             if employee.branch_id:
-                return qs.filter(branch_id=employee.branch_id).exclude(role='super_admin').distinct()
+                return (
+                    qs.filter(branch_id=employee.branch_id)
+                    .exclude(role="super_admin")
+                    .distinct()
+                )
             return qs.filter(id=employee.id)
 
-        if hasattr(qs.model, 'employee') and qs.model.__name__ != 'AttendancePolicy':
+        if hasattr(qs.model, "employee") and qs.model.__name__ != "AttendancePolicy":
             if all_tenant_site_ids:
                 return qs.filter(
-                    Q(employee__site_id__in=all_tenant_site_ids) | Q(employee__enrolled_sites__id__in=all_tenant_site_ids)
+                    Q(employee__site_id__in=all_tenant_site_ids)
+                    | Q(employee__enrolled_sites__id__in=all_tenant_site_ids)
                 ).distinct()
             if employee.branch_id:
                 return qs.filter(employee__branch_id=employee.branch_id).distinct()
             return qs.filter(employee=employee)
 
-        if qs.model.__name__ == 'Entity':
-            return qs.filter(id__in=tenant_entity_ids) if tenant_entity_ids else (qs.filter(id=employee.entity_id) if employee.entity_id else qs.none())
+        if qs.model.__name__ == "Entity":
+            return (
+                qs.filter(id__in=tenant_entity_ids)
+                if tenant_entity_ids
+                else (
+                    qs.filter(id=employee.entity_id)
+                    if employee.entity_id
+                    else qs.none()
+                )
+            )
 
-        if qs.model.__name__ == 'Branch':
-            return qs.filter(id__in=tenant_branch_ids) if tenant_branch_ids else (qs.filter(id=employee.branch_id) if employee.branch_id else qs.none())
+        if qs.model.__name__ == "Branch":
+            return (
+                qs.filter(id__in=tenant_branch_ids)
+                if tenant_branch_ids
+                else (
+                    qs.filter(id=employee.branch_id)
+                    if employee.branch_id
+                    else qs.none()
+                )
+            )
 
-        if qs.model.__name__ == 'Department':
-            return qs.filter(entity_id__in=tenant_entity_ids) if tenant_entity_ids else qs.none()
+        if qs.model.__name__ == "Department":
+            return (
+                qs.filter(entity_id__in=tenant_entity_ids)
+                if tenant_entity_ids
+                else qs.none()
+            )
 
-        if qs.model.__name__ == 'Designation':
-            return qs.filter(department__entity_id__in=tenant_entity_ids) if tenant_entity_ids else qs.none()
+        if qs.model.__name__ == "Designation":
+            return (
+                qs.filter(department__entity_id__in=tenant_entity_ids)
+                if tenant_entity_ids
+                else qs.none()
+            )
 
-        if qs.model.__name__ == 'PayrollRun':
-            return qs.filter(entity_id__in=tenant_entity_ids) if tenant_entity_ids else qs.none()
+        if qs.model.__name__ == "PayrollRun":
+            return (
+                qs.filter(entity_id__in=tenant_entity_ids)
+                if tenant_entity_ids
+                else qs.none()
+            )
 
-        if qs.model.__name__ == 'Role':
-            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization_id=employee.organization_id)).distinct()
+        if qs.model.__name__ == "Role":
+            return qs.filter(
+                Q(site_id__in=all_tenant_site_ids)
+                | Q(site__isnull=True, organization_id=employee.organization_id)
+            ).distinct()
 
-        if qs.model.__name__ == 'SalaryStructure':
+        if qs.model.__name__ == "SalaryStructure":
             return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True))
-        if qs.model.__name__ == 'ComponentRule':
+        if qs.model.__name__ == "ComponentRule":
             if all_tenant_site_ids:
-                return qs.filter(Q(structure__site_id__in=all_tenant_site_ids) | Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
-            return qs.filter(Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
+                return qs.filter(
+                    Q(structure__site_id__in=all_tenant_site_ids)
+                    | Q(structure__site__isnull=True)
+                    | Q(structure__isnull=True)
+                ).distinct()
+            return qs.filter(
+                Q(structure__site__isnull=True) | Q(structure__isnull=True)
+            ).distinct()
 
-        if qs.model.__name__ == 'AttendancePolicy':
+        if qs.model.__name__ == "AttendancePolicy":
             cond = Q(site__isnull=True, organization__isnull=True)
             if all_tenant_site_ids:
                 cond |= Q(site_id__in=all_tenant_site_ids)
@@ -845,53 +1236,71 @@ def isolate_queryset(qs, user):
                 cond |= Q(site_id=employee.site_id)
             return qs.filter(cond).distinct()
 
-        if qs.model.__name__ == 'Holiday':
-            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)).distinct()
+        if qs.model.__name__ == "Holiday":
+            return qs.filter(
+                Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)
+            ).distinct()
 
-        if qs.model.__name__ == 'Organization':
-            return qs.filter(id=employee.organization_id) if employee.organization_id else qs.none()
+        if qs.model.__name__ == "Organization":
+            return (
+                qs.filter(id=employee.organization_id)
+                if employee.organization_id
+                else qs.none()
+            )
 
         return qs.none()
 
     # ── CASE 5: ALL DATA OF THE ENTITIES ('Corporate' / Site Admin) ─────────
     # Full access within this tenant boundary
-    if qs.model.__name__ == 'Site':
-        return qs.filter(id__in=all_tenant_site_ids) if all_tenant_site_ids else qs.none()
+    if qs.model.__name__ == "Site":
+        return (
+            qs.filter(id__in=all_tenant_site_ids) if all_tenant_site_ids else qs.none()
+        )
 
-    org_id = tenant_site.organization_id if tenant_site else getattr(employee, 'organization_id', None)
+    org_id = (
+        tenant_site.organization_id
+        if tenant_site
+        else getattr(employee, "organization_id", None)
+    )
 
-    if qs.model.__name__ == 'Employee':
+    if qs.model.__name__ == "Employee":
         eq = Q()
         if all_tenant_site_ids:
-            eq |= Q(site_id__in=all_tenant_site_ids) | Q(enrolled_sites__id__in=all_tenant_site_ids)
+            eq |= Q(site_id__in=all_tenant_site_ids) | Q(
+                enrolled_sites__id__in=all_tenant_site_ids
+            )
         if tenant_entity_ids:
             eq |= Q(entity_id__in=tenant_entity_ids)
         if org_id:
             eq |= Q(organization_id=org_id) | Q(entity__organization_id=org_id)
         if eq:
-            return qs.filter(eq).exclude(role='super_admin').distinct()
+            return qs.filter(eq).exclude(role="super_admin").distinct()
         return qs.filter(id=employee.id)
 
-    if hasattr(qs.model, 'employee') and qs.model.__name__ != 'AttendancePolicy':
+    if hasattr(qs.model, "employee") and qs.model.__name__ != "AttendancePolicy":
         eq = Q()
         if all_tenant_site_ids:
-            eq |= Q(employee__site_id__in=all_tenant_site_ids) | Q(employee__enrolled_sites__id__in=all_tenant_site_ids)
+            eq |= Q(employee__site_id__in=all_tenant_site_ids) | Q(
+                employee__enrolled_sites__id__in=all_tenant_site_ids
+            )
         if tenant_entity_ids:
             eq |= Q(employee__entity_id__in=tenant_entity_ids)
         if org_id:
-            eq |= Q(employee__organization_id=org_id) | Q(employee__entity__organization_id=org_id)
+            eq |= Q(employee__organization_id=org_id) | Q(
+                employee__entity__organization_id=org_id
+            )
         if eq:
             return qs.filter(eq).distinct()
         return qs.filter(employee=employee)
 
-    if qs.model.__name__ == 'Entity':
+    if qs.model.__name__ == "Entity":
         if tenant_entity_ids:
             return qs.filter(id__in=tenant_entity_ids)
         if org_id:
             return qs.filter(organization_id=org_id)
         return qs.none()
 
-    if qs.model.__name__ == 'Branch':
+    if qs.model.__name__ == "Branch":
         if tenant_branch_ids or tenant_entity_ids:
             bq = Q(id__in=tenant_branch_ids)
             if tenant_entity_ids:
@@ -901,61 +1310,84 @@ def isolate_queryset(qs, user):
             return qs.filter(entity__organization_id=org_id)
         return qs.none()
 
-    if qs.model.__name__ == 'Department':
+    if qs.model.__name__ == "Department":
         if tenant_entity_ids:
             return qs.filter(entity_id__in=tenant_entity_ids)
         if org_id:
             return qs.filter(entity__organization_id=org_id)
         return qs.none()
 
-    if qs.model.__name__ == 'Designation':
+    if qs.model.__name__ == "Designation":
         if tenant_entity_ids:
             return qs.filter(department__entity_id__in=tenant_entity_ids)
         if org_id:
             return qs.filter(department__entity__organization_id=org_id)
         return qs.none()
 
-    if qs.model.__name__ == 'PayrollRun':
+    if qs.model.__name__ == "PayrollRun":
         if tenant_entity_ids:
             return qs.filter(entity_id__in=tenant_entity_ids)
         if org_id:
             return qs.filter(entity__organization_id=org_id)
         return qs.none()
 
-    if qs.model.__name__ == 'Role':
+    if qs.model.__name__ == "Role":
         q = Q(site_id__in=all_tenant_site_ids)
-        if not qs.filter(q, name__iexact='Site Admin').exists():
-            q |= Q(code='SITE_ADMIN', site__isnull=True)
-        org_id = tenant_site.organization_id if tenant_site else getattr(employee, 'organization_id', None)
+        if not qs.filter(q, name__iexact="Site Admin").exists():
+            q |= Q(code="SITE_ADMIN", site__isnull=True)
+        org_id = (
+            tenant_site.organization_id
+            if tenant_site
+            else getattr(employee, "organization_id", None)
+        )
         if org_id:
             q |= Q(site__isnull=True, organization_id=org_id)
         return qs.filter(q).distinct()
 
-    if qs.model.__name__ == 'SalaryStructure':
+    if qs.model.__name__ == "SalaryStructure":
         return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True))
 
-    if qs.model.__name__ == 'ComponentRule':
+    if qs.model.__name__ == "ComponentRule":
         if all_tenant_site_ids:
-            return qs.filter(Q(structure__site_id__in=all_tenant_site_ids) | Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
-        return qs.filter(Q(structure__site__isnull=True) | Q(structure__isnull=True)).distinct()
+            return qs.filter(
+                Q(structure__site_id__in=all_tenant_site_ids)
+                | Q(structure__site__isnull=True)
+                | Q(structure__isnull=True)
+            ).distinct()
+        return qs.filter(
+            Q(structure__site__isnull=True) | Q(structure__isnull=True)
+        ).distinct()
 
-    if qs.model.__name__ == 'AttendancePolicy':
-        return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True, organization__isnull=True)).distinct()
+    if qs.model.__name__ == "AttendancePolicy":
+        return qs.filter(
+            Q(site_id__in=all_tenant_site_ids)
+            | Q(site__isnull=True, organization__isnull=True)
+        ).distinct()
 
-    if qs.model.__name__ == 'Holiday':
+    if qs.model.__name__ == "Holiday":
         if all_tenant_site_ids:
-            return qs.filter(Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)).distinct()
+            return qs.filter(
+                Q(site_id__in=all_tenant_site_ids) | Q(site__isnull=True)
+            ).distinct()
         return qs.filter(site__isnull=True).distinct()
 
-    if qs.model.__name__ == 'Organization':
-        org_id = tenant_site.organization_id if tenant_site else getattr(employee, 'organization_id', None)
+    if qs.model.__name__ == "Organization":
+        org_id = (
+            tenant_site.organization_id
+            if tenant_site
+            else getattr(employee, "organization_id", None)
+        )
         return qs.filter(id=org_id) if org_id else qs.none()
 
-    if hasattr(qs.model, 'site'):
+    if hasattr(qs.model, "site"):
         return qs.filter(site_id__in=all_tenant_site_ids)
 
-    if hasattr(qs.model, 'organization'):
-        return qs.filter(organization_id=employee.organization_id) if employee.organization_id else qs.none()
+    if hasattr(qs.model, "organization"):
+        return (
+            qs.filter(organization_id=employee.organization_id)
+            if employee.organization_id
+            else qs.none()
+        )
 
     return qs.none()
 
@@ -963,6 +1395,7 @@ def isolate_queryset(qs, user):
 # ---------------------------------------------------------------------------
 # ViewSet Mixin
 # ---------------------------------------------------------------------------
+
 
 class DataIsolationMixin:
     """
@@ -981,39 +1414,43 @@ class DataIsolationMixin:
 
     If none of these exist, non-superusers will receive an empty queryset.
     """
+
     def get_queryset(self):
         qs = super().get_queryset()
-        request = getattr(self, 'request', None)
+        request = getattr(self, "request", None)
         if request is None or not request.user.is_authenticated:
             return qs.none()
         return isolate_queryset(qs, request.user)
 
     def create(self, request, *args, **kwargs):
         """
-        Intercept creation to auto-assign the user's isolated scope (Site/Entity/Org) 
-        if the frontend didn't provide it, and prevent cross-tenant IDOR injection 
+        Intercept creation to auto-assign the user's isolated scope (Site/Entity/Org)
+        if the frontend didn't provide it, and prevent cross-tenant IDOR injection
         if the client supplied foreign keys belonging to another tenant.
         """
         # Defensive check: If the underlying viewset does not support creation
         # (e.g., ReadOnlyModelViewSet), return 405 Method Not Allowed instead of 500 AttributeError.
-        if not hasattr(super(), 'create'):
+        if not hasattr(super(), "create"):
             from rest_framework.exceptions import MethodNotAllowed
+
             raise MethodNotAllowed(request.method)
 
         if request.user.is_authenticated and not request.user.is_superuser:
             model = self.get_queryset().model
             from organisation.models import Site
             from rest_framework.exceptions import PermissionDenied
-            
-            all_tenant_site_ids, tenant_branch_ids, tenant_entity_ids, tenant_site = _get_tenant_scope(request.user)
+
+            all_tenant_site_ids, tenant_branch_ids, tenant_entity_ids, tenant_site = (
+                _get_tenant_scope(request.user)
+            )
 
             target_site = None
             target_org = None
             target_entity = None
-            
-            employee = getattr(request.user, 'employee_profile', None)
+
+            employee = getattr(request.user, "employee_profile", None)
             admin_sites = Site.objects.filter(contact_email=request.user.email)
-            
+
             if admin_sites.exists():
                 site = admin_sites.first()
                 target_site = site.id
@@ -1026,65 +1463,90 @@ class DataIsolationMixin:
             elif tenant_site:
                 target_site = tenant_site.id
                 target_org = tenant_site.organization_id
-                target_entity = tenant_site.branch.entity_id if tenant_site.branch else None
-                
-            if hasattr(request.data, 'copy'):
+                target_entity = (
+                    tenant_site.branch.entity_id if tenant_site.branch else None
+                )
+
+            if hasattr(request.data, "copy"):
                 mutable_data = request.data.copy()
             else:
                 mutable_data = dict(request.data)
 
             # IDOR Prevention: Verify supplied site/entity against tenant scope
-            if hasattr(model, 'site') and mutable_data.get('site'):
+            if hasattr(model, "site") and mutable_data.get("site"):
                 try:
-                    s_id = int(mutable_data['site'])
+                    s_id = int(mutable_data["site"])
                     if all_tenant_site_ids and s_id not in all_tenant_site_ids:
-                        raise PermissionDenied("Cross-tenant assignment forbidden: Site does not belong to your organization.")
+                        raise PermissionDenied(
+                            "Cross-tenant assignment forbidden: Site does not belong to your organization."
+                        )
                 except (ValueError, TypeError):
                     pass
 
-            if hasattr(model, 'entity') and mutable_data.get('entity'):
+            if hasattr(model, "entity") and mutable_data.get("entity"):
                 try:
-                    e_id = int(mutable_data['entity'])
+                    e_id = int(mutable_data["entity"])
                     if tenant_entity_ids and e_id not in tenant_entity_ids:
-                        raise PermissionDenied("Cross-tenant assignment forbidden: Entity does not belong to your organization.")
+                        raise PermissionDenied(
+                            "Cross-tenant assignment forbidden: Entity does not belong to your organization."
+                        )
                 except (ValueError, TypeError):
                     pass
-                    
+
             modified = False
-            if model.__name__ != 'AttendancePolicy':
-                if hasattr(model, 'site') and not mutable_data.get('site') and target_site:
-                    mutable_data['site'] = target_site
+            if model.__name__ != "AttendancePolicy":
+                if (
+                    hasattr(model, "site")
+                    and not mutable_data.get("site")
+                    and target_site
+                ):
+                    mutable_data["site"] = target_site
                     modified = True
-                if hasattr(model, 'organization') and not mutable_data.get('organization') and target_org:
-                    mutable_data['organization'] = target_org
+                if (
+                    hasattr(model, "organization")
+                    and not mutable_data.get("organization")
+                    and target_org
+                ):
+                    mutable_data["organization"] = target_org
                     modified = True
-                if hasattr(model, 'entity') and not mutable_data.get('entity') and target_entity:
-                    mutable_data['entity'] = target_entity
+                if (
+                    hasattr(model, "entity")
+                    and not mutable_data.get("entity")
+                    and target_entity
+                ):
+                    mutable_data["entity"] = target_entity
                     modified = True
-                
+
             if modified:
                 serializer = self.get_serializer(data=mutable_data)
                 serializer.is_valid(raise_exception=True)
                 self.perform_create(serializer)
                 from rest_framework.response import Response
                 from rest_framework import status
+
                 headers = self.get_success_headers(serializer.data)
-                return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
-                    
-        if hasattr(super(), 'create'):
+                return Response(
+                    serializer.data, status=status.HTTP_201_CREATED, headers=headers
+                )
+
+        if hasattr(super(), "create"):
             return super().create(request, *args, **kwargs)
         from rest_framework.exceptions import MethodNotAllowed
+
         raise MethodNotAllowed(request.method)
+
 
 # ---------------------------------------------------------------------------
 # Dynamic CRUD Permission
 # ---------------------------------------------------------------------------
+
 
 class DynamicCRUDPermission(permissions.BasePermission):
     """
     Enforces strict backend CRUD boundaries based on dynamic_role.permissions.
     Only checks if the view defines an `rbac_module` (e.g. `rbac_module = 'Employees'`).
     """
+
     def has_permission(self, request, view):
         # 1. Bypass if unauthenticated
         if not request.user or not request.user.is_authenticated:
@@ -1092,27 +1554,27 @@ class DynamicCRUDPermission(permissions.BasePermission):
         # Superuser and Super Admin have full CRUD permissions across all modules
         if request.user.is_superuser:
             return True
-        employee = getattr(request.user, 'employee_profile', None)
-        if employee and employee.role in ['super_admin', 'org_admin', 'admin']:
+        employee = getattr(request.user, "employee_profile", None)
+        if employee and employee.role in ["super_admin", "org_admin", "admin"]:
             return True
         # 3. If view doesn't define rbac_module, don't enforce dynamic CRUD here (let other permissions handle it)
-        rbac_module = getattr(view, 'rbac_module', None)
+        rbac_module = getattr(view, "rbac_module", None)
         if not rbac_module:
             return True
-            
+
         # 4. Extract module permissions
         module_perms = {}
         site = _get_tenant_site(request.user)
 
         # Strict site module boundary: If site has modules configured, rbac_module must be allowed
-        if site and site.modules is not None:
+        if site and site.modules is not None and len(site.modules) > 0:
             allowed_mods = set()
             for m in site.modules:
-                allowed_mods.add(m if isinstance(m, str) else m.get('name', ''))
-            if 'Sub Sites' in allowed_mods:
-                allowed_mods.add('Sites')
-            if 'Sites' in allowed_mods:
-                allowed_mods.add('Sub Sites')
+                allowed_mods.add(m if isinstance(m, str) else m.get("name", ""))
+            if "Sub Sites" in allowed_mods:
+                allowed_mods.add("Sites")
+            if "Sites" in allowed_mods:
+                allowed_mods.add("Sub Sites")
 
             if rbac_module not in allowed_mods:
                 return False
@@ -1124,34 +1586,74 @@ class DynamicCRUDPermission(permissions.BasePermission):
 
         # If user has dynamic capabilities to manage all (can_manage_users, Corporate/Region scope, or site contact)
         has_full_site_mgmt = bool(
-            (site and site.contact_email and request.user.email and site.contact_email.strip().lower() == request.user.email.strip().lower()) or
-            (employee and employee.dynamic_role and (getattr(employee.dynamic_role, 'can_manage_users', False) or getattr(employee.dynamic_role, 'access_scope', None) in ('Corporate', 'Region')))
+            (
+                site
+                and site.contact_email
+                and request.user.email
+                and site.contact_email.strip().lower()
+                == request.user.email.strip().lower()
+            )
+            or (
+                employee
+                and employee.dynamic_role
+                and (
+                    getattr(employee.dynamic_role, "can_manage_users", False)
+                    or getattr(employee.dynamic_role, "access_scope", None)
+                    in ("Corporate", "Region")
+                )
+            )
         )
         if not module_perms and has_full_site_mgmt:
-            module_perms = {'view': True, 'create': True, 'update': True, 'delete': True}
-                            
+            module_perms = {
+                "view": True,
+                "create": True,
+                "update": True,
+                "delete": True,
+            }
+
         # Special workflow permissions handling for Run Payroll
-        if rbac_module == 'Run Payroll':
-            action = getattr(view, 'action', None)
-            if action in ['approve', 'reject']:
-                return _is_truthy(dynamic_perms.get('can_approve_payroll'))
-            if action == 'execute':
-                return (_is_truthy(dynamic_perms.get('can_run_payroll')) or
-                        _is_truthy(module_perms.get('create')))
-            if request.method in ['GET', 'HEAD', 'OPTIONS']:
-                if any(_is_truthy(dynamic_perms.get(k)) for k in ['can_run_payroll', 'can_view_confidential_payroll', 'can_approve_payroll']):
+        if rbac_module == "Run Payroll":
+            action = getattr(view, "action", None)
+            if action in ["approve", "reject"]:
+                return _is_truthy(dynamic_perms.get("can_approve_payroll"))
+            if action == "execute":
+                return _is_truthy(dynamic_perms.get("can_run_payroll")) or _is_truthy(
+                    module_perms.get("create")
+                )
+            if request.method in ["GET", "HEAD", "OPTIONS"]:
+                if any(
+                    _is_truthy(dynamic_perms.get(k))
+                    for k in [
+                        "can_run_payroll",
+                        "can_view_confidential_payroll",
+                        "can_approve_payroll",
+                    ]
+                ):
                     return True
 
-        # Fallback for standard employees without a customized dynamic role
-        if not module_perms and employee and employee.role == 'employee':
+        # Special self-service and approval actions on Employees
+        action = getattr(view, "action", None)
+        if rbac_module == "Employees" and action in [
+            "update_profile_details",
+            "request_profile_unlock",
+            "approve_profile_unlock",
+            "reject_profile_unlock",
+            "reset_credentials",
+        ]:
+            return True
+
+        # Fallback for standard employees or users without a customized dynamic role
+        if not module_perms and (not employee or employee.role == "employee"):
             ess_modules = {
-                'Leave Requests': {'view': 'self', 'create': True},
-                'Attendance': {'view': 'self', 'create': True},
-                'Daily Attendance': {'view': 'self', 'create': True},
-                'Holiday Planner': {'view': True, 'create': False},
-                'Salary Slips': {'view': 'self', 'create': False},
-                'Form 16': {'view': 'self', 'create': False},
-                'Separation Request': {'view': 'self', 'create': True},
+                "Leave Requests": {"view": "self", "create": True},
+                "Attendance": {"view": "self", "create": True},
+                "Daily Attendance": {"view": "self", "create": True},
+                "Holiday Planner": {"view": True, "create": False},
+                "Salary Slips": {"view": "self", "create": False},
+                "Form 16": {"view": "self", "create": False},
+                "Separation Request": {"view": "self", "create": True},
+                "Loans & Advances": {"view": "self", "create": True},
+                "Reimbursements": {"view": "self", "create": True},
             }
             if rbac_module in ess_modules:
                 module_perms = ess_modules[rbac_module]
@@ -1159,62 +1661,86 @@ class DynamicCRUDPermission(permissions.BasePermission):
         # If no permissions found, deny
         if not module_perms:
             return False
-        
+
         # 6. Map request method to Create/Read/Update/Delete
         method = request.method
-        if method in ['GET', 'HEAD', 'OPTIONS']:
-            view_perm = module_perms.get('view')
+        if method in ["GET", "HEAD", "OPTIONS"]:
+            view_perm = module_perms.get("view")
             return _has_view_perm(view_perm)
-        elif method == 'POST':
-            return _is_truthy(module_perms.get('create'))
-        elif method in ['PUT', 'PATCH']:
+        elif method == "POST":
+            return _is_truthy(module_perms.get("create"))
+        elif method in ["PUT", "PATCH"]:
             # We will allow the request to proceed to has_object_permission
             # if they are a manager. We'll enforce the strict check there.
-            if _is_truthy(module_perms.get('update')):
+            if _is_truthy(module_perms.get("update")):
                 return True
             if employee:
                 from employees.models import Employee
+
                 if Employee.objects.filter(manager=employee).exists():
                     return True
             return False
-        elif method == 'DELETE':
-            return _is_truthy(module_perms.get('delete'))
-            
+        elif method == "DELETE":
+            return _is_truthy(module_perms.get("delete"))
+
         return False
 
     def has_object_permission(self, request, view, obj):
         if request.user.is_superuser:
             return True
-        employee = getattr(request.user, 'employee_profile', None)
-        if employee and employee.role in ['super_admin', 'org_admin', 'admin']:
+        employee = getattr(request.user, "employee_profile", None)
+        if employee and employee.role in ["super_admin", "org_admin", "admin"]:
             return True
+
+        action = getattr(view, "action", None)
+        if action in ["update_profile_details", "request_profile_unlock"]:
+            return bool(employee and obj.id == employee.id)
+        if action in ["approve_profile_unlock", "reject_profile_unlock"]:
+            return bool(
+                employee
+                and (
+                    obj.manager_id == employee.id
+                    or employee.role
+                    in ["super_admin", "org_admin", "admin", "site_admin"]
+                )
+            )
 
         # Check if they are updating a reportee's object
         method = request.method
-        if method in ['PUT', 'PATCH'] and employee and hasattr(obj, 'employee'):
-            if getattr(obj.employee, 'manager_id', None) == employee.id:
+        if method in ["PUT", "PATCH"] and employee and hasattr(obj, "employee"):
+            if getattr(obj.employee, "manager_id", None) == employee.id:
                 return True
-                
+
         # Otherwise fallback to the module permissions
-        rbac_module = getattr(view, 'rbac_module', None)
+        rbac_module = getattr(view, "rbac_module", None)
         if not rbac_module:
             return True
-            
+
         module_perms = {}
         site = _get_tenant_site(request.user)
         if site and site.modules:
             for mod in site.modules:
-                mod_name = mod if isinstance(mod, str) else mod.get('name', '')
+                mod_name = mod if isinstance(mod, str) else mod.get("name", "")
                 if mod_name == rbac_module:
-                    module_perms = {'view': True, 'create': True, 'update': True, 'delete': True}
+                    module_perms = {
+                        "view": True,
+                        "create": True,
+                        "update": True,
+                        "delete": True,
+                    }
                     break
 
-        if not module_perms and employee and employee.dynamic_role and employee.dynamic_role.permissions:
+        if (
+            not module_perms
+            and employee
+            and employee.dynamic_role
+            and employee.dynamic_role.permissions
+        ):
             module_perms = employee.dynamic_role.permissions.get(rbac_module, {})
-            
-        if method in ['PUT', 'PATCH']:
-            return _is_truthy(module_perms.get('update'))
-        elif method == 'DELETE':
-            return _is_truthy(module_perms.get('delete'))
-            
+
+        if method in ["PUT", "PATCH"]:
+            return _is_truthy(module_perms.get("update"))
+        elif method == "DELETE":
+            return _is_truthy(module_perms.get("delete"))
+
         return True

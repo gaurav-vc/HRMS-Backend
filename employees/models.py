@@ -63,6 +63,26 @@ class Employee(models.Model):
     bonus_months = models.IntegerField(default=1)
     
     # Compliance / Bank Details
+    WORKER_TYPE_CHOICES = [
+        ('Salaried', 'Salaried Employee (Sec 192)'),
+        ('Professional', 'Professional / Consultant / Retainer (Sec 194J)'),
+        ('Contractor', 'Contractor / Vendor (Sec 194C)')
+    ]
+    TDS_SECTION_CHOICES = [
+        ('194J_10', '194J - Professional Services (10%)'),
+        ('194J_2', '194J - Technical Services (2%)'),
+        ('194C_1', '194C - Individual Contractor (1%)'),
+        ('194C_2', '194C - Corporate Contractor (2%)'),
+        ('192', '192 - Salaried Tax Slabs'),
+        ('CUSTOM', 'Custom Rate (%)'),
+    ]
+
+    worker_type = models.CharField(max_length=30, choices=WORKER_TYPE_CHOICES, default='Salaried')
+    tds_applicable = models.BooleanField(default=False)
+    tds_section = models.CharField(max_length=20, choices=TDS_SECTION_CHOICES, default='194J_10')
+    tds_rate = models.DecimalField(max_digits=5, decimal_places=2, default=10.00)
+    tds_lower_deduction_cert = models.CharField(max_length=50, blank=True, null=True, help_text="Certificate u/s 197 for lower/nil deduction")
+
     pf_applicable = models.BooleanField(default=False)
     pan = models.CharField(max_length=50, blank=True, null=True)
     aadhaar = models.CharField(max_length=50, blank=True, null=True)
@@ -83,6 +103,13 @@ class Employee(models.Model):
     
     # Self-referential Manager relation
     manager = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='reportees')
+    
+    # Profile Self-Service Governance & One-Time Lock
+    profile_edit_unlocked = models.BooleanField(default=True, help_text="True allows one-time or manager-approved editing of bank, statutory & documents")
+    profile_edit_count = models.IntegerField(default=0, help_text="Number of times employee submitted profile edits")
+    profile_unlock_requested = models.BooleanField(default=False, help_text="Pending manager approval to re-edit profile")
+    profile_unlock_requested_at = models.DateTimeField(null=True, blank=True)
+    profile_unlock_reason = models.TextField(null=True, blank=True)
     
     class Meta:
         constraints = [
@@ -112,6 +139,7 @@ class Notification(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     related_run_id = models.IntegerField(null=True, blank=True)
     related_employee_id = models.IntegerField(null=True, blank=True)
+    notification_type = models.CharField(max_length=50, blank=True, null=True)
     
     class Meta:
         ordering = ['-created_at']
@@ -171,8 +199,11 @@ class EmployeeExit(models.Model):
     it_cleared = models.BooleanField(default=False)
     finance_cleared = models.BooleanField(default=False)
     
-    fnf_status = models.CharField(max_length=50, default='Pending') # Full & Final
-    status = models.CharField(max_length=50, default='Pending') # Pending, Approved, Rejected, Deactivated
+    clearance_remarks = models.JSONField(default=dict, blank=True)
+    fnf_status = models.CharField(max_length=50, default='Pending') # Full & Final: Pending, Settled, Waived
+    fnf_statement = models.JSONField(default=dict, blank=True)
+    settled_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(max_length=50, default='Pending') # Pending, In Progress, Approved, Rejected, Completed, Deactivated
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -183,12 +214,16 @@ class CompensationHistory(models.Model):
     Used by the Retro Arrears engine to recalculate backdated frozen payroll runs.
     """
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='compensation_history')
-    ctc = models.IntegerField()
+    previous_ctc = models.IntegerField(default=0, help_text="Previous Annual CTC before revision")
+    ctc = models.IntegerField(help_text="Revised / Current Annual CTC")
+    hike_percentage = models.DecimalField(max_digits=6, decimal_places=2, default=0.0, help_text="Percentage hike")
+    revision_type = models.CharField(max_length=50, default="Annual Appraisal", help_text="e.g. Annual Appraisal, Promotion, Market Correction")
     salary_structure = models.ForeignKey('payroll.SalaryStructure', on_delete=models.PROTECT)
     effective_from = models.DateField()
     effective_to = models.DateField(null=True, blank=True)
     
     reason = models.TextField(blank=True, null=True)
+    notes = models.TextField(blank=True, null=True)
     changed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     

@@ -24,6 +24,28 @@ class EmployeeSerializer(serializers.ModelSerializer):
         model = Employee
         fields = '__all__'
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get('request')
+        user = getattr(request, 'user', None) if request else None
+        
+        from authentication.permissions import can_view_salary
+        if not can_view_salary(user, instance):
+            data['ctc'] = None
+            data['ctc_masked'] = "xxxx"
+            data['is_salary_confidential'] = True
+        else:
+            data['is_salary_confidential'] = False
+
+        data['workerType'] = instance.worker_type
+        data['tdsApplicable'] = instance.tds_applicable
+        data['tdsSection'] = instance.tds_section
+        data['tdsRate'] = float(instance.tds_rate) if instance.tds_rate is not None else 10.0
+        data['tdsLowerDeductionCert'] = instance.tds_lower_deduction_cert
+        data['pfApplicable'] = instance.pf_applicable
+            
+        return data
+
     def to_internal_value(self, data):
         data = data.copy() if hasattr(data, 'copy') else dict(data)
         if 'salaryStructure' in data:
@@ -36,6 +58,28 @@ class EmployeeSerializer(serializers.ModelSerializer):
             data['group_category'] = data.pop('groupCategory')
         if 'gradeCategory' in data:
             data['grade_category'] = data.pop('gradeCategory')
+        if 'workerType' in data:
+            data['worker_type'] = data.pop('workerType')
+        if 'tdsApplicable' in data:
+            data['tds_applicable'] = data.pop('tdsApplicable')
+        if 'tdsSection' in data:
+            data['tds_section'] = data.pop('tdsSection')
+        if 'tdsRate' in data:
+            data['tds_rate'] = data.pop('tdsRate')
+        if 'tdsLowerDeductionCert' in data:
+            data['tds_lower_deduction_cert'] = data.pop('tdsLowerDeductionCert')
+        if 'pfApplicable' in data:
+            data['pf_applicable'] = data.pop('pfApplicable')
+
+        request = self.context.get('request')
+        user = getattr(request, 'user', None) if request else None
+        from authentication.permissions import is_ceo_user
+        if not is_ceo_user(user):
+            # Non-CEO users cannot set, update, or clear employee CTC or tax deductions
+            data.pop('ctc', None)
+            data.pop('tax_saving_deductions', None)
+            data.pop('salary_structure', None)
+
         return super().to_internal_value(data)
 
     def validate(self, attrs):
@@ -92,11 +136,48 @@ class EmployeeTransferSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 class EmployeeExitSerializer(serializers.ModelSerializer):
+    employee_name = serializers.SerializerMethodField()
+    employee_code = serializers.CharField(source="employee.code", default="", read_only=True)
+    department_name = serializers.CharField(source="employee.department.name", default="", read_only=True)
+    designation_name = serializers.CharField(source="employee.designation.name", default="", read_only=True)
+
     class Meta:
         model = EmployeeExit
         fields = '__all__'
 
-from .models import Notification
+    def get_employee_name(self, obj):
+        if obj.employee:
+            return f"{obj.employee.first_name} {obj.employee.last_name}".strip()
+        return ""
+
+from .models import Notification, CompensationHistory
+
+
+class CompensationHistorySerializer(serializers.ModelSerializer):
+    salary_structure_name = serializers.CharField(
+        source="salary_structure.name", default="", read_only=True
+    )
+    changed_by_name = serializers.SerializerMethodField()
+    employee_code = serializers.CharField(
+        source="employee.code", default="", read_only=True
+    )
+    employee_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CompensationHistory
+        fields = "__all__"
+
+    def get_changed_by_name(self, obj):
+        if obj.changed_by:
+            return obj.changed_by.get_full_name() or obj.changed_by.username
+        return ""
+
+    def get_employee_name(self, obj):
+        if obj.employee:
+            return f"{obj.employee.first_name} {obj.employee.last_name}".strip()
+        return ""
+
+
 class NotificationSerializer(serializers.ModelSerializer):
     related_run_period = serializers.SerializerMethodField()
 

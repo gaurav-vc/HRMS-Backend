@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import DailyAttendance, PunchLog, RegularizationRequest, FaceProfile, DynamicQRToken, ShiftDefinition, ShiftAssignment, Holiday, HolidayRuleGroup
+from .models import DailyAttendance, PunchLog, RegularizationRequest, FaceProfile, DynamicQRToken, ShiftDefinition, ShiftAssignment, Holiday, HolidayRuleGroup, AttendancePeriodVerification
 from employees.serializers import EmployeeSerializer
 
 class FaceProfileSerializer(serializers.ModelSerializer):
@@ -177,3 +177,17 @@ class HolidaySerializer(serializers.ModelSerializer):
     class Meta:
         model = Holiday
         fields = '__all__'
+
+class AttendancePeriodVerificationSerializer(serializers.ModelSerializer):
+    entity_name = serializers.CharField(source='entity.name', read_only=True)
+    verified_by_name = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = AttendancePeriodVerification
+        fields = '__all__'
+
+    def get_verified_by_name(self, obj):
+        if obj.verified_by:
+            return obj.verified_by.get_full_name() or obj.verified_by.username
+        return None
+

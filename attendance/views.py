@@ -7,8 +7,9 @@ from django.utils import timezone
 from datetime import datetime, timedelta
 import math
 import os
-from .models import DailyAttendance, PunchLog, RegularizationRequest, DynamicQRToken, FaceProfile, Holiday, HolidayRuleGroup
-from .serializers import DailyAttendanceSerializer, PunchLogSerializer, RegularizationRequestSerializer, DynamicQRTokenSerializer, HolidaySerializer, HolidayRuleGroupSerializer
+from django.db import transaction
+from .models import DailyAttendance, PunchLog, RegularizationRequest, DynamicQRToken, FaceProfile, Holiday, HolidayRuleGroup, AttendancePeriodVerification
+from .serializers import DailyAttendanceSerializer, PunchLogSerializer, RegularizationRequestSerializer, DynamicQRTokenSerializer, HolidaySerializer, HolidayRuleGroupSerializer, AttendancePeriodVerificationSerializer
 from .decorators import strict_liveness_precheck
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371000 # Radius of earth in meters
@@ -1428,6 +1429,128 @@ class AttendanceViewSet(viewsets.ViewSet):
             "records": serialized_records
         })
 
+    @action(detail=False, methods=['get', 'post'], url_path='period-verification')
+    def period_verification(self, request):
+        """
+        API for Attendance Verification & Period Sign-off required before payroll execution.
+        GET: Returns verification status, metrics (recorded days, approved days, pending regularizations).
+        POST: Performs period verification with mandatory remarks and marks records as is_approved=True.
+        """
+        from organisation.models import Entity
+        from employees.models import Employee
+        from django.db.models import Q
+        import calendar
+
+        period = request.query_params.get('period') or request.data.get('period')
+        entity_id = (
+            request.query_params.get('entity')
+            or request.data.get('entity')
+            or request.query_params.get('entity_id')
+            or request.data.get('entity_id')
+        )
+
+        if not period or not entity_id:
+            return Response({"error": "Both 'period' (YYYY-MM) and 'entity' ID are required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            entity = Entity.objects.get(id=entity_id)
+        except Entity.DoesNotExist:
+            return Response({"error": f"Entity with ID {entity_id} does not exist."}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            year, month = map(int, period.split('-'))
+            num_days = calendar.monthrange(year, month)[1]
+            start_date = datetime(year, month, 1).date()
+            end_date = datetime(year, month, num_days).date()
+        except Exception:
+            return Response({"error": f"Invalid period format '{period}'. Expected YYYY-MM."}, status=status.HTTP_400_BAD_REQUEST)
+
+        existing_verif = AttendancePeriodVerification.objects.filter(entity=entity, period=period).first()
+
+        # Active employees in entity
+        active_emps_count = Employee.objects.filter(
+            Q(entity=entity) | Q(branch__entity=entity) | Q(site__branch__entity=entity),
+            status="Active"
+        ).count()
+
+        emp_filter = Q(employee__entity=entity) | Q(employee__branch__entity=entity) | Q(employee__site__branch__entity=entity)
+        total_records = DailyAttendance.objects.filter(emp_filter, attendance_date__range=[start_date, end_date]).count()
+        approved_records = DailyAttendance.objects.filter(emp_filter, attendance_date__range=[start_date, end_date], is_approved=True).count()
+        unapproved_records = max(0, total_records - approved_records)
+        pending_regs = RegularizationRequest.objects.filter(emp_filter, attendance_date__range=[start_date, end_date], status='Pending').count()
+
+        if request.method == 'GET':
+            return Response({
+                "period": period,
+                "entity": entity.id,
+                "entity_name": entity.name,
+                "is_verified": bool(existing_verif and existing_verif.status == 'Verified'),
+                "verification": AttendancePeriodVerificationSerializer(existing_verif).data if existing_verif else None,
+                "metrics": {
+                    "total_active_employees": active_emps_count,
+                    "total_attendance_days": total_records,
+                    "approved_days": approved_records,
+                    "unapproved_days": unapproved_records,
+                    "pending_regularizations": pending_regs,
+                }
+            }, status=status.HTTP_200_OK)
+
+        # POST: Verify & Sign-off by IT Manager / Payroll runner / authorized admin
+        user = request.user
+        emp = getattr(user, 'employee_profile', None)
+        can_verify = False
+        if user.is_superuser or (emp and emp.role in ['super_admin', 'org_admin', 'admin']):
+            can_verify = True
+        else:
+            from authentication.permissions import check_user_permission, coerce_permission_bool
+            if check_user_permission(user, 'can_run_payroll') or check_user_permission(user, 'can_approve_payroll'):
+                can_verify = True
+            elif emp and emp.dynamic_role and emp.dynamic_role.permissions:
+                perms = emp.dynamic_role.permissions
+                if coerce_permission_bool(perms.get('can_run_payroll')) or coerce_permission_bool(perms.get('can_verify_attendance')):
+                    can_verify = True
+            if emp:
+                role_str = f"{getattr(emp.dynamic_role, 'name', '')} {getattr(emp.designation, 'title', '')}".lower()
+                if 'it' in role_str or 'manager' in role_str or 'payroll' in role_str:
+                    can_verify = True
+
+        if not can_verify:
+            return Response({"error": "Permission denied. Only IT Managers, Payroll Administrators, and authorized managers can verify attendance."}, status=status.HTTP_403_FORBIDDEN)
+
+        remarks = str(request.data.get('remarks', '')).strip()
+        if not remarks or len(remarks) < 3:
+            return Response({"error": "Verification remarks are mandatory. Please provide remarks explaining the sign-off."}, status=status.HTTP_400_BAD_REQUEST)
+
+        now = timezone.now()
+        with transaction.atomic():
+            attendances = DailyAttendance.objects.filter(emp_filter, attendance_date__range=[start_date, end_date])
+            attendances.update(
+                is_approved=True,
+                approved_by=emp,
+                approved_at=now
+            )
+
+            verif, _ = AttendancePeriodVerification.objects.update_or_create(
+                period=period,
+                entity=entity,
+                defaults={
+                    'status': 'Verified',
+                    'verified_by': user,
+                    'verified_at': now,
+                    'remarks': remarks,
+                    'total_employees': active_emps_count,
+                    'total_attendance_days': attendances.count(),
+                    'approved_days': attendances.count(),
+                    'pending_regularizations': pending_regs,
+                }
+            )
+
+        return Response({
+            "success": True,
+            "message": f"Attendance for {entity.name} ({period}) successfully verified and signed off.",
+            "verification": AttendancePeriodVerificationSerializer(verif).data
+        }, status=status.HTTP_200_OK)
+
 from authentication.permissions import DataIsolationMixin
 from rest_framework.permissions import IsAuthenticated
 
@@ -1526,6 +1649,128 @@ class DailyAttendanceViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             "deleted_ids": unlocked_ids,
             "locked_records": locked_records,
             "message": f"Successfully deleted {deleted_count} record(s). Protected {len(locked_records)} locked record(s)."
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get', 'post'], url_path='period-verification')
+    def period_verification(self, request):
+        """
+        API for Attendance Verification & Period Sign-off required before payroll execution.
+        GET: Returns verification status, metrics (recorded days, approved days, pending regularizations).
+        POST: Performs period verification with mandatory remarks and marks records as is_approved=True.
+        """
+        from organisation.models import Entity
+        from employees.models import Employee
+        from django.db.models import Q
+        import calendar
+
+        period = request.query_params.get('period') or request.data.get('period')
+        entity_id = (
+            request.query_params.get('entity')
+            or request.data.get('entity')
+            or request.query_params.get('entity_id')
+            or request.data.get('entity_id')
+        )
+
+        if not period or not entity_id:
+            return Response({"error": "Both 'period' (YYYY-MM) and 'entity' ID are required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            entity = Entity.objects.get(id=entity_id)
+        except Entity.DoesNotExist:
+            return Response({"error": f"Entity with ID {entity_id} does not exist."}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            year, month = map(int, period.split('-'))
+            num_days = calendar.monthrange(year, month)[1]
+            start_date = datetime(year, month, 1).date()
+            end_date = datetime(year, month, num_days).date()
+        except Exception:
+            return Response({"error": f"Invalid period format '{period}'. Expected YYYY-MM."}, status=status.HTTP_400_BAD_REQUEST)
+
+        existing_verif = AttendancePeriodVerification.objects.filter(entity=entity, period=period).first()
+
+        # Active employees in entity
+        active_emps_count = Employee.objects.filter(
+            Q(entity=entity) | Q(branch__entity=entity) | Q(site__branch__entity=entity),
+            status="Active"
+        ).count()
+
+        emp_filter = Q(employee__entity=entity) | Q(employee__branch__entity=entity) | Q(employee__site__branch__entity=entity)
+        total_records = DailyAttendance.objects.filter(emp_filter, attendance_date__range=[start_date, end_date]).count()
+        approved_records = DailyAttendance.objects.filter(emp_filter, attendance_date__range=[start_date, end_date], is_approved=True).count()
+        unapproved_records = max(0, total_records - approved_records)
+        pending_regs = RegularizationRequest.objects.filter(emp_filter, attendance_date__range=[start_date, end_date], status='Pending').count()
+
+        if request.method == 'GET':
+            return Response({
+                "period": period,
+                "entity": entity.id,
+                "entity_name": entity.name,
+                "is_verified": bool(existing_verif and existing_verif.status == 'Verified'),
+                "verification": AttendancePeriodVerificationSerializer(existing_verif).data if existing_verif else None,
+                "metrics": {
+                    "total_active_employees": active_emps_count,
+                    "total_attendance_days": total_records,
+                    "approved_days": approved_records,
+                    "unapproved_days": unapproved_records,
+                    "pending_regularizations": pending_regs,
+                }
+            }, status=status.HTTP_200_OK)
+
+        # POST: Verify & Sign-off by IT Manager / Payroll runner / authorized admin
+        user = request.user
+        emp = getattr(user, 'employee_profile', None)
+        can_verify = False
+        if user.is_superuser or (emp and emp.role in ['super_admin', 'org_admin', 'admin']):
+            can_verify = True
+        else:
+            from authentication.permissions import check_user_permission, coerce_permission_bool
+            if check_user_permission(user, 'can_run_payroll') or check_user_permission(user, 'can_approve_payroll'):
+                can_verify = True
+            elif emp and emp.dynamic_role and emp.dynamic_role.permissions:
+                perms = emp.dynamic_role.permissions
+                if coerce_permission_bool(perms.get('can_run_payroll')) or coerce_permission_bool(perms.get('can_verify_attendance')):
+                    can_verify = True
+            if emp:
+                role_str = f"{getattr(emp.dynamic_role, 'name', '')} {getattr(emp.designation, 'title', '')}".lower()
+                if 'it' in role_str or 'manager' in role_str or 'payroll' in role_str:
+                    can_verify = True
+
+        if not can_verify:
+            return Response({"error": "Permission denied. Only IT Managers, Payroll Administrators, and authorized managers can verify attendance."}, status=status.HTTP_403_FORBIDDEN)
+
+        remarks = str(request.data.get('remarks', '')).strip()
+        if not remarks or len(remarks) < 3:
+            return Response({"error": "Verification remarks are mandatory. Please provide remarks explaining the sign-off."}, status=status.HTTP_400_BAD_REQUEST)
+
+        now = timezone.now()
+        with transaction.atomic():
+            attendances = DailyAttendance.objects.filter(emp_filter, attendance_date__range=[start_date, end_date])
+            attendances.update(
+                is_approved=True,
+                approved_by=emp,
+                approved_at=now
+            )
+
+            verif, _ = AttendancePeriodVerification.objects.update_or_create(
+                period=period,
+                entity=entity,
+                defaults={
+                    'status': 'Verified',
+                    'verified_by': user,
+                    'verified_at': now,
+                    'remarks': remarks,
+                    'total_employees': active_emps_count,
+                    'total_attendance_days': attendances.count(),
+                    'approved_days': attendances.count(),
+                    'pending_regularizations': pending_regs,
+                }
+            )
+
+        return Response({
+            "success": True,
+            "message": f"Attendance for {entity.name} ({period}) successfully verified and signed off.",
+            "verification": AttendancePeriodVerificationSerializer(verif).data
         }, status=status.HTTP_200_OK)
 
 class RegularizationViewSet(DataIsolationMixin, viewsets.ModelViewSet):

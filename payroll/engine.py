@@ -132,12 +132,28 @@ def evaluate_component(rule, context):
         
         result = simple_eval(rule.formula, names=eval_context, operators=my_operators, functions=my_functions)
         
-        # Apply Proration if flagged
-        if getattr(rule, 'prorate', False) and 'present_days' in context and 'total_days' in context:
+        # Apply Proration for attendance / LWP (Leave Without Pay)
+        should_prorate = getattr(rule, 'prorate', False)
+        # Standard monthly fixed earning components always prorate with attendance
+        if not should_prorate and getattr(rule, 'type', '') == 'Earning':
+            r_name_up = (rule.name or "").upper()
+            if any(k in r_name_up for k in ["BASIC", "HRA", "LTA", "SPECIAL", "DEARNESS", "DA", "CONVEYANCE"]):
+                should_prorate = True
+
+        if should_prorate and 'present_days' in context and 'total_days' in context:
             total_days_dec = Decimal(str(context['total_days']))
             if total_days_dec > 0:
                 proration_ratio = Decimal(str(context['present_days'])) / total_days_dec
-                result = Decimal(str(result)) * proration_ratio
+                # Prevent Double-Proration:
+                # If a deduction/contribution formula already depends on an already-prorated component (e.g. basic),
+                # do not multiply by proration_ratio a second time.
+                f_lower = (getattr(rule, 'formula', '') or '').lower()
+                is_dependent_on_prorated = any(
+                    k in f_lower for k in ["basic", "basic_pay", "hra", "non_balancing_gross"]
+                ) or getattr(rule, 'calc', '') == '% of Basic'
+
+                if not (rule.type in ["Deduction", "Employer Contribution"] and is_dependent_on_prorated):
+                    result = Decimal(str(result)) * proration_ratio
         
         # Ensure it's a Decimal
         return Decimal(str(result)).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
@@ -204,3 +220,42 @@ def calculate_tds(ytd_gross, ytd_tax_paid, current_month_gross, remaining_months
         
     monthly_tds = remaining_tax_due / Decimal(remaining_months)
     return monthly_tds.quantize(Decimal('1.00'), rounding=decimal.ROUND_HALF_UP)
+
+def calculate_professional_tds(gross_fee, tds_section='194J_10', custom_rate=Decimal('10.00'), pan=None):
+    """
+    Computes TDS for Professional Fees / Contractor Payouts (Section 194J / 194C).
+    Section 206AA: If PAN is missing or invalid, applies minimum 20% penalty deduction.
+    Returns: (tds_amount, effective_rate, is_penalty)
+    """
+    gross_fee = Decimal(str(gross_fee or '0.00'))
+    if gross_fee <= Decimal('0.00'):
+        return Decimal('0.00'), Decimal('0.00'), False
+
+    # Check PAN for Section 206AA penalty
+    pan_clean = str(pan or '').strip().upper()
+    is_pan_missing = not pan_clean or pan_clean in ['N/A', 'NONE', 'XXXXX0000X'] or len(pan_clean) < 10
+
+    if is_pan_missing:
+        effective_rate = Decimal('20.00')
+        is_penalty = True
+    elif tds_section == '194J_10':
+        effective_rate = Decimal('10.00')
+        is_penalty = False
+    elif tds_section == '194J_2':
+        effective_rate = Decimal('2.00')
+        is_penalty = False
+    elif tds_section == '194C_1':
+        effective_rate = Decimal('1.00')
+        is_penalty = False
+    elif tds_section == '194C_2':
+        effective_rate = Decimal('2.00')
+        is_penalty = False
+    elif tds_section == 'CUSTOM':
+        effective_rate = Decimal(str(custom_rate or '10.00'))
+        is_penalty = False
+    else:
+        effective_rate = Decimal(str(custom_rate or '10.00'))
+        is_penalty = False
+
+    tds_amount = (gross_fee * (effective_rate / Decimal('100.00'))).quantize(Decimal('0.01'), rounding=decimal.ROUND_HALF_UP)
+    return tds_amount, effective_rate, is_penalty

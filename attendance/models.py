@@ -1,4 +1,5 @@
 from django.db import models
+from django.conf import settings
 from employees.models import Employee
 from organisation.models import Site, Entity, Role, Department, Branch
 import uuid
@@ -23,6 +24,10 @@ class DailyAttendance(models.Model):
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    is_approved = models.BooleanField(default=False, db_index=True)
+    approved_by = models.ForeignKey(Employee, on_delete=models.SET_NULL, null=True, blank=True, related_name='approved_daily_attendances')
+    approved_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         unique_together = ('employee', 'attendance_date')
@@ -374,3 +379,34 @@ class LivenessLockout(models.Model):
     
     def __str__(self):
         return f"Lockout for {self.employee}: {self.failed_attempts} fails"
+
+class AttendancePeriodVerification(models.Model):
+    STATUS_CHOICES = (
+        ('Pending', 'Pending'),
+        ('Verified', 'Verified'),
+        ('Rejected', 'Rejected'),
+    )
+    period = models.CharField(max_length=7, help_text="YYYY-MM", db_index=True)
+    entity = models.ForeignKey(Entity, on_delete=models.CASCADE, related_name='attendance_verifications')
+    site = models.ForeignKey(Site, on_delete=models.SET_NULL, null=True, blank=True, related_name='attendance_verifications')
+    
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Pending')
+    verified_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='attendance_verifications')
+    verified_at = models.DateTimeField(null=True, blank=True)
+    remarks = models.TextField(help_text="Mandatory remarks for attendance verification")
+    
+    total_employees = models.IntegerField(default=0)
+    total_attendance_days = models.IntegerField(default=0)
+    approved_days = models.IntegerField(default=0)
+    pending_regularizations = models.IntegerField(default=0)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ('period', 'entity')
+        ordering = ['-period', '-created_at']
+
+    def __str__(self):
+        return f"{self.entity.name} - {self.period}: {self.status}"
+

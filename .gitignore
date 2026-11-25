@@ -9,6 +9,7 @@ env/
 ENV/
 env.bak/
 venv.bak/
+.venv/
 
 # Django
 *.log
@@ -16,3 +17,14 @@ local_settings.py
 
 db.sqlite3-journal
 db.sqlite3
+*.removed_backup
+*.sql
+
+# DeepFace & AI Model Weights
+.deepface/
+weights/
+*.h5
+*.hdf5
+media/punch_photos/
+temp_charts/
+*.jpeg

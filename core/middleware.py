@@ -27,6 +27,8 @@ from core.telemetry import (
 
 logger = logging.getLogger("core.telemetry")
 
+_ACTOR_TENANT_CACHE = {}
+
 
 class QueryCounter:
     """Cursor execution wrapper to count queries without requiring DEBUG=True."""
@@ -145,24 +147,29 @@ class ApiTelemetryMiddleware:
                     actor_email = request.POST.get("email") or request.POST.get("username") or ""
 
             if actor_email and (tenant_id == "system" or not tenant_id):
-                try:
-                    from django.contrib.auth import get_user_model
-                    User = get_user_model()
-                    matched_user = User.objects.filter(email=actor_email).first() or User.objects.filter(username=actor_email).first()
-                    if matched_user:
-                        if getattr(matched_user, "is_superuser", False) or getattr(matched_user, "role", "") == "super_admin":
-                            tenant_id = "superadmin"
-                        else:
-                            emp = getattr(matched_user, "employee_profile", None)
-                            if emp:
-                                if getattr(emp, "organization_id", None):
-                                    tenant_id = f"org_{emp.organization_id}"
-                                elif getattr(emp, "entity_id", None):
-                                    tenant_id = f"entity_{emp.entity_id}"
-                                elif getattr(emp, "site_id", None):
-                                    tenant_id = f"site_{emp.site_id}"
-                except Exception:
-                    pass
+                cached = _ACTOR_TENANT_CACHE.get(actor_email)
+                if cached:
+                    tenant_id = cached
+                else:
+                    try:
+                        from django.contrib.auth import get_user_model
+                        User = get_user_model()
+                        matched_user = User.objects.filter(email=actor_email).first() or User.objects.filter(username=actor_email).first()
+                        if matched_user:
+                            if getattr(matched_user, "is_superuser", False) or getattr(matched_user, "role", "") == "super_admin":
+                                tenant_id = "superadmin"
+                            else:
+                                emp = getattr(matched_user, "employee_profile", None)
+                                if emp:
+                                    if getattr(emp, "organization_id", None):
+                                        tenant_id = f"org_{emp.organization_id}"
+                                    elif getattr(emp, "entity_id", None):
+                                        tenant_id = f"entity_{emp.entity_id}"
+                                    elif getattr(emp, "site_id", None):
+                                        tenant_id = f"site_{emp.site_id}"
+                            _ACTOR_TENANT_CACHE[actor_email] = tenant_id
+                    except Exception:
+                        pass
 
             # 5. Detect Client Platform (WEB vs MOBILE API) and Heartbeat
             platform = detect_client_platform(request)

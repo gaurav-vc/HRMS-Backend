@@ -1,10 +1,24 @@
 from rest_framework import serializers
-from .models import PayrollRun, Loan, Reimbursement, ComponentRule, ComplianceReport, SalaryStructure, PayrollRunComment
+from .models import (
+    PayrollRun,
+    Loan,
+    LoanInstallment,
+    SalaryAdvance,
+    SalaryAdvanceInstallment,
+    EmiReliefRequest,
+    Reimbursement,
+    ComponentRule,
+    ComplianceReport,
+    SalaryStructure,
+    PayrollRunComment,
+)
+
 
 class ComponentRuleSerializer(serializers.ModelSerializer):
     class Meta:
         model = ComponentRule
-        fields = '__all__'
+        fields = "__all__"
+
 
 class SalaryStructureSerializer(serializers.ModelSerializer):
     components = ComponentRuleSerializer(many=True, read_only=True)
@@ -12,25 +26,31 @@ class SalaryStructureSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = SalaryStructure
-        fields = '__all__'
-    
+        fields = "__all__"
+
     def get_employee_count(self, obj):
         try:
             return obj.employees.count()
         except Exception:
             return 0
 
+
 class PayrollRunCommentSerializer(serializers.ModelSerializer):
     author_name = serializers.SerializerMethodField()
-    
+
     class Meta:
         model = PayrollRunComment
-        fields = ['id', 'comment', 'timestamp', 'author_name']
-        
+        fields = ["id", "comment", "timestamp", "author_name"]
+
     def get_author_name(self, obj):
-        if obj.author and hasattr(obj.author, 'employee_profile') and obj.author.employee_profile:
+        if (
+            obj.author
+            and hasattr(obj.author, "employee_profile")
+            and obj.author.employee_profile
+        ):
             return f"{obj.author.employee_profile.first_name} {obj.author.employee_profile.last_name}"
         return obj.author.username if obj.author else "Unknown"
+
 
 class PayrollRunSerializer(serializers.ModelSerializer):
     employees = serializers.SerializerMethodField()
@@ -43,77 +63,73 @@ class PayrollRunSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = PayrollRun
-        fields = '__all__'
-        
+        fields = "__all__"
+
     def get_employees(self, obj):
-        return obj.payslip_set.count() if hasattr(obj, 'payslip_set') else 0
-        
+        return obj.payslip_set.count() if hasattr(obj, "payslip_set") else 0
+
     def _can_view_confidential(self):
-        request = self.context.get('request')
+        request = self.context.get("request")
         if not request or not request.user.is_authenticated:
             return False
-        user = request.user
-        if user.is_superuser:
-            return True
-        emp = getattr(user, 'employee_profile', None)
-        from authentication.permissions import coerce_permission_bool
-        if emp and emp.dynamic_role and emp.dynamic_role.permissions:
-            perms = emp.dynamic_role.permissions
-            if (coerce_permission_bool(perms.get('can_view_confidential_payroll')) or 
-                coerce_permission_bool(perms.get('can_view_confidential')) or
-                coerce_permission_bool(perms.get('can_approve_payroll')) or
-                coerce_permission_bool(perms.get('can_run_payroll'))):
-                return True
-        from organisation.models import Site
-        if Site.objects.filter(contact_email=user.email).exists():
-            return True
-        if emp and getattr(emp, 'is_admin', False):
-            return True
-        return False
-        
+        from authentication.permissions import is_ceo_user
+
+        return is_ceo_user(request.user)
+
     def get_gross(self, obj):
         if not self._can_view_confidential():
             return 0
         from django.db.models import Sum
-        if hasattr(obj, 'payslip_set'):
-            return obj.payslip_set.aggregate(Sum('gross'))['gross__sum'] or 0
+
+        if hasattr(obj, "payslip_set"):
+            return obj.payslip_set.aggregate(Sum("gross"))["gross__sum"] or 0
         return 0
 
     def get_deductions(self, obj):
         if not self._can_view_confidential():
             return 0
         from django.db.models import Sum
-        if hasattr(obj, 'payslip_set'):
-            return obj.payslip_set.aggregate(Sum('deductions'))['deductions__sum'] or 0
+
+        if hasattr(obj, "payslip_set"):
+            return obj.payslip_set.aggregate(Sum("deductions"))["deductions__sum"] or 0
         return 0
 
     def get_net(self, obj):
         if not self._can_view_confidential():
             return 0
         from django.db.models import Sum
-        if hasattr(obj, 'payslip_set'):
-            return obj.payslip_set.aggregate(Sum('net'))['net__sum'] or 0
+
+        if hasattr(obj, "payslip_set"):
+            return obj.payslip_set.aggregate(Sum("net"))["net__sum"] or 0
         return 0
-        
+
     def get_comments(self, obj):
         # Return the latest comments to show rejection reasons
-        comments = obj.comments.all().order_by('-timestamp')[:5]
+        comments = obj.comments.all().order_by("-timestamp")[:5]
         return PayrollRunCommentSerializer(comments, many=True).data
 
     def get_exceptions(self, obj):
-        if hasattr(obj, 'payrollexception_set'):
+        if hasattr(obj, "payrollexception_set"):
             return [e.error_trace for e in obj.payrollexception_set.all()]
         return []
 
     def get_employee_details(self, obj):
-        if not hasattr(obj, 'payslip_set'):
+        if not hasattr(obj, "payslip_set"):
             return []
-        slips = obj.payslip_set.select_related(
-            'employee', 'employee__department', 'employee__designation', 'employee__site', 'employee__entity'
-        ).prefetch_related('lines', 'lines__rule').all()
+        slips = (
+            obj.payslip_set.select_related(
+                "employee",
+                "employee__department",
+                "employee__designation",
+                "employee__site",
+                "employee__entity",
+            )
+            .prefetch_related("lines", "lines__rule")
+            .all()
+        )
         if not slips.exists():
             return []
-        
+
         can_view_conf = self._can_view_confidential()
         details = []
         for slip in slips:
@@ -121,81 +137,226 @@ class PayrollRunSerializer(serializers.ModelSerializer):
             components = {}
             for line in slip.lines.all():
                 components[line.rule.name.strip()] = float(line.amount)
-            
-            pf_amount = sum(v for k, v in components.items() if 'pf' in k.lower() or 'provident' in k.lower())
-            pt_amount = sum(v for k, v in components.items() if 'pt' in k.lower() or 'professional' in k.lower())
-            reimbursement = sum(v for k, v in components.items() if 'reimbursement' in k.lower())
-            incentive = sum(v for k, v in components.items() if 'incentive' in k.lower() or 'bonus' in k.lower())
-            arrears = sum(v for k, v in components.items() if 'arrear' in k.lower())
-            ot_pay = sum(v for k, v in components.items() if 'overtime' in k.lower() or 'ot' in k.lower())
+
+            pf_amount = sum(
+                v
+                for k, v in components.items()
+                if "pf" in k.lower() or "provident" in k.lower()
+            )
+            pt_amount = sum(
+                v
+                for k, v in components.items()
+                if "pt" in k.lower() or "professional" in k.lower()
+            )
+            reimbursement = sum(
+                v for k, v in components.items() if "reimbursement" in k.lower()
+            )
+            incentive = sum(
+                v
+                for k, v in components.items()
+                if "incentive" in k.lower() or "bonus" in k.lower()
+            )
+            arrears = sum(v for k, v in components.items() if "arrear" in k.lower())
+            ot_pay = sum(
+                v
+                for k, v in components.items()
+                if "overtime" in k.lower() or "ot" in k.lower()
+            )
 
             hide_money = not can_view_conf
-            details.append({
-                'id': emp.id,
-                'name': f"{emp.first_name} {emp.last_name}".strip(),
-                'code': emp.code or f"EMP{emp.id}",
-                'email': emp.email or '',
-                'entity': obj.entity.name if obj.entity else '',
-                'department': emp.department.name if emp.department else 'General',
-                'bankName': emp.bank_name or '',
-                'acNo': emp.bank_account or '',
-                'ifscCode': emp.ifsc or '',
-                'currentSalary': 0 if hide_money else float(emp.ctc or 0),
-                'totalDays': float(slip.total_days or 30),
-                'presentDays': float(slip.days_present or 0),
-                'leaves': float(slip.annual_leaves or 0),
-                'lopDays': float(slip.lop_days or 0),
-                'halfDays': float(slip.half_days or 0),
-                'latePenalties': float(slip.late_penalty_days or 0),
-                'ot': float(slip.ot_hours or 0),
-                'overtimeHours': float(slip.ot_hours or 0),
-                'overtimePay': 0 if hide_money else float(ot_pay),
-                'otMultiplier': float(getattr(slip, 'attendance_snapshot', {}).get('ot_multiplier', 2.0) if getattr(slip, 'attendance_snapshot', None) else 2.0),
-                'daysPaid': float(slip.days_paid or 0),
-                'totalAmount': 0 if hide_money else float(slip.gross or 0),
-                'arrears': 0 if hide_money else float(arrears),
-                'deduction': 0 if hide_money else float(slip.deductions or 0),
-                'pf': 0 if hide_money else float(pf_amount),
-                'pt': 0 if hide_money else float(pt_amount),
-                'reimbursement': 0 if hide_money else float(reimbursement),
-                'incentive': 0 if hide_money else float(incentive),
-                'payableSalary': 0 if hide_money else float(slip.net or 0),
-                'isConfidential': hide_money,
-            })
+            details.append(
+                {
+                    "id": emp.id,
+                    "name": f"{emp.first_name} {emp.last_name}".strip(),
+                    "code": emp.code or f"EMP{emp.id}",
+                    "email": emp.email or "",
+                    "entity": obj.entity.name if obj.entity else "",
+                    "department": emp.department.name if emp.department else "General",
+                    "bankName": emp.bank_name or "",
+                    "acNo": emp.bank_account or "",
+                    "ifscCode": emp.ifsc or "",
+                    "currentSalary": 0 if hide_money else float(emp.ctc or 0),
+                    "totalDays": float(slip.total_days or 30),
+                    "presentDays": float(slip.days_present or 0),
+                    "leaves": float(slip.annual_leaves or 0),
+                    "lopDays": float(slip.lop_days or 0),
+                    "halfDays": float(slip.half_days or 0),
+                    "latePenalties": float(slip.late_penalty_days or 0),
+                    "ot": float(slip.ot_hours or 0),
+                    "overtimeHours": float(slip.ot_hours or 0),
+                    "overtimePay": 0 if hide_money else float(ot_pay),
+                    "otMultiplier": float(
+                        getattr(slip, "attendance_snapshot", {}).get(
+                            "ot_multiplier", 1.0
+                        )
+                        if getattr(slip, "attendance_snapshot", None)
+                        else 1.0
+                    ),
+                    "daysPaid": float(slip.days_paid or 0),
+                    "totalAmount": 0 if hide_money else float(slip.gross or 0),
+                    "arrears": 0 if hide_money else float(arrears),
+                    "deduction": 0 if hide_money else float(slip.deductions or 0),
+                    "pf": 0 if hide_money else float(pf_amount),
+                    "pt": 0 if hide_money else float(pt_amount),
+                    "reimbursement": 0 if hide_money else float(reimbursement),
+                    "incentive": 0 if hide_money else float(incentive),
+                    "payableSalary": 0 if hide_money else float(slip.net or 0),
+                    "isConfidential": hide_money,
+                }
+            )
         return details
 
+
+class LoanInstallmentSerializer(serializers.ModelSerializer):
+    skipped_by_name = serializers.SerializerMethodField()
+    debited_in_run_period = serializers.CharField(
+        source="debited_in_run.period", default="", read_only=True
+    )
+    debited_in_payslip_number = serializers.CharField(
+        source="debited_in_payslip.payslip_number", default="", read_only=True
+    )
+
+    class Meta:
+        model = LoanInstallment
+        fields = "__all__"
+
+    def get_skipped_by_name(self, obj):
+        if obj.skipped_by:
+            return f"{obj.skipped_by.first_name} {obj.skipped_by.last_name}".strip()
+        return None
+
+
 class LoanSerializer(serializers.ModelSerializer):
+    installments_paid_count = serializers.IntegerField(read_only=True)
+    installments_remaining_count = serializers.IntegerField(read_only=True)
+    total_amount_paid = serializers.DecimalField(
+        max_digits=10, decimal_places=2, read_only=True
+    )
+    employee_name = serializers.SerializerMethodField()
+    employee_code = serializers.CharField(
+        source="employee.code", default="", read_only=True
+    )
+    department_name = serializers.CharField(
+        source="employee.department.name", default="", read_only=True
+    )
+    designation_title = serializers.CharField(
+        source="employee.designation.title", default="", read_only=True
+    )
+    pending_relief_request = serializers.SerializerMethodField()
+
     class Meta:
         model = Loan
-        fields = '__all__'
+        fields = "__all__"
+
+    def get_pending_relief_request(self, obj):
+        req = obj.relief_requests.filter(status="PENDING").first()
+        if req:
+            return {
+                "id": req.id,
+                "reason": req.reason,
+                "preferred_strategy": req.preferred_strategy,
+                "preferred_strategy_display": req.get_preferred_strategy_display(),
+                "created_at": req.created_at,
+                "installment_id": req.installment_id,
+                "installment_period": req.installment.period if req.installment else "",
+            }
+        return None
+
+    def get_employee_name(self, obj):
+        if obj.employee:
+            return f"{obj.employee.first_name} {obj.employee.last_name}".strip()
+        return ""
 
     def validate(self, data):
-        employee = data.get('employee')
-        
+        employee = data.get("employee")
+
         # If updating an existing loan, we might not need to run these creation validations
         # or we might need to be careful. Check if this is a creation.
         if self.instance is None and employee:
-            active_loans = Loan.objects.filter(employee=employee).exclude(status='Closed')
-            
+            active_loans = Loan.objects.filter(employee=employee).exclude(
+                status="Closed"
+            )
+
             if active_loans.count() >= 3:
-                raise serializers.ValidationError("professional limit reached and 3 loans")
-                
-            if active_loans.filter(status='Pending').exists():
-                raise serializers.ValidationError("You have a pending loan request that has not been approved yet. You cannot apply for another loan until it is approved.")
-                
+                raise serializers.ValidationError(
+                    "Professional limit reached: maximum of 3 concurrent loans allowed."
+                )
+
+            if active_loans.filter(status="Pending").exists():
+                raise serializers.ValidationError(
+                    "You have a pending loan request that has not been approved yet. You cannot apply for another loan until it is approved."
+                )
+
         return data
+
+
+class SalaryAdvanceInstallmentSerializer(serializers.ModelSerializer):
+    debited_in_run_period = serializers.CharField(
+        source="debited_in_run.period", default="", read_only=True
+    )
+    debited_in_payslip_number = serializers.CharField(
+        source="debited_in_payslip.payslip_number", default="", read_only=True
+    )
+    skipped_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SalaryAdvanceInstallment
+        fields = "__all__"
+
+    def get_skipped_by_name(self, obj):
+        if obj.skipped_by:
+            return f"{obj.skipped_by.first_name} {obj.skipped_by.last_name}".strip()
+        return None
+
+
+class SalaryAdvanceSerializer(serializers.ModelSerializer):
+    installments_recovered_count = serializers.IntegerField(read_only=True)
+    installments_pending_count = serializers.IntegerField(read_only=True)
+    total_amount_recovered = serializers.DecimalField(
+        max_digits=10, decimal_places=2, read_only=True
+    )
+    employee_name = serializers.SerializerMethodField()
+    employee_code = serializers.CharField(
+        source="employee.code", default="", read_only=True
+    )
+    department_name = serializers.CharField(
+        source="employee.department.name", default="", read_only=True
+    )
+    designation_title = serializers.CharField(
+        source="employee.designation.title", default="", read_only=True
+    )
+    approved_by_name = serializers.SerializerMethodField()
+    installments = SalaryAdvanceInstallmentSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = SalaryAdvance
+        fields = "__all__"
+
+    def get_employee_name(self, obj):
+        if obj.employee:
+            return f"{obj.employee.first_name} {obj.employee.last_name}".strip()
+        return ""
+
+    def get_approved_by_name(self, obj):
+        if obj.approved_by:
+            return f"{obj.approved_by.first_name} {obj.approved_by.last_name}".strip()
+        return ""
+
 
 class ReimbursementSerializer(serializers.ModelSerializer):
     class Meta:
         model = Reimbursement
-        fields = '__all__'
+        fields = "__all__"
+
 
 class ComplianceReportSerializer(serializers.ModelSerializer):
     class Meta:
         model = ComplianceReport
-        fields = '__all__'
+        fields = "__all__"
+
 
 from .models import Form16Document
+
 
 class Form16DocumentSerializer(serializers.ModelSerializer):
     employee_name = serializers.SerializerMethodField()
@@ -204,85 +365,119 @@ class Form16DocumentSerializer(serializers.ModelSerializer):
     designation_title = serializers.SerializerMethodField()
     branch_name = serializers.SerializerMethodField()
     uploaded_by_name = serializers.SerializerMethodField()
-    
+
     class Meta:
         model = Form16Document
-        fields = '__all__'
-        
+        fields = "__all__"
+
     def get_employee_name(self, obj):
         return f"{obj.employee.first_name} {obj.employee.last_name}"
-        
+
     def get_employee_code(self, obj):
         return obj.employee.code
-        
+
     def get_department_name(self, obj):
-        return obj.employee.department.name if getattr(obj.employee, 'department', None) else ""
-        
+        return (
+            obj.employee.department.name
+            if getattr(obj.employee, "department", None)
+            else ""
+        )
+
     def get_designation_title(self, obj):
-        return obj.employee.designation.title if getattr(obj.employee, 'designation', None) else ""
-        
+        return (
+            obj.employee.designation.title
+            if getattr(obj.employee, "designation", None)
+            else ""
+        )
+
     def get_branch_name(self, obj):
-        return obj.employee.branch.name if getattr(obj.employee, 'branch', None) else ""
-        
+        return obj.employee.branch.name if getattr(obj.employee, "branch", None) else ""
+
     def get_uploaded_by_name(self, obj):
         if obj.uploaded_by:
-            if hasattr(obj.uploaded_by, 'employee_profile') and obj.uploaded_by.employee_profile:
+            if (
+                hasattr(obj.uploaded_by, "employee_profile")
+                and obj.uploaded_by.employee_profile
+            ):
                 return f"{obj.uploaded_by.employee_profile.first_name} {obj.uploaded_by.employee_profile.last_name}"
             return obj.uploaded_by.username
         return ""
 
+
 from .models import (
-    CTCImportHistory, WalletPolicy, EmployeeWallet, WalletLedgerEntry,
-    DisciplinaryInfractionCategory, EmployeeDisciplinaryMemo
+    CTCImportHistory,
+    WalletPolicy,
+    EmployeeWallet,
+    WalletLedgerEntry,
+    DisciplinaryInfractionCategory,
+    EmployeeDisciplinaryMemo,
 )
+
 
 class CTCImportHistorySerializer(serializers.ModelSerializer):
     imported_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = CTCImportHistory
-        fields = '__all__'
-        
+        fields = "__all__"
+
     def get_imported_by_name(self, obj):
         if obj.imported_by:
-            if hasattr(obj.imported_by, 'employee_profile') and obj.imported_by.employee_profile:
+            if (
+                hasattr(obj.imported_by, "employee_profile")
+                and obj.imported_by.employee_profile
+            ):
                 return f"{obj.imported_by.employee_profile.first_name} {obj.imported_by.employee_profile.last_name}"
             return obj.imported_by.username
         return ""
 
 
 class WalletPolicySerializer(serializers.ModelSerializer):
-    site_name = serializers.CharField(source='site.name', read_only=True)
-    organization_name = serializers.CharField(source='organization.name', read_only=True)
+    site_name = serializers.CharField(source="site.name", read_only=True)
+    organization_name = serializers.CharField(
+        source="organization.name", read_only=True
+    )
 
     class Meta:
         model = WalletPolicy
-        fields = '__all__'
+        fields = "__all__"
 
 
 class WalletLedgerEntrySerializer(serializers.ModelSerializer):
     class Meta:
         model = WalletLedgerEntry
-        fields = '__all__'
+        fields = "__all__"
 
 
 class EmployeeWalletSerializer(serializers.ModelSerializer):
     employee_name = serializers.SerializerMethodField()
-    employee_code = serializers.CharField(source='employee.code', read_only=True)
+    employee_code = serializers.CharField(source="employee.code", read_only=True)
     department_name = serializers.SerializerMethodField()
     designation_title = serializers.SerializerMethodField()
     role_name = serializers.SerializerMethodField()
-    site_name = serializers.CharField(source='employee.site.name', read_only=True)
-    effective_ceiling = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    site_name = serializers.CharField(source="employee.site.name", read_only=True)
+    effective_ceiling = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True
+    )
     recent_transactions = serializers.SerializerMethodField()
 
     class Meta:
         model = EmployeeWallet
         fields = [
-            'id', 'employee', 'employee_name', 'employee_code',
-            'department_name', 'designation_title', 'role_name', 'site_name',
-            'is_active', 'current_balance', 'custom_target_ceiling',
-            'effective_ceiling', 'recent_transactions', 'updated_at'
+            "id",
+            "employee",
+            "employee_name",
+            "employee_code",
+            "department_name",
+            "designation_title",
+            "role_name",
+            "site_name",
+            "is_active",
+            "current_balance",
+            "custom_target_ceiling",
+            "effective_ceiling",
+            "recent_transactions",
+            "updated_at",
         ]
 
     def get_employee_name(self, obj):
@@ -302,7 +497,7 @@ class EmployeeWalletSerializer(serializers.ModelSerializer):
         if emp.designation and emp.designation.title:
             return emp.designation.title
         if emp.role:
-            return emp.role.replace('_', ' ').title()
+            return emp.role.replace("_", " ").title()
         return "—"
 
     def get_designation_title(self, obj):
@@ -317,59 +512,81 @@ class EmployeeWalletSerializer(serializers.ModelSerializer):
         emp = obj.employee
         if emp.department and emp.department.name:
             return emp.department.name
-        if emp.dynamic_role and emp.dynamic_role.department and emp.dynamic_role.department.name:
+        if (
+            emp.dynamic_role
+            and emp.dynamic_role.department
+            and emp.dynamic_role.department.name
+        ):
             return emp.dynamic_role.department.name
         return "—"
 
     def get_recent_transactions(self, obj):
-        txns = obj.transactions.all().order_by('-created_at')[:10]
+        txns = obj.transactions.all().order_by("-created_at")[:10]
         return WalletLedgerEntrySerializer(txns, many=True).data
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
         # Guarantee both camelCase and snake_case properties
-        ret['employeeName'] = ret.get('employee_name')
-        ret['employeeCode'] = ret.get('employee_code')
-        ret['roleName'] = ret.get('role_name')
-        ret['designationTitle'] = ret.get('designation_title')
-        ret['departmentName'] = ret.get('department_name')
-        ret['siteName'] = ret.get('site_name')
-        ret['isActive'] = ret.get('is_active')
-        ret['currentBalance'] = ret.get('current_balance')
-        ret['customTargetCeiling'] = ret.get('custom_target_ceiling')
-        ret['effectiveCeiling'] = ret.get('effective_ceiling')
+        ret["employeeName"] = ret.get("employee_name")
+        ret["employeeCode"] = ret.get("employee_code")
+        ret["roleName"] = ret.get("role_name")
+        ret["designationTitle"] = ret.get("designation_title")
+        ret["departmentName"] = ret.get("department_name")
+        ret["siteName"] = ret.get("site_name")
+        ret["isActive"] = ret.get("is_active")
+        ret["currentBalance"] = ret.get("current_balance")
+        ret["customTargetCeiling"] = ret.get("custom_target_ceiling")
+        ret["effectiveCeiling"] = ret.get("effective_ceiling")
         return ret
 
 
 class DisciplinaryInfractionCategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = DisciplinaryInfractionCategory
-        fields = '__all__'
+        fields = "__all__"
 
 
 class EmployeeDisciplinaryMemoSerializer(serializers.ModelSerializer):
     employee_name = serializers.SerializerMethodField()
-    employee_code = serializers.CharField(source='employee.code', read_only=True)
+    employee_code = serializers.CharField(source="employee.code", read_only=True)
     department_name = serializers.SerializerMethodField()
     designation_title = serializers.SerializerMethodField()
     role_name = serializers.SerializerMethodField()
-    site_id = serializers.IntegerField(source='employee.site.id', read_only=True)
-    site_name = serializers.CharField(source='employee.site.name', read_only=True)
+    site_id = serializers.IntegerField(source="employee.site.id", read_only=True)
+    site_name = serializers.CharField(source="employee.site.name", read_only=True)
     issuer_name = serializers.SerializerMethodField()
-    category_name = serializers.CharField(source='category.name', read_only=True)
-    payroll_period = serializers.CharField(source='payroll_run.period', read_only=True)
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    payroll_period = serializers.CharField(source="payroll_run.period", read_only=True)
 
     class Meta:
         model = EmployeeDisciplinaryMemo
         fields = [
-            'id', 'employee', 'employee_name', 'employee_code',
-            'department_name', 'designation_title', 'role_name',
-            'site_id', 'site_name', 'issued_by', 'issuer_name',
-            'category', 'category_name', 'is_custom_reason',
-            'infraction_reason', 'description', 'amount',
-            'incident_date', 'status', 'is_active',
-            'payroll_run', 'payroll_period', 'payslip',
-            'deducted_at', 'created_at', 'updated_at'
+            "id",
+            "employee",
+            "employee_name",
+            "employee_code",
+            "department_name",
+            "designation_title",
+            "role_name",
+            "site_id",
+            "site_name",
+            "issued_by",
+            "issuer_name",
+            "category",
+            "category_name",
+            "is_custom_reason",
+            "infraction_reason",
+            "description",
+            "amount",
+            "incident_date",
+            "status",
+            "is_active",
+            "payroll_run",
+            "payroll_period",
+            "payslip",
+            "deducted_at",
+            "created_at",
+            "updated_at",
         ]
 
     def get_employee_name(self, obj):
@@ -401,7 +618,7 @@ class EmployeeDisciplinaryMemoSerializer(serializers.ModelSerializer):
         if emp.designation and emp.designation.title:
             return emp.designation.title
         if emp.role:
-            return emp.role.replace('_', ' ').title()
+            return emp.role.replace("_", " ").title()
         return "—"
 
     def get_designation_title(self, obj):
@@ -416,28 +633,57 @@ class EmployeeDisciplinaryMemoSerializer(serializers.ModelSerializer):
         emp = obj.employee
         if emp.department and emp.department.name:
             return emp.department.name
-        if emp.dynamic_role and emp.dynamic_role.department and emp.dynamic_role.department.name:
+        if (
+            emp.dynamic_role
+            and emp.dynamic_role.department
+            and emp.dynamic_role.department.name
+        ):
             return emp.dynamic_role.department.name
         return "—"
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
         # Guarantee both camelCase and snake_case properties
-        ret['employeeName'] = ret.get('employee_name')
-        ret['employeeCode'] = ret.get('employee_code')
-        ret['roleName'] = ret.get('role_name')
-        ret['designationTitle'] = ret.get('designation_title')
-        ret['departmentName'] = ret.get('department_name')
-        ret['siteId'] = ret.get('site_id')
-        ret['siteName'] = ret.get('site_name')
-        ret['issuerName'] = ret.get('issuer_name')
-        ret['categoryName'] = ret.get('category_name')
-        ret['isCustomReason'] = ret.get('is_custom_reason')
-        ret['infractionReason'] = ret.get('infraction_reason')
-        ret['incidentDate'] = ret.get('incident_date')
-        ret['isActive'] = ret.get('is_active')
-        ret['payrollPeriod'] = ret.get('payroll_period')
-        ret['deductedAt'] = ret.get('deducted_at')
-        ret['createdAt'] = ret.get('created_at')
+        ret["employeeName"] = ret.get("employee_name")
+        ret["employeeCode"] = ret.get("employee_code")
+        ret["roleName"] = ret.get("role_name")
+        ret["designationTitle"] = ret.get("designation_title")
+        ret["departmentName"] = ret.get("department_name")
+        ret["siteId"] = ret.get("site_id")
+        ret["siteName"] = ret.get("site_name")
+        ret["issuerName"] = ret.get("issuer_name")
+        ret["categoryName"] = ret.get("category_name")
+        ret["isCustomReason"] = ret.get("is_custom_reason")
+        ret["infractionReason"] = ret.get("infraction_reason")
+        ret["incidentDate"] = ret.get("incident_date")
+        ret["isActive"] = ret.get("is_active")
+        ret["payrollPeriod"] = ret.get("payroll_period")
+        ret["deductedAt"] = ret.get("deducted_at")
+        ret["createdAt"] = ret.get("created_at")
         return ret
 
+
+class EmiReliefRequestSerializer(serializers.ModelSerializer):
+    employee_name = serializers.SerializerMethodField()
+    employee_code = serializers.CharField(source="employee.code", default="", read_only=True)
+    loan_type = serializers.CharField(source="loan.type", default="", read_only=True)
+    loan_amount = serializers.DecimalField(source="loan.amount", max_digits=10, decimal_places=2, read_only=True)
+    loan_outstanding = serializers.DecimalField(source="loan.outstanding", max_digits=10, decimal_places=2, read_only=True)
+    emi_amount = serializers.DecimalField(source="loan.emi", max_digits=10, decimal_places=2, read_only=True)
+    installment_period = serializers.CharField(source="installment.period", default="", read_only=True)
+    installment_number = serializers.IntegerField(source="installment.installment_number", default=0, read_only=True)
+    decided_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = EmiReliefRequest
+        fields = "__all__"
+
+    def get_employee_name(self, obj):
+        if obj.employee:
+            return f"{obj.employee.first_name} {obj.employee.last_name}".strip()
+        return ""
+
+    def get_decided_by_name(self, obj):
+        if obj.decided_by:
+            return f"{obj.decided_by.first_name} {obj.decided_by.last_name}".strip()
+        return ""
