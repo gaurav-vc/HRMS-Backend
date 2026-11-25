@@ -8,49 +8,107 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('attendance', '0015_dailyattendance_is_split_shift_and_more'),
-        ('employees', '0030_employee_tds_applicable_and_more'),
-        ('organisation', '0024_attendancepolicy_entity_and_more'),
+        ("attendance", "0015_dailyattendance_is_split_shift_and_more"),
+        ("employees", "0030_employee_tds_applicable_and_more"),
+        ("organisation", "0024_attendancepolicy_entity_and_more"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='dailyattendance',
-            name='approved_at',
+            model_name="dailyattendance",
+            name="approved_at",
             field=models.DateTimeField(blank=True, null=True),
         ),
         migrations.AddField(
-            model_name='dailyattendance',
-            name='approved_by',
-            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='approved_daily_attendances', to='employees.employee'),
+            model_name="dailyattendance",
+            name="approved_by",
+            field=models.ForeignKey(
+                blank=True,
+                null=True,
+                on_delete=django.db.models.deletion.SET_NULL,
+                related_name="approved_daily_attendances",
+                to="employees.employee",
+            ),
         ),
         migrations.AddField(
-            model_name='dailyattendance',
-            name='is_approved',
+            model_name="dailyattendance",
+            name="is_approved",
             field=models.BooleanField(db_index=True, default=False),
         ),
         migrations.CreateModel(
-            name='AttendancePeriodVerification',
+            name="AttendancePeriodVerification",
             fields=[
-                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
-                ('period', models.CharField(db_index=True, help_text='YYYY-MM', max_length=7)),
-                ('status', models.CharField(choices=[('Pending', 'Pending'), ('Verified', 'Verified'), ('Rejected', 'Rejected')], default='Pending', max_length=20)),
-                ('verified_at', models.DateTimeField(blank=True, null=True)),
-                ('remarks', models.TextField(help_text='Mandatory remarks for attendance verification')),
-                ('total_employees', models.IntegerField(default=0)),
-                ('total_attendance_days', models.IntegerField(default=0)),
-                ('approved_days', models.IntegerField(default=0)),
-                ('pending_regularizations', models.IntegerField(default=0)),
-                ('created_at', models.DateTimeField(auto_now_add=True)),
-                ('updated_at', models.DateTimeField(auto_now=True)),
-                ('entity', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='attendance_verifications', to='organisation.entity')),
-                ('site', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='attendance_verifications', to='organisation.site')),
-                ('verified_by', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='attendance_verifications', to=settings.AUTH_USER_MODEL)),
+                (
+                    "id",
+                    models.BigAutoField(
+                        auto_created=True,
+                        primary_key=True,
+                        serialize=False,
+                        verbose_name="ID",
+                    ),
+                ),
+                (
+                    "period",
+                    models.CharField(db_index=True, help_text="YYYY-MM", max_length=7),
+                ),
+                (
+                    "status",
+                    models.CharField(
+                        choices=[
+                            ("Pending", "Pending"),
+                            ("Verified", "Verified"),
+                            ("Rejected", "Rejected"),
+                        ],
+                        default="Pending",
+                        max_length=20,
+                    ),
+                ),
+                ("verified_at", models.DateTimeField(blank=True, null=True)),
+                (
+                    "remarks",
+                    models.TextField(
+                        help_text="Mandatory remarks for attendance verification"
+                    ),
+                ),
+                ("total_employees", models.IntegerField(default=0)),
+                ("total_attendance_days", models.IntegerField(default=0)),
+                ("approved_days", models.IntegerField(default=0)),
+                ("pending_regularizations", models.IntegerField(default=0)),
+                ("created_at", models.DateTimeField(auto_now_add=True)),
+                ("updated_at", models.DateTimeField(auto_now=True)),
+                (
+                    "entity",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name="attendance_verifications",
+                        to="organisation.entity",
+                    ),
+                ),
+                (
+                    "site",
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.SET_NULL,
+                        related_name="attendance_verifications",
+                        to="organisation.site",
+                    ),
+                ),
+                (
+                    "verified_by",
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.SET_NULL,
+                        related_name="attendance_verifications",
+                        to=settings.AUTH_USER_MODEL,
+                    ),
+                ),
             ],
             options={
-                'ordering': ['-period', '-created_at'],
-                'unique_together': {('period', 'entity')},
+                "ordering": ["-period", "-created_at"],
+                "unique_together": {("period", "entity")},
             },
         ),
     ]

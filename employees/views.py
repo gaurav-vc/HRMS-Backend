@@ -838,6 +838,7 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
                         from leaves.models import LeaveType, LeaveBalance
                         from datetime import date
                         from decimal import Decimal
+
                         current_year = date.today().year
                         for lt in LeaveType.objects.filter(active=True):
                             ent = lt.annual_entitlement or Decimal("0.00")
@@ -1460,6 +1461,7 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         if old_status == "Draft" and new_status == "Active" and not emp.user:
             email = emp.email
             from django.contrib.auth.models import User
+
             if email and not User.objects.filter(username=email).exists():
                 import secrets
                 import string
@@ -1726,11 +1728,11 @@ Regards,
         else:
             send_email = bool(send_email_val)
 
-        send_sms_val = request.data.get('send_sms')
+        send_sms_val = request.data.get("send_sms")
         if send_sms_val is None:
-            send_sms_val = request.data.get('sendSms', True)
+            send_sms_val = request.data.get("sendSms", True)
         if isinstance(send_sms_val, str):
-            send_sms = send_sms_val.lower() in ('true', '1')
+            send_sms = send_sms_val.lower() in ("true", "1")
         else:
             send_sms = bool(send_sms_val)
 
@@ -1744,6 +1746,7 @@ Regards,
             new_password = "".join(secrets.choice(alphabet) for _ in range(12))
 
         from django.contrib.auth.models import User
+
         user = target_employee.user
         target_email = target_employee.email or (user.email if user else None)
         if not target_email and user and "@" in user.username:
@@ -1848,13 +1851,15 @@ HR Operations
                 print(f"Failed to start password email thread: {e}")
 
         sms_sent = False
-        target_phone = target_employee.phone or ''
+        target_phone = target_employee.phone or ""
         if send_sms and target_phone:
             import threading
             from core.jio_sms import JioSMSService
-            origin = request.headers.get('Origin') or request.build_absolute_uri('/')
-            login_url = origin.rstrip('/') + '/auth'
+
+            origin = request.headers.get("Origin") or request.build_absolute_uri("/")
+            login_url = origin.rstrip("/") + "/auth"
             login_id = target_email or target_employee.code or target_phone
+
             def _send_sms():
                 try:
                     JioSMSService.send_credentials_sms(
@@ -1862,32 +1867,43 @@ HR Operations
                         first_name=target_employee.first_name,
                         login_id=login_id,
                         password=new_password,
-                        login_url=login_url
+                        login_url=login_url,
                     )
                 except Exception as err:
                     print(f"[Password Reset SMS Error] {err}")
+
             threading.Thread(target=_send_sms, daemon=True).start()
             sms_sent = True
-                
+
         status_msg_parts = []
         if email_sent:
             status_msg_parts.append(f"email to {target_email}")
         if sms_sent:
             status_msg_parts.append(f"SMS to {target_phone}")
-        status_msg = f"Credentials sent via {', '.join(status_msg_parts)}." if status_msg_parts else "Password updated successfully."
+        status_msg = (
+            f"Credentials sent via {', '.join(status_msg_parts)}."
+            if status_msg_parts
+            else "Password updated successfully."
+        )
 
-        return Response({
-            "success": True,
-            "email_sent": email_sent,
-            "emailSent": email_sent,
-            "sms_sent": sms_sent,
-            "smsSent": sms_sent,
-            "recipient": target_email,
-            "recipient_phone": target_phone,
-            "generated_password": new_password if password_mode != 'custom' else None,
-            "generatedPassword": new_password if password_mode != 'custom' else None,
-            "message": status_msg
-        })
+        return Response(
+            {
+                "success": True,
+                "email_sent": email_sent,
+                "emailSent": email_sent,
+                "sms_sent": sms_sent,
+                "smsSent": sms_sent,
+                "recipient": target_email,
+                "recipient_phone": target_phone,
+                "generated_password": (
+                    new_password if password_mode != "custom" else None
+                ),
+                "generatedPassword": (
+                    new_password if password_mode != "custom" else None
+                ),
+                "message": status_msg,
+            }
+        )
 
     @action(detail=True, methods=["get"], url_path="salary-revisions")
     def salary_revisions(self, request, pk=None):
@@ -1895,7 +1911,9 @@ HR Operations
         from .models import CompensationHistory
         from .serializers import CompensationHistorySerializer
 
-        revisions = CompensationHistory.objects.filter(employee=employee).order_by("-effective_from", "-created_at")
+        revisions = CompensationHistory.objects.filter(employee=employee).order_by(
+            "-effective_from", "-created_at"
+        )
         serializer = CompensationHistorySerializer(revisions, many=True)
         return Response(serializer.data)
 
@@ -1911,15 +1929,23 @@ HR Operations
         from payroll.models import SalaryStructure
         from authentication.permissions import is_ceo_user
 
-        if not (request.user.is_superuser or is_ceo_user(request.user) or request.user.has_perm("employees.change_employee")):
+        if not (
+            request.user.is_superuser
+            or is_ceo_user(request.user)
+            or request.user.has_perm("employees.change_employee")
+        ):
             return Response(
-                {"error": "Permission denied: Only authorized administrators or executives can revise compensation."},
+                {
+                    "error": "Permission denied: Only authorized administrators or executives can revise compensation."
+                },
                 status=403,
             )
 
         new_ctc = request.data.get("new_ctc")
         if not new_ctc or int(new_ctc) <= 0:
-            return Response({"error": "A valid positive new CTC amount is required."}, status=400)
+            return Response(
+                {"error": "A valid positive new CTC amount is required."}, status=400
+            )
         new_ctc = int(new_ctc)
 
         effective_from_str = request.data.get("effective_from")
@@ -1927,9 +1953,14 @@ HR Operations
             return Response({"error": "Effective from date is required."}, status=400)
 
         try:
-            effective_from = datetime.datetime.strptime(effective_from_str, "%Y-%m-%d").date()
+            effective_from = datetime.datetime.strptime(
+                effective_from_str, "%Y-%m-%d"
+            ).date()
         except ValueError:
-            return Response({"error": "Invalid date format for effective_from. Use YYYY-MM-DD."}, status=400)
+            return Response(
+                {"error": "Invalid date format for effective_from. Use YYYY-MM-DD."},
+                status=400,
+            )
 
         revision_type = request.data.get("revision_type", "Annual Appraisal")
         reason = request.data.get("reason", "")
@@ -1940,18 +1971,32 @@ HR Operations
         if structure_id:
             target_structure = SalaryStructure.objects.filter(id=structure_id).first()
         if not target_structure:
-            target_structure = employee.salary_structure or SalaryStructure.objects.filter(status="Active").first()
+            target_structure = (
+                employee.salary_structure
+                or SalaryStructure.objects.filter(status="Active").first()
+            )
 
         if not target_structure:
-            return Response({"error": "No valid salary structure found to attach to this revision."}, status=400)
+            return Response(
+                {
+                    "error": "No valid salary structure found to attach to this revision."
+                },
+                status=400,
+            )
 
         with transaction.atomic():
             old_ctc = int(employee.ctc or 0)
             hike_pct = Decimal("0.00")
             if old_ctc > 0:
-                hike_pct = ((Decimal(str(new_ctc)) - Decimal(str(old_ctc))) / Decimal(str(old_ctc)) * Decimal("100.0")).quantize(Decimal("0.01"))
+                hike_pct = (
+                    (Decimal(str(new_ctc)) - Decimal(str(old_ctc)))
+                    / Decimal(str(old_ctc))
+                    * Decimal("100.0")
+                ).quantize(Decimal("0.01"))
 
-            prev_active = CompensationHistory.objects.filter(employee=employee, effective_to__isnull=True).first()
+            prev_active = CompensationHistory.objects.filter(
+                employee=employee, effective_to__isnull=True
+            ).first()
             if prev_active:
                 prev_active.effective_to = effective_from - datetime.timedelta(days=1)
                 prev_active.save(update_fields=["effective_to"])
@@ -1978,22 +2023,30 @@ HR Operations
             first_day_current_month = today.replace(day=1)
             is_retroactive = effective_from < first_day_current_month
 
-            return Response({
-                "message": "Salary revision recorded successfully.",
-                "revision": CompensationHistorySerializer(new_record).data,
-                "is_retroactive": is_retroactive,
-                "retro_notice": f"Backdated hike from {effective_from}. Arrears will be calculated in the next payroll run." if is_retroactive else None,
-                "employee": {
-                    "id": employee.id,
-                    "code": employee.code,
-                    "name": f"{employee.first_name} {employee.last_name}",
-                    "current_ctc": employee.ctc,
-                    "salary_structure_id": target_structure.id,
-                    "salary_structure_name": target_structure.name,
-                },
-            })
+            return Response(
+                {
+                    "message": "Salary revision recorded successfully.",
+                    "revision": CompensationHistorySerializer(new_record).data,
+                    "is_retroactive": is_retroactive,
+                    "retro_notice": (
+                        f"Backdated hike from {effective_from}. Arrears will be calculated in the next payroll run."
+                        if is_retroactive
+                        else None
+                    ),
+                    "employee": {
+                        "id": employee.id,
+                        "code": employee.code,
+                        "name": f"{employee.first_name} {employee.last_name}",
+                        "current_ctc": employee.ctc,
+                        "salary_structure_id": target_structure.id,
+                        "salary_structure_name": target_structure.name,
+                    },
+                }
+            )
 
-    @action(detail=True, methods=["patch", "put", "post"], url_path="update-profile-details")
+    @action(
+        detail=True, methods=["patch", "put", "post"], url_path="update-profile-details"
+    )
     def update_profile_details(self, request, pk=None):
         """
         Allows an employee to edit their bank, statutory, and related details.
@@ -2003,17 +2056,19 @@ HR Operations
         employee = self.get_object()
         user = request.user
         current_emp = getattr(user, "employee_profile", None)
-        
-        is_admin_or_super = (
-            user.is_superuser
-            or (current_emp and current_emp.role in ["super_admin", "org_admin", "admin", "site_admin"])
+
+        is_admin_or_super = user.is_superuser or (
+            current_emp
+            and current_emp.role in ["super_admin", "org_admin", "admin", "site_admin"]
         )
-        
+
         # If not admin/super, enforce ownership and lock check
         if not is_admin_or_super:
             if current_emp and current_emp.id != employee.id:
                 return Response(
-                    {"error": "You do not have permission to edit another employee's profile details."},
+                    {
+                        "error": "You do not have permission to edit another employee's profile details."
+                    },
                     status=403,
                 )
             if not employee.profile_edit_unlocked:
@@ -2025,29 +2080,38 @@ HR Operations
                     },
                     status=400,
                 )
-        
+
         data = request.data
         allowed_fields = [
-            "bank_name", "bank_account", "ifsc",
-            "pan", "aadhaar", "uan", "esi",
-            "phone", "emergency_contact", "present_address", "permanent_address"
+            "bank_name",
+            "bank_account",
+            "ifsc",
+            "pan",
+            "aadhaar",
+            "uan",
+            "esi",
+            "phone",
+            "emergency_contact",
+            "present_address",
+            "permanent_address",
         ]
-        
+
         for f in allowed_fields:
             if f in data:
                 setattr(employee, f, data[f])
-                
+
         # Lock profile if regular employee
         if not is_admin_or_super:
             employee.profile_edit_unlocked = False
             employee.profile_edit_count += 1
             employee.profile_unlock_requested = False
             employee.profile_unlock_reason = None
-            
+
         employee.save()
-        
+
         # Audit & notifications
         from .models import Notification
+
         manager = employee.manager
         if manager and manager != employee:
             Notification.objects.create(
@@ -2057,7 +2121,7 @@ HR Operations
                 notification_type="PROFILE_UPDATED",
                 related_employee_id=employee.id,
             )
-            
+
         Notification.objects.create(
             recipient=employee,
             title="Profile Details Saved & Locked",
@@ -2065,13 +2129,15 @@ HR Operations
             notification_type="PROFILE_LOCKED",
             related_employee_id=employee.id,
         )
-        
-        return Response({
-            "message": "Profile details updated and locked successfully.",
-            "profile_edit_unlocked": employee.profile_edit_unlocked,
-            "profile_edit_count": employee.profile_edit_count,
-            "employee": EmployeeSerializer(employee).data,
-        })
+
+        return Response(
+            {
+                "message": "Profile details updated and locked successfully.",
+                "profile_edit_unlocked": employee.profile_edit_unlocked,
+                "profile_edit_count": employee.profile_edit_count,
+                "employee": EmployeeSerializer(employee).data,
+            }
+        )
 
     @action(detail=True, methods=["post"], url_path="request-profile-unlock")
     def request_profile_unlock(self, request, pk=None):
@@ -2082,28 +2148,46 @@ HR Operations
         employee = self.get_object()
         user = request.user
         current_emp = getattr(user, "employee_profile", None)
-        
+
         if current_emp and current_emp.id != employee.id and not user.is_superuser:
-            return Response({"error": "You can only request unlock for your own profile."}, status=403)
-            
-        reason = request.data.get("reason", "").strip() or "Employee requested permission to update bank/statutory details or upload documents."
-        
+            return Response(
+                {"error": "You can only request unlock for your own profile."},
+                status=403,
+            )
+
+        reason = (
+            request.data.get("reason", "").strip()
+            or "Employee requested permission to update bank/statutory details or upload documents."
+        )
+
         from django.utils import timezone
         from .models import Notification
-        
+
         employee.profile_unlock_requested = True
         employee.profile_unlock_requested_at = timezone.now()
         employee.profile_unlock_reason = reason
-        employee.save(update_fields=["profile_unlock_requested", "profile_unlock_requested_at", "profile_unlock_reason"])
-        
+        employee.save(
+            update_fields=[
+                "profile_unlock_requested",
+                "profile_unlock_requested_at",
+                "profile_unlock_reason",
+            ]
+        )
+
         # Determine manager to notify
         manager = employee.manager
         if not manager:
             # Fallback to site admin or any admin
-            manager = Employee.objects.filter(site=employee.site, role__in=["site_admin", "admin"]).first()
+            manager = Employee.objects.filter(
+                site=employee.site, role__in=["site_admin", "admin"]
+            ).first()
         if not manager:
-            manager = Employee.objects.filter(role__in=["admin", "super_admin"]).exclude(id=employee.id).first()
-            
+            manager = (
+                Employee.objects.filter(role__in=["admin", "super_admin"])
+                .exclude(id=employee.id)
+                .first()
+            )
+
         if manager:
             Notification.objects.create(
                 recipient=manager,
@@ -2112,7 +2196,7 @@ HR Operations
                 notification_type="PROFILE_UNLOCK_REQUEST",
                 related_employee_id=employee.id,
             )
-            
+
         Notification.objects.create(
             recipient=employee,
             title="Profile Unlock Request Sent",
@@ -2120,12 +2204,16 @@ HR Operations
             notification_type="PROFILE_UNLOCK_PENDING",
             related_employee_id=employee.id,
         )
-        
-        return Response({
-            "message": "Profile unlock request submitted to your manager.",
-            "profile_unlock_requested": True,
-            "manager_name": f"{manager.first_name} {manager.last_name}" if manager else None,
-        })
+
+        return Response(
+            {
+                "message": "Profile unlock request submitted to your manager.",
+                "profile_unlock_requested": True,
+                "manager_name": (
+                    f"{manager.first_name} {manager.last_name}" if manager else None
+                ),
+            }
+        )
 
     @action(detail=True, methods=["post"], url_path="approve-profile-unlock")
     def approve_profile_unlock(self, request, pk=None):
@@ -2135,20 +2223,34 @@ HR Operations
         employee = self.get_object()
         user = request.user
         current_emp = getattr(user, "employee_profile", None)
-        
+
         is_manager = current_emp and (employee.manager_id == current_emp.id)
-        is_admin_or_super = user.is_superuser or (current_emp and current_emp.role in ["super_admin", "org_admin", "admin", "site_admin"])
-        
+        is_admin_or_super = user.is_superuser or (
+            current_emp
+            and current_emp.role in ["super_admin", "org_admin", "admin", "site_admin"]
+        )
+
         if not (is_manager or is_admin_or_super):
-            return Response({"error": "Only the reporting manager or administrator can approve profile unlocks."}, status=403)
-            
+            return Response(
+                {
+                    "error": "Only the reporting manager or administrator can approve profile unlocks."
+                },
+                status=403,
+            )
+
         from .models import Notification
-        
+
         employee.profile_edit_unlocked = True
         employee.profile_unlock_requested = False
         employee.profile_unlock_reason = None
-        employee.save(update_fields=["profile_edit_unlocked", "profile_unlock_requested", "profile_unlock_reason"])
-        
+        employee.save(
+            update_fields=[
+                "profile_edit_unlocked",
+                "profile_unlock_requested",
+                "profile_unlock_reason",
+            ]
+        )
+
         # Mark manager's notification as read
         if current_emp:
             Notification.objects.filter(
@@ -2156,7 +2258,7 @@ HR Operations
                 related_employee_id=employee.id,
                 notification_type="PROFILE_UNLOCK_REQUEST",
             ).update(is_read=True)
-            
+
         # Notify employee
         Notification.objects.create(
             recipient=employee,
@@ -2165,12 +2267,14 @@ HR Operations
             notification_type="PROFILE_UNLOCKED",
             related_employee_id=employee.id,
         )
-        
-        return Response({
-            "message": f"Profile unlocked successfully for {employee.first_name} {employee.last_name}.",
-            "profile_edit_unlocked": True,
-            "profile_unlock_requested": False,
-        })
+
+        return Response(
+            {
+                "message": f"Profile unlocked successfully for {employee.first_name} {employee.last_name}.",
+                "profile_edit_unlocked": True,
+                "profile_unlock_requested": False,
+            }
+        )
 
     @action(detail=True, methods=["post"], url_path="reject-profile-unlock")
     def reject_profile_unlock(self, request, pk=None):
@@ -2180,20 +2284,33 @@ HR Operations
         employee = self.get_object()
         user = request.user
         current_emp = getattr(user, "employee_profile", None)
-        
+
         is_manager = current_emp and (employee.manager_id == current_emp.id)
-        is_admin_or_super = user.is_superuser or (current_emp and current_emp.role in ["super_admin", "org_admin", "admin", "site_admin"])
-        
+        is_admin_or_super = user.is_superuser or (
+            current_emp
+            and current_emp.role in ["super_admin", "org_admin", "admin", "site_admin"]
+        )
+
         if not (is_manager or is_admin_or_super):
-            return Response({"error": "Only the reporting manager or administrator can reject profile unlocks."}, status=403)
-            
-        reason = request.data.get("reason", "").strip() or "Manager did not approve edit request."
+            return Response(
+                {
+                    "error": "Only the reporting manager or administrator can reject profile unlocks."
+                },
+                status=403,
+            )
+
+        reason = (
+            request.data.get("reason", "").strip()
+            or "Manager did not approve edit request."
+        )
         from .models import Notification
-        
+
         employee.profile_unlock_requested = False
         employee.profile_unlock_reason = None
-        employee.save(update_fields=["profile_unlock_requested", "profile_unlock_reason"])
-        
+        employee.save(
+            update_fields=["profile_unlock_requested", "profile_unlock_reason"]
+        )
+
         # Mark manager's notification as read
         if current_emp:
             Notification.objects.filter(
@@ -2201,7 +2318,7 @@ HR Operations
                 related_employee_id=employee.id,
                 notification_type="PROFILE_UNLOCK_REQUEST",
             ).update(is_read=True)
-            
+
         # Notify employee
         Notification.objects.create(
             recipient=employee,
@@ -2210,11 +2327,13 @@ HR Operations
             notification_type="PROFILE_UNLOCK_REJECTED",
             related_employee_id=employee.id,
         )
-        
-        return Response({
-            "message": f"Profile unlock request rejected for {employee.first_name} {employee.last_name}.",
-            "profile_unlock_requested": False,
-        })
+
+        return Response(
+            {
+                "message": f"Profile unlock request rejected for {employee.first_name} {employee.last_name}.",
+                "profile_unlock_requested": False,
+            }
+        )
 
 
 from .models import EmployeeDocument, EmployeeTransfer, EmployeeExit
@@ -2246,14 +2365,23 @@ class EmployeeDocumentViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         user = request.user
         emp_id = request.data.get("employee")
         current_emp = getattr(user, "employee_profile", None)
-        
+
         # If user is a normal employee (not admin/super_admin)
-        if current_emp and current_emp.role not in ["super_admin", "org_admin", "admin", "site_admin"] and not user.is_superuser:
-            target_emp = Employee.objects.filter(id=emp_id).first() if emp_id else current_emp
+        if (
+            current_emp
+            and current_emp.role
+            not in ["super_admin", "org_admin", "admin", "site_admin"]
+            and not user.is_superuser
+        ):
+            target_emp = (
+                Employee.objects.filter(id=emp_id).first() if emp_id else current_emp
+            )
             if target_emp and not target_emp.profile_edit_unlocked:
                 return Response(
-                    {"detail": "Document uploading is locked. Please request manager approval to upload new documents."},
-                    status=status.HTTP_403_FORBIDDEN
+                    {
+                        "detail": "Document uploading is locked. Please request manager approval to upload new documents."
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
                 )
         return super().create(request, *args, **kwargs)
 
@@ -2261,11 +2389,18 @@ class EmployeeDocumentViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         user = request.user
         current_emp = getattr(user, "employee_profile", None)
         doc = self.get_object()
-        if current_emp and current_emp.role not in ["super_admin", "org_admin", "admin", "site_admin"] and not user.is_superuser:
+        if (
+            current_emp
+            and current_emp.role
+            not in ["super_admin", "org_admin", "admin", "site_admin"]
+            and not user.is_superuser
+        ):
             if doc.employee and not doc.employee.profile_edit_unlocked:
                 return Response(
-                    {"detail": "Document modification is locked. Please request manager approval."},
-                    status=status.HTTP_403_FORBIDDEN
+                    {
+                        "detail": "Document modification is locked. Please request manager approval."
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
                 )
         return super().destroy(request, *args, **kwargs)
 
@@ -2351,6 +2486,7 @@ class EmployeeExitViewSet(DataIsolationMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="clearance")
     def update_clearance(self, request, pk=None):
         from django.utils import timezone
+
         exit_process = self.get_object()
         department = request.data.get("department")  # "manager", "it", "finance", "hr"
         cleared = request.data.get("cleared", True)
@@ -2407,23 +2543,33 @@ class EmployeeExitViewSet(DataIsolationMixin, viewsets.ModelViewSet):
 
         lwd = exit_process.last_working_day
         worked_days = lwd.day if lwd else 0
-        unpaid_salary = (daily_rate * Decimal(str(worked_days))).quantize(Decimal("0.01"))
+        unpaid_salary = (daily_rate * Decimal(str(worked_days))).quantize(
+            Decimal("0.01")
+        )
 
         active_loans = Loan.objects.filter(employee=emp, status="Active")
         outstanding_loan = sum((l.outstanding for l in active_loans), Decimal("0.00"))
 
         active_advances = SalaryAdvance.objects.filter(employee=emp, status="Disbursed")
-        outstanding_advance = sum((a.outstanding for a in active_advances), Decimal("0.00"))
+        outstanding_advance = sum(
+            (a.outstanding for a in active_advances), Decimal("0.00")
+        )
 
         resignation_date = exit_process.resignation_date
         actual_notice_days = (
-            (lwd - resignation_date).days if (lwd and resignation_date) else exit_process.notice_period_days
+            (lwd - resignation_date).days
+            if (lwd and resignation_date)
+            else exit_process.notice_period_days
         )
         shortfall_days = max(0, exit_process.notice_period_days - actual_notice_days)
-        shortfall_deduction = (daily_rate * Decimal(str(shortfall_days))).quantize(Decimal("0.01"))
+        shortfall_deduction = (daily_rate * Decimal(str(shortfall_days))).quantize(
+            Decimal("0.01")
+        )
 
         total_earnings = unpaid_salary
-        total_deductions = (outstanding_loan + outstanding_advance + shortfall_deduction).quantize(Decimal("0.01"))
+        total_deductions = (
+            outstanding_loan + outstanding_advance + shortfall_deduction
+        ).quantize(Decimal("0.01"))
         net_payable = (total_earnings - total_deductions).quantize(Decimal("0.01"))
 
         calculated_statement = {
@@ -2447,17 +2593,21 @@ class EmployeeExitViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         }
 
         if request.method == "GET":
-            return Response({
-                "exit_id": exit_process.id,
-                "fnf_status": exit_process.fnf_status,
-                "fnf_statement": exit_process.fnf_statement or calculated_statement,
-                "preview": calculated_statement,
-            })
+            return Response(
+                {
+                    "exit_id": exit_process.id,
+                    "fnf_status": exit_process.fnf_status,
+                    "fnf_statement": exit_process.fnf_statement or calculated_statement,
+                    "preview": calculated_statement,
+                }
+            )
 
         waive_shortfall = request.data.get("waive_shortfall", False)
         remarks = request.data.get("remarks", "")
         if waive_shortfall:
-            total_deductions = (outstanding_loan + outstanding_advance).quantize(Decimal("0.01"))
+            total_deductions = (outstanding_loan + outstanding_advance).quantize(
+                Decimal("0.01")
+            )
             net_payable = (total_earnings - total_deductions).quantize(Decimal("0.01"))
             calculated_statement["shortfall_days"] = 0
             calculated_statement["shortfall_deduction"] = 0.0
@@ -2490,11 +2640,13 @@ class EmployeeExitViewSet(DataIsolationMixin, viewsets.ModelViewSet):
             a.status = "Recovered"
             a.save(update_fields=["outstanding", "status"])
 
-        return Response({
-            "message": "Full & Final settlement successfully executed. Employee marked Exited and user account deactivated.",
-            "exit": self.get_serializer(exit_process).data,
-            "fnf_statement": calculated_statement,
-        })
+        return Response(
+            {
+                "message": "Full & Final settlement successfully executed. Employee marked Exited and user account deactivated.",
+                "exit": self.get_serializer(exit_process).data,
+                "fnf_statement": calculated_statement,
+            }
+        )
 
 
 class WorkspaceNotificationView(APIView):
