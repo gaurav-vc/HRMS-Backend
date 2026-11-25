@@ -1643,17 +1643,22 @@ class DynamicCRUDPermission(permissions.BasePermission):
             return True
 
         # Fallback for standard employees or users without a customized dynamic role
-        if not module_perms and (not employee or employee.role == "employee"):
+        if not module_perms:
             ess_modules = {
                 "Leave Requests": {"view": "self", "create": True},
+                "Leaves": {"view": "self", "create": True},
+                "Leave Balances": {"view": "self", "create": False},
                 "Attendance": {"view": "self", "create": True},
                 "Daily Attendance": {"view": "self", "create": True},
+                "Regularization": {"view": "self", "create": True},
                 "Holiday Planner": {"view": True, "create": False},
                 "Salary Slips": {"view": "self", "create": False},
                 "Form 16": {"view": "self", "create": False},
                 "Separation Request": {"view": "self", "create": True},
                 "Loans & Advances": {"view": "self", "create": True},
                 "Reimbursements": {"view": "self", "create": True},
+                "Documents": {"view": "self", "create": True, "delete": True},
+                "Announcements": {"view": True, "create": False},
             }
             if rbac_module in ess_modules:
                 module_perms = ess_modules[rbac_module]
@@ -1711,6 +1716,14 @@ class DynamicCRUDPermission(permissions.BasePermission):
             if getattr(obj.employee, "manager_id", None) == employee.id:
                 return True
 
+        # Check if user is accessing their own personal record
+        if hasattr(obj, "employee") and employee and getattr(obj, "employee_id", None) == employee.id:
+            if method in ["GET", "HEAD", "OPTIONS"]:
+                return True
+            if method in ["PUT", "PATCH", "DELETE"]:
+                # Individual viewsets enforce fine-grained locks (e.g., profile_edit_unlocked)
+                return True
+
         # Otherwise fallback to the module permissions
         rbac_module = getattr(view, "rbac_module", None)
         if not rbac_module:
@@ -1737,6 +1750,25 @@ class DynamicCRUDPermission(permissions.BasePermission):
             and employee.dynamic_role.permissions
         ):
             module_perms = employee.dynamic_role.permissions.get(rbac_module, {})
+
+        if not module_perms and rbac_module in [
+            "Documents",
+            "Leave Requests",
+            "Leaves",
+            "Leave Balances",
+            "Attendance",
+            "Daily Attendance",
+            "Regularization",
+            "Loans & Advances",
+            "Reimbursements",
+            "Salary Slips",
+        ]:
+            module_perms = {
+                "view": "self",
+                "create": True,
+                "update": True,
+                "delete": True,
+            }
 
         if method in ["PUT", "PATCH"]:
             return _is_truthy(module_perms.get("update"))
