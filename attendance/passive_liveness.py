@@ -31,24 +31,22 @@ class PassiveLivenessService:
                 return False, 0.0, "Invalid image for liveness check"
                 
             # 1. Texture/Blur Analysis (Laplacian Variance)
-            # Printed photos and screens often lack the high-frequency depth details of a real face.
+            # Only flag extreme cases (e.g. completely blank or unreadable images)
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
             
-            # If the variance is incredibly low, it's a blurry printed photo or a low-res screen
-            if laplacian_var < 50.0:
-                return False, 1.0, "Spoof Detected: Image lacks natural depth texture (Possible Print/Screen)."
+            # Relax threshold to avoid false positives on compressed webcam/mobile streams
+            if laplacian_var < 5.0:
+                return False, 1.0, "Spoof Detected: Image is too blurry or lacks depth texture. Please ensure good lighting."
                 
             # 2. Specular Reflection / Screen Glare Analysis (HSV Value Variance)
-            # Human skin has smooth gradients. Screens emit light with extreme clipping, 
-            # and matte paper has very flat value distribution.
             hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
             v_channel = hsv[:, :, 2]
             v_std = np.std(v_channel)
             
-            # Unnatural lighting variance (too flat = paper, too extreme = screen glare)
-            if v_std < 10.0 or v_std > 100.0:
-                return False, 1.0, "Spoof Detected: Unnatural specular reflection detected (Possible Screen)."
+            # Avoid false positives on indoor lighting / studio lights
+            if v_std < 2.0:
+                return False, 1.0, "Spoof Detected: Unnatural flat lighting detected. Please look directly at the camera."
                 
             # If we had the ONNX model, we would run MiniFASNet here.
             # Since we don't, we rely on the above heuristics + DeepFace thresholding.

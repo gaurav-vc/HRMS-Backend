@@ -15,6 +15,13 @@ class DailyAttendance(models.Model):
     first_check_in = models.DateTimeField(null=True, blank=True)
     last_check_out = models.DateTimeField(null=True, blank=True)
     
+    # Split Shift Tracking
+    is_split_shift = models.BooleanField(default=False)
+    part1_in = models.DateTimeField(null=True, blank=True)
+    part1_out = models.DateTimeField(null=True, blank=True)
+    part2_in = models.DateTimeField(null=True, blank=True)
+    part2_out = models.DateTimeField(null=True, blank=True)
+    
     total_work_hours = models.DecimalField(max_digits=5, decimal_places=2, default=0.00)
     overtime_hours = models.DecimalField(max_digits=5, decimal_places=2, default=0.00)
     
@@ -280,6 +287,11 @@ class ShiftDefinition(models.Model):
     ot_multiplier = models.DecimalField(max_digits=4, decimal_places=2, default=1.0)
     color_hex = models.CharField(max_length=20, default="#000000")
     is_active = models.BooleanField(default=True)
+    
+    # Split Shift Configuration
+    is_split_shift = models.BooleanField(default=False, help_text="Split shift into 2 distinct working windows")
+    part2_start_time = models.TimeField(null=True, blank=True, help_text="Part 2 start time")
+    part2_end_time = models.TimeField(null=True, blank=True, help_text="Part 2 end time")
     
     # Dynamic Overtime Configuration
     is_ot_enabled = models.BooleanField(default=True, help_text="Master toggle to enable or disable OT computation for this shift")

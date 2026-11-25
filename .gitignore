@@ -20,7 +20,7 @@ db.sqlite3
 *.removed_backup
 *.sql
 
-# DeepFace & AI Model Weights
+# DeepFace & AI Model Weights (Large binary files downloaded automatically at runtime)
 .deepface/
 weights/
 *.h5

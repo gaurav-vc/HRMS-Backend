@@ -16,6 +16,11 @@ from pathlib import Path
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Configure DeepFace home directory inside project workspace to avoid Windows home permissions
+DEEPFACE_DIR = os.path.join(str(BASE_DIR), '.deepface')
+os.makedirs(os.path.join(DEEPFACE_DIR, '.deepface', 'weights'), exist_ok=True)
+os.environ['DEEPFACE_HOME'] = DEEPFACE_DIR
+
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/

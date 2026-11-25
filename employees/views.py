@@ -1460,7 +1460,6 @@ class EmployeeViewSet(DataIsolationMixin, viewsets.ModelViewSet):
         if old_status == "Draft" and new_status == "Active" and not emp.user:
             email = emp.email
             from django.contrib.auth.models import User
-
             if email and not User.objects.filter(username=email).exists():
                 import secrets
                 import string
@@ -1727,6 +1726,14 @@ Regards,
         else:
             send_email = bool(send_email_val)
 
+        send_sms_val = request.data.get('send_sms')
+        if send_sms_val is None:
+            send_sms_val = request.data.get('sendSms', True)
+        if isinstance(send_sms_val, str):
+            send_sms = send_sms_val.lower() in ('true', '1')
+        else:
+            send_sms = bool(send_sms_val)
+
         import secrets
         import string
 
@@ -1737,7 +1744,6 @@ Regards,
             new_password = "".join(secrets.choice(alphabet) for _ in range(12))
 
         from django.contrib.auth.models import User
-
         user = target_employee.user
         target_email = target_employee.email or (user.email if user else None)
         if not target_email and user and "@" in user.username:
@@ -1841,25 +1847,47 @@ HR Operations
             except Exception as e:
                 print(f"Failed to start password email thread: {e}")
 
-        return Response(
-            {
-                "success": True,
-                "email_sent": email_sent,
-                "emailSent": email_sent,
-                "recipient": target_email,
-                "generated_password": (
-                    new_password if password_mode != "custom" else None
-                ),
-                "generatedPassword": (
-                    new_password if password_mode != "custom" else None
-                ),
-                "message": (
-                    f"Credentials updated successfully and sent to {target_email}."
-                    if email_sent
-                    else "Password updated successfully."
-                ),
-            }
-        )
+        sms_sent = False
+        target_phone = target_employee.phone or ''
+        if send_sms and target_phone:
+            import threading
+            from core.jio_sms import JioSMSService
+            origin = request.headers.get('Origin') or request.build_absolute_uri('/')
+            login_url = origin.rstrip('/') + '/auth'
+            login_id = target_email or target_employee.code or target_phone
+            def _send_sms():
+                try:
+                    JioSMSService.send_credentials_sms(
+                        phone=target_phone,
+                        first_name=target_employee.first_name,
+                        login_id=login_id,
+                        password=new_password,
+                        login_url=login_url
+                    )
+                except Exception as err:
+                    print(f"[Password Reset SMS Error] {err}")
+            threading.Thread(target=_send_sms, daemon=True).start()
+            sms_sent = True
+                
+        status_msg_parts = []
+        if email_sent:
+            status_msg_parts.append(f"email to {target_email}")
+        if sms_sent:
+            status_msg_parts.append(f"SMS to {target_phone}")
+        status_msg = f"Credentials sent via {', '.join(status_msg_parts)}." if status_msg_parts else "Password updated successfully."
+
+        return Response({
+            "success": True,
+            "email_sent": email_sent,
+            "emailSent": email_sent,
+            "sms_sent": sms_sent,
+            "smsSent": sms_sent,
+            "recipient": target_email,
+            "recipient_phone": target_phone,
+            "generated_password": new_password if password_mode != 'custom' else None,
+            "generatedPassword": new_password if password_mode != 'custom' else None,
+            "message": status_msg
+        })
 
     @action(detail=True, methods=["get"], url_path="salary-revisions")
     def salary_revisions(self, request, pk=None):
@@ -2043,6 +2071,7 @@ HR Operations
             "profile_edit_unlocked": employee.profile_edit_unlocked,
             "profile_edit_count": employee.profile_edit_count,
             "employee": EmployeeSerializer(employee).data,
+        })
         })
 
     @action(detail=True, methods=["post"], url_path="request-profile-unlock")

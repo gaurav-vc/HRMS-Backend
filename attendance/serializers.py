@@ -155,6 +155,27 @@ class RegularizationRequestSerializer(serializers.ModelSerializer):
         return obj.employee.entity.name if getattr(obj.employee, 'entity', None) else "—"
 
 class ShiftDefinitionSerializer(serializers.ModelSerializer):
+    def to_internal_value(self, data):
+        field_mapping = {
+            'startTime': 'start_time',
+            'endTime': 'end_time',
+            'graceMinutes': 'grace_minutes',
+            'otMultiplier': 'ot_multiplier',
+            'colorHex': 'color_hex',
+            'isActive': 'is_active',
+            'isSplitShift': 'is_split_shift',
+            'part2StartTime': 'part2_start_time',
+            'part2EndTime': 'part2_end_time',
+            'isOtEnabled': 'is_ot_enabled',
+            'minHoursForOt': 'min_hours_for_ot',
+            'otCalculationBaseHours': 'ot_calculation_base_hours',
+        }
+        mutable = data.copy() if hasattr(data, 'copy') else dict(data)
+        for camel, snake in field_mapping.items():
+            if camel in mutable and snake not in mutable:
+                mutable[snake] = mutable[camel]
+        return super().to_internal_value(mutable)
+
     class Meta:
         model = ShiftDefinition
         fields = '__all__'

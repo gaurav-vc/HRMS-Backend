@@ -36,10 +36,10 @@ class NotificationService:
             send_sms_active = bool(phone)
         elif delivery_method == 'email':
             send_email_active = bool(email)
-        else: # 'auto'
+        else: # 'auto' - trigger on both email and phone when available
             if email:
                 send_email_active = True
-            if phone and not email: # Blue-collar deskless worker without email
+            if phone:
                 send_sms_active = True
 
         # 1. Dispatch Email (if active)
@@ -91,31 +91,17 @@ HR Operations Team
 
     @classmethod
     def _dispatch_sms_async(cls, first_name, phone, login_id, password, login_url):
-        sms_text = f"Welcome {first_name}! Your HRMS Account is ready. Login: {login_id} | Password: {password} | Portal: {login_url}"
-
         def _send():
-            # Check if SMS Gateway (e.g., Twilio, AWS SNS, MSG91) credentials are configured in settings
-            sms_provider = getattr(settings, 'SMS_PROVIDER', 'CONSOLE')
-            
-            if sms_provider == 'TWILIO':
-                account_sid = getattr(settings, 'TWILIO_ACCOUNT_SID', None)
-                auth_token = getattr(settings, 'TWILIO_AUTH_TOKEN', None)
-                from_number = getattr(settings, 'TWILIO_FROM_NUMBER', None)
-                if account_sid and auth_token and from_number:
-                    try:
-                        from twilio.rest import Client
-                        client = Client(account_sid, auth_token)
-                        client.messages.create(body=sms_text, from_=from_number, to=phone)
-                        logger.info(f"[TWILIO SMS SENT] Sent credentials to {phone}")
-                        return
-                    except Exception as e:
-                        logger.error(f"[TWILIO SMS FAILED] {e}")
-            
-            # In non-production environments without an SMS gateway, log dispatch with credentials redacted
-            import re
-            masked_text = re.sub(r'(Password:\s*)\S+', r'\1[REDACTED]', sms_text, flags=re.IGNORECASE)
-            masked_text = re.sub(r'(PIN:\s*)\S+', r'\1[REDACTED]', masked_text, flags=re.IGNORECASE)
-            masked_phone = phone[:3] + '****' + phone[-3:] if len(phone) > 6 else '****'
-            logger.info(f"[SMS DISPATCH SIMULATED] To: {masked_phone} | Content: {masked_text}")
+            try:
+                from core.jio_sms import JioSMSService
+                JioSMSService.send_credentials_sms(
+                    phone=phone,
+                    first_name=first_name,
+                    login_id=login_id,
+                    password=password,
+                    login_url=login_url
+                )
+            except Exception as e:
+                logger.error(f"[SMS DISPATCH ERROR] Failed to send credentials to {phone}: {e}")
 
         threading.Thread(target=_send, daemon=True).start()
