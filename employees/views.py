@@ -2072,7 +2072,6 @@ HR Operations
             "profile_edit_count": employee.profile_edit_count,
             "employee": EmployeeSerializer(employee).data,
         })
-        })
 
     @action(detail=True, methods=["post"], url_path="request-profile-unlock")
     def request_profile_unlock(self, request, pk=None):
